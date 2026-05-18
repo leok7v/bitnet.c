@@ -71,9 +71,13 @@ run_case() {
         echo "RUN $name: $path"
         ran=$((ran + 1))
         bench_models="${bench_models}${bench_models:+ }$path"
+        strict_kquant_fallback=0
+        if [ "$name" = "Qwen 2.5 dense" ] || [ "$name" = "Qwen 3 dense" ]; then
+            strict_kquant_fallback=1
+            echo "  using Q4_K/Q6_K CUDA matvec correctness fallback"
+        fi
         if [ "$RUN_COHERENCE" = "1" ]; then
-            if [ "$name" = "Qwen 2.5 dense" ] || [ "$name" = "Qwen 3 dense" ]; then
-                echo "  using Q4_K/Q6_K CUDA matvec correctness fallback"
+            if [ "$strict_kquant_fallback" = "1" ]; then
                 BN_CUDA_DISABLE_Q4_K=1 BN_CUDA_DISABLE_Q6_K=1 \
                     "$COHERENCE" "$path" --cuda || fail=1
             else
@@ -81,7 +85,12 @@ run_case() {
             fi
         fi
         if [ "$RUN_LLAMA_COMPARE" = "1" ]; then
-            "$COMPARE_LLAMA" "$path" --cuda --llama-cuda -n "$N_TOKENS" -t "$THREADS" --maxseq "$MAXSEQ" || fail=1
+            if [ "$strict_kquant_fallback" = "1" ]; then
+                BN_CUDA_DISABLE_Q4_K=1 BN_CUDA_DISABLE_Q6_K=1 \
+                    "$COMPARE_LLAMA" "$path" --cuda --llama-cuda -n "$N_TOKENS" -t "$THREADS" --maxseq "$MAXSEQ" || fail=1
+            else
+                "$COMPARE_LLAMA" "$path" --cuda --llama-cuda -n "$N_TOKENS" -t "$THREADS" --maxseq "$MAXSEQ" || fail=1
+            fi
         fi
     else
         echo "SKIP $name: set $env_name or BN_MODEL_ROOT=$ROOT"
