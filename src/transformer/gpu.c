@@ -632,10 +632,10 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         const char *env = getenv("BN_GPU_Q6_Q8K_REFINE_TOP");
         if (env) refine_top = atoi(env);
         if (refine_top > 0 &&
-            bn_transformer_gpu_read_xb(gpu, s->x,
+            bn_transformer_gpu_read_xb(gpu, s->xb,
                                        (size_t)dim * sizeof(float)) == 0) {
             gpu_refine_q6k_logits_top(s->logits, c->vocab_size,
-                                      logit_res->cpu_weight, s->x,
+                                      logit_res->cpu_weight, s->xb,
                                       refine_top);
         }
     }
@@ -643,9 +643,9 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         float *cpu_logits = (float *)malloc((size_t)c->vocab_size *
                                             sizeof(float));
         if (cpu_logits &&
-            bn_transformer_gpu_read_xb(gpu, s->x,
+            bn_transformer_gpu_read_xb(gpu, s->xb,
                                        (size_t)dim * sizeof(float)) == 0) {
-            bn_quant_matvec(cpu_logits, logit_res->cpu_weight, s->x,
+            bn_quant_matvec(cpu_logits, logit_res->cpu_weight, s->xb,
                             s->x_q, bn_model_pool(m));
             double sum_abs = 0.0;
             double sum_sq = 0.0;

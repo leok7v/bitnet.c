@@ -865,11 +865,11 @@ int bn_transformer_gpu_fallback_logits(
     if (bn_transformer_gpu_emit_context_flush(emit, gpu) != 0)
         return -1;
     double t_flush = bn_platform_time_ms();
-    if (bn_transformer_gpu_read_xb(gpu, s->x,
+    if (bn_transformer_gpu_read_xb(gpu, s->xb,
                                    (size_t)dim * sizeof(float)) != 0)
         return -1;
     double t_read = bn_platform_time_ms();
-    bn_quant_matvec(s->logits, logits->cpu_weight, s->x, s->x_q,
+    bn_quant_matvec(s->logits, logits->cpu_weight, s->xb, s->x_q,
                     bn_model_pool(m));
     double t_logits = bn_platform_time_ms();
     const char *profile = getenv("BN_GPU_PROFILE");
