@@ -275,7 +275,7 @@ void bn_moe_cache_print_stats(const BnMoEState *ms) {
 }
 
 int bn_moe_prefault_mmap(struct BnModel *m) {
-    if (!m || !bn_model_moe_io(m)->mmap_base || m->config.n_experts <= 0)
+    if (!m || !bn_moe_io_has_mmap(bn_model_moe_io(m)) || m->config.n_experts <= 0)
         return -1;
 
 #if defined(__EMSCRIPTEN__)
@@ -293,7 +293,8 @@ int bn_moe_prefault_mmap(struct BnModel *m) {
             em->expert_down_bytes == 0)
             continue;
 
-        const size_t bases[3] = { em->gate_offset, em->up_offset, em->down_offset };
+        const size_t offsets[3] = { em->gate_offset, em->up_offset, em->down_offset };
+        const size_t strides[3] = { em->gate_stride, em->up_stride, em->down_stride };
         const size_t sizes[3] = {
             em->expert_gate_bytes, em->expert_up_bytes, em->expert_down_bytes
         };
@@ -301,10 +302,13 @@ int bn_moe_prefault_mmap(struct BnModel *m) {
         for (int p = 0; p < 3; p++) {
             size_t proj_bytes = sizes[p];
             if (proj_bytes == 0) continue;
+            const uint8_t *base =
+                bn_moe_mmap_base_for_proj(bn_model_moe_io(m), em, p);
+            if (!base) continue;
 
             for (int e = 0; e < m->config.n_experts; e++) {
-                const uint8_t *ptr = bn_model_moe_io(m)->mmap_base + bases[p] +
-                                     (size_t)e * proj_bytes;
+                const uint8_t *ptr = base + offsets[p] +
+                    (size_t)e * (strides[p] ? strides[p] : proj_bytes);
                 for (size_t off = 0; off < proj_bytes; off += page) {
                     sink ^= ptr[off];
                     touched_pages++;

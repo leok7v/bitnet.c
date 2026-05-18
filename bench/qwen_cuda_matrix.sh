@@ -12,8 +12,10 @@ ROOT="${BN_MODEL_ROOT:-/data/models/gguf}"
 COHERENCE="${COHERENCE:-./test_coherence}"
 COMPARE_LLAMA="${COMPARE_LLAMA:-./test/compare_llama.sh}"
 CUDA_COMPARE="${CUDA_COMPARE:-./bench/cuda_compare.sh}"
+BITNET="${BITNET:-./bitnet}"
 REQUIRE_MODELS="${REQUIRE_MODELS:-0}"
 RUN_COHERENCE="${RUN_COHERENCE:-1}"
+RUN_SHARDED_MOE_SMOKE="${RUN_SHARDED_MOE_SMOKE:-1}"
 RUN_LLAMA_COMPARE="${RUN_LLAMA_COMPARE:-0}"
 RUN_BENCH="${RUN_BENCH:-0}"
 N_TOKENS="${N_TOKENS:-8}"
@@ -58,8 +60,12 @@ run_case() {
 
     if path=$(find_model "$env_name" "$rel_dir" "$@"); then
         if [[ "$path" == *-of-*.gguf ]]; then
-            echo "SKIP $name: sharded GGUF is not supported by this loader ($path)"
-            missing=$((missing + 1))
+            echo "RUN $name sharded mmap smoke: $path"
+            ran=$((ran + 1))
+            if [ "$RUN_SHARDED_MOE_SMOKE" = "1" ]; then
+                "$BITNET" "$path" -n 0 --maxseq 32 --quiet || fail=1
+            fi
+            echo "  CUDA coherence skipped for sharded MoE size; mmap runtime smoke covered"
             return
         fi
         echo "RUN $name: $path"
@@ -97,6 +103,7 @@ run_case "Qwen 3.5 dense" "BN_MODEL_QWEN35_DENSE" \
     "Qwen3.5-27B*.gguf" "qwen3.5-27b*.gguf"
 run_case "Qwen 3.5 sparse MoE" "BN_MODEL_QWEN35_MOE" \
     "qwen3_5" \
+    "Qwen3.5-*-UD-Q3_K_XL-00001-of-*.gguf" "qwen3.5-*-ud-q3_k_xl-00001-of-*.gguf" \
     "Qwen3.5-*A*B*00001-of-*.gguf" "qwen3.5-*a*b*00001-of-*.gguf" "Qwen3.5*MOE*00001-of-*.gguf" "qwen3.5*moe*00001-of-*.gguf"
 run_case "Qwen 3.6 dense" "BN_MODEL_QWEN36_DENSE" \
     "qwen3_6" \

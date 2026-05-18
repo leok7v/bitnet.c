@@ -176,21 +176,15 @@ int main(int argc, char **argv) {
     printf("=== GGUF Model Dump ===\n");
     printf("File: %s\n\n", path);
 
-    /* Load file */
-    BnMappedFile mf = bn_platform_load_file(path);
-    if (!mf.data) {
-        fprintf(stderr, "ERROR: failed to load '%s'\n", path);
-        return 1;
-    }
-    printf("File size: %zu bytes (%.1f MB)\n", mf.size, mf.size / (1024.0 * 1024.0));
-
     /* Parse GGUF */
-    BnGGUFFile *f = bn_gguf_open(mf.data, mf.size);
+    BnGGUFFile *f = bn_gguf_open_file(path);
     if (!f) {
         fprintf(stderr, "ERROR: failed to parse GGUF\n");
-        bn_platform_unload_file(&mf);
         return 1;
     }
+    const BnMappedFile *mf = bn_gguf_primary_file(f);
+    if (mf)
+        printf("File size: %zu bytes (%.1f MB)\n", mf->size, mf->size / (1024.0 * 1024.0));
 
     printf("GGUF version: %u\n", f->version);
     printf("Alignment:    %zu\n", f->alignment);
@@ -423,6 +417,5 @@ int main(int argc, char **argv) {
     printf("\n=== Done ===\n");
 
     bn_gguf_free(f);
-    bn_platform_unload_file(&mf);
     return 0;
 }

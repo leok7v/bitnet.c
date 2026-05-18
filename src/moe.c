@@ -6,11 +6,19 @@ int bn_moe_checked_mul_size(size_t a, size_t b, size_t *out) {
     return 0;
 }
 
+static size_t gguf_tensor_file_offset(BnGGUFFile *f,
+                                      const BnGGUFTensorInfo *info) {
+    if (f->n_shards > 0 && info->shard_idx < f->n_shards)
+        return f->shard_data_offsets[info->shard_idx] + info->offset;
+    return f->data_offset + info->offset;
+}
+
 static int moe_load_expert_map_proj(BnGGUFFile *f, const char *name,
                                     int n_experts, int *type_out,
                                     int *rows_out, int *cols_out,
                                     size_t *base_offset_out,
-                                    size_t *expert_bytes_out) {
+                                    size_t *expert_bytes_out,
+                                    uint32_t *shard_idx_out) {
     int ti = bn_gguf_find_tensor(f, name);
     if (ti < 0) return -1;
 
@@ -35,7 +43,8 @@ static int moe_load_expert_map_proj(BnGGUFFile *f, const char *name,
     *type_out = (int)info->type;
     *rows_out = rows;
     *cols_out = cols;
-    *base_offset_out = f->data_offset + info->offset;
+    *base_offset_out = gguf_tensor_file_offset(f, info);
+    *shard_idx_out = info->shard_idx;
 
     size_t expert_elements = 0;
     if (bn_moe_checked_mul_size((size_t)rows, (size_t)cols, &expert_elements) != 0 ||
@@ -83,8 +92,10 @@ static int moe_load_expert_map_gate_up_fused(BnGGUFFile *f, const char *name,
     em->expert_up_bytes = one_proj_bytes;
     em->gate_stride = fused_bytes;
     em->up_stride = fused_bytes;
-    em->gate_offset = f->data_offset + info->offset;
+    em->gate_offset = gguf_tensor_file_offset(f, info);
     em->up_offset = em->gate_offset + one_proj_bytes;
+    em->gate_shard_idx = info->shard_idx;
+    em->up_shard_idx = info->shard_idx;
     return 0;
 }
 
@@ -100,10 +111,12 @@ int bn_moe_load_expert_map(BnGGUFFile *f,
         if (!names->up ||
             moe_load_expert_map_proj(f, names->gate, n_experts,
                 &em->gate_type, &em->gate_rows, &em->gate_cols,
-                &em->gate_offset, &em->expert_gate_bytes) != 0 ||
+                &em->gate_offset, &em->expert_gate_bytes,
+                &em->gate_shard_idx) != 0 ||
             moe_load_expert_map_proj(f, names->up, n_experts,
                 &em->up_type, &em->up_rows, &em->up_cols,
-                &em->up_offset, &em->expert_up_bytes) != 0)
+                &em->up_offset, &em->expert_up_bytes,
+                &em->up_shard_idx) != 0)
             return -1;
         em->gate_stride = em->expert_gate_bytes;
         em->up_stride = em->expert_up_bytes;
@@ -117,7 +130,8 @@ int bn_moe_load_expert_map(BnGGUFFile *f,
     if (!names->down ||
         moe_load_expert_map_proj(f, names->down, n_experts,
             &em->down_type, &em->down_rows, &em->down_cols,
-            &em->down_offset, &em->expert_down_bytes) != 0)
+            &em->down_offset, &em->expert_down_bytes,
+            &em->down_shard_idx) != 0)
         return -1;
     em->down_stride = em->expert_down_bytes;
     return 0;

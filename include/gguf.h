@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "platform.h"
 
 #define BN_GGUF_MAGIC              0x46554747   // "GGUF" little-endian
 #define BN_GGUF_MAX_DIMS           4
@@ -93,9 +94,10 @@ typedef struct {
     uint64_t dims[4];
     uint32_t type;
     uint64_t offset;
+    uint32_t shard_idx;
 } BnGGUFTensorInfo;
 
-typedef struct {
+typedef struct BnGGUFFile {
     uint32_t      version;
     uint64_t      n_tensors;
     uint64_t      n_kv;
@@ -105,9 +107,17 @@ typedef struct {
     size_t        data_offset;
     uint8_t      *raw;       // pointer to start of buffer (for tensor data access)
     size_t        raw_size;  // total buffer size (for bounds checking)
+    uint8_t     **shard_raws;
+    size_t       *shard_raw_sizes;
+    size_t       *shard_data_offsets;
+    BnMappedFile *owned_maps;
+    size_t        n_shards;
+    struct BnGGUFFile **owned_extra_files;
+    size_t        n_owned_extra_files;
 } BnGGUFFile;
 
 BnGGUFFile *bn_gguf_open(const uint8_t *buf, size_t size);
+BnGGUFFile *bn_gguf_open_file(const char *path);
 void        bn_gguf_free(BnGGUFFile *f);
 int         bn_gguf_find_key(BnGGUFFile *f, const char *key);
 uint32_t    bn_gguf_get_u32(BnGGUFFile *f, const char *key);
@@ -119,5 +129,6 @@ const void *bn_gguf_get_arr_data(BnGGUFFile *f, const char *key);
 int         bn_gguf_find_tensor(BnGGUFFile *f, const char *name);
 void       *bn_gguf_tensor_data(BnGGUFFile *f, int idx);
 int         bn_gguf_tensor_size(uint32_t type, uint64_t nelements, size_t *out);
+const BnMappedFile *bn_gguf_primary_file(BnGGUFFile *f);
 
 #endif // BN_GGUF_H

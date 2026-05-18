@@ -8,11 +8,12 @@ static const void *moe_mmap_expert_proj(const BnMoEIO *io,
                                         int proj) {
     size_t offset = 0;
     size_t proj_bytes = 0;
-    if (!io || !io->mmap_base ||
+    if (!io || !bn_moe_io_has_mmap(io) ||
         bn_moe_proj_info(map, expert_idx, proj, &offset, &proj_bytes) != 0)
         return NULL;
     (void)proj_bytes;
-    return io->mmap_base + offset;
+    const uint8_t *base = bn_moe_mmap_base_for_proj(io, map, proj);
+    return base ? base + offset : NULL;
 }
 
 static int moe_try_gpu_serial_expert(BnModel *m, BnSession *sess,
@@ -23,7 +24,7 @@ static int moe_try_gpu_serial_expert(BnModel *m, BnSession *sess,
     BnRunState *s = &sess->state;
     const BnMoEExpertMap *map = &lw->moe.expert_map;
     BnMoEIO *io = bn_model_moe_io(m);
-    if (!gpu || !ms || !io || !io->mmap_base)
+    if (!gpu || !ms || !io || !bn_moe_io_has_mmap(io))
         return -1;
 
     BnGPUMoETemporaryBuffers temps;
@@ -112,7 +113,7 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
     double t_compute = bn_moe_time_ms();
     int shared_gu_ready = 0;
 
-    if (bn_model_moe_io(m)->mmap_base && K <= BN_MAX_MOE_K) {
+    if (bn_moe_io_has_mmap(bn_model_moe_io(m)) && K <= BN_MAX_MOE_K) {
         // --- Cross-expert batched dispatch (mmap path) ---
         int valid_k = 0;
         int valid_indices[BN_MAX_MOE_K];
@@ -248,7 +249,7 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
         }
     }
 #if !defined(__EMSCRIPTEN__)
-    else if (bn_model_moe_io(m)->fd >= 0 && !bn_model_moe_io(m)->mmap_base) {
+    else if (bn_model_moe_io(m)->fd >= 0 && !bn_moe_io_has_mmap(bn_model_moe_io(m))) {
         // --- Pipelined pread path with LRU cache ---
         BnMoEPrefetch *pf_gu = (BnMoEPrefetch *)bn_model_moe_io(m)->prefetch;
         BnMoEPrefetch *pf_dn = (BnMoEPrefetch *)bn_model_moe_io(m)->prefetch_down;

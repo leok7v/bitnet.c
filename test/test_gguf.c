@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <unistd.h>
 
 // --- Test: Build a minimal GGUF buffer in memory and parse it ---
 
@@ -72,6 +73,39 @@ static size_t build_test_gguf(uint8_t *buf, size_t buf_size) {
     float test_vals[] = {1.0f, 2.0f, 3.0f, 4.0f};
     wb_write(&wb, test_vals, sizeof(test_vals));
 
+    return wb.pos;
+}
+
+static size_t build_one_tensor_gguf(uint8_t *buf, size_t buf_size,
+                                    const char *tensor_name,
+                                    const float vals[4]) {
+    WriteBuffer wb;
+    wb.data = buf;
+    wb.pos = 0;
+    wb.cap = buf_size;
+
+    wb_u32(&wb, 0x46554747);
+    wb_u32(&wb, 3);
+    wb_u64(&wb, 1);
+    wb_u64(&wb, 1);
+
+    wb_str(&wb, "general.architecture");
+    wb_u32(&wb, BN_GGUF_TYPE_STRING);
+    wb_str(&wb, "bitnet");
+
+    wb_str(&wb, tensor_name);
+    wb_u32(&wb, 2);
+    wb_u64(&wb, 2);
+    wb_u64(&wb, 2);
+    wb_u32(&wb, BN_GGUF_TENSOR_F32);
+    wb_u64(&wb, 0);
+
+    size_t data_start = wb.pos + (32 - (wb.pos % 32)) % 32;
+    while (wb.pos < data_start) {
+        uint8_t zero = 0;
+        wb_write(&wb, &zero, 1);
+    }
+    wb_write(&wb, vals, 4 * sizeof(float));
     return wb.pos;
 }
 
@@ -146,11 +180,55 @@ static void test_find_key(void) {
     printf("PASSED\n");
 }
 
+static void write_file(const char *path, const uint8_t *buf, size_t size) {
+    FILE *fp = fopen(path, "wb");
+    assert(fp != NULL);
+    assert(fwrite(buf, 1, size, fp) == size);
+    assert(fclose(fp) == 0);
+}
+
+static void test_open_shards(void) {
+    printf("test_open_shards... ");
+
+    char path1[] = "/tmp/bitnet-gguf-test-00001-of-00002.gguf";
+    char path2[] = "/tmp/bitnet-gguf-test-00002-of-00002.gguf";
+    uint8_t buf1[4096], buf2[4096];
+    float vals1[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float vals2[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    size_t size1 = build_one_tensor_gguf(buf1, sizeof(buf1), "shard0.weight", vals1);
+    size_t size2 = build_one_tensor_gguf(buf2, sizeof(buf2), "shard1.weight", vals2);
+    write_file(path1, buf1, size1);
+    write_file(path2, buf2, size2);
+
+    BnGGUFFile *f = bn_gguf_open_file(path1);
+    assert(f != NULL);
+    assert(f->n_shards == 2);
+    assert(f->n_tensors == 2);
+    assert(strcmp(bn_gguf_get_str(f, "general.architecture"), "bitnet") == 0);
+
+    int t0 = bn_gguf_find_tensor(f, "shard0.weight");
+    int t1 = bn_gguf_find_tensor(f, "shard1.weight");
+    assert(t0 >= 0);
+    assert(t1 >= 0);
+    float *data0 = (float *)bn_gguf_tensor_data(f, t0);
+    float *data1 = (float *)bn_gguf_tensor_data(f, t1);
+    assert(data0 != NULL);
+    assert(data1 != NULL);
+    assert(data0[0] == 1.0f && data0[3] == 4.0f);
+    assert(data1[0] == 5.0f && data1[3] == 8.0f);
+
+    bn_gguf_free(f);
+    unlink(path1);
+    unlink(path2);
+    printf("PASSED\n");
+}
+
 int main(void) {
     printf("=== GGUF Tests ===\n");
     test_parse_synthetic();
     test_bad_magic();
     test_find_key();
+    test_open_shards();
     printf("All GGUF tests passed!\n");
     return 0;
 }

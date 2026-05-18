@@ -62,6 +62,10 @@ typedef struct {
 int bn_moe_checked_mul_size(size_t a, size_t b, size_t *out);
 int bn_moe_proj_info(const BnMoEExpertMap *map, int expert_idx, int proj,
                      size_t *offset, size_t *proj_bytes);
+int bn_moe_io_has_mmap(const BnMoEIO *io);
+const uint8_t *bn_moe_mmap_base_for_proj(const BnMoEIO *io,
+                                         const BnMoEExpertMap *map,
+                                         int proj);
 #if !defined(__EMSCRIPTEN__)
 void bn_moe_madvise_experts(const BnMoEIO *io, const BnMoEExpertMap *map,
                             const int *indices, int n, int advice, int proj_mask);

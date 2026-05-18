@@ -40,6 +40,10 @@ void bn_moe_print_stats(const BnMoEState *ms, int n_tokens);
 // Reset accumulated stats (call between benchmark runs).
 void bn_moe_reset_stats(BnMoEState *ms);
 
+// True when expert I/O can read directly from mapped GGUF storage. This
+// includes both single-file mmap and multi-shard mmap bases.
+int bn_moe_io_has_mmap(const BnMoEIO *io);
+
 // Create expert LRU cache for pread pipeline (no-op on EMSCRIPTEN or mmap).
 // budget_bytes: total cache memory budget (0 to disable).
 // gate/up/down_bytes: per-expert projection sizes from expert_map.

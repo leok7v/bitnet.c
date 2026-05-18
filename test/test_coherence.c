@@ -634,36 +634,31 @@ int main(int argc, char **argv) {
 
     /* ── Load model ──────────────────────────────────────────────── */
 
-    BnMappedFile mf = bn_platform_load_file(argv[1]);
-    if (!mf.data) {
-        fprintf(stderr, "Failed to load file: %s\n", argv[1]);
-        return 1;
-    }
-
-    BnGGUFFile *gf = bn_gguf_open(mf.data, mf.size);
+    BnGGUFFile *gf = bn_gguf_open_file(argv[1]);
     if (!gf) {
         fprintf(stderr, "Failed to parse GGUF\n");
-        bn_platform_unload_file(&mf);
         return 1;
     }
+    const BnMappedFile *mf = bn_gguf_primary_file(gf);
 
     BnModel model;
     if (bn_model_load(&model, gf, 2048, 0, 0) != 0) {
         fprintf(stderr, "Failed to load model\n");
         bn_gguf_free(gf);
-        bn_platform_unload_file(&mf);
         return 1;
     }
     if (use_flash)
         model.config.flash_attn = 1;
     if (kv16)
         model.config.kv_f16 = 1;
-    bn_model_set_file(&model, mf);
     if (model.config.n_experts > 0) {
-        if (mf.is_mmap == 1 && mf.data)
-            bn_model_set_moe_mmap_base(&model, mf.data);
-        if (mf.fd >= 0)
-            bn_model_set_moe_fd(&model, mf.fd);
+        if (gf->n_shards > 1 && gf->shard_raws)
+            bn_model_set_moe_mmap_shards(&model, (const uint8_t **)gf->shard_raws,
+                                         gf->n_shards);
+        else if (gf->n_shards <= 1 && mf && mf->is_mmap == 1 && mf->data)
+            bn_model_set_moe_mmap_base(&model, mf->data);
+        if (gf->n_shards <= 1 && mf && mf->fd >= 0)
+            bn_model_set_moe_fd(&model, mf->fd);
         bn_moe_prefetch_create(bn_model_moe_io(&model));
     }
 

@@ -161,12 +161,38 @@ int bn_moe_proj_info(const BnMoEExpertMap *map, int expert_idx, int proj,
     }
 }
 
+static uint32_t moe_proj_shard_idx(const BnMoEExpertMap *map, int proj) {
+    switch (proj) {
+        case 0: return map->gate_shard_idx;
+        case 1: return map->up_shard_idx;
+        case 2: return map->down_shard_idx;
+        default: return 0;
+    }
+}
+
+int bn_moe_io_has_mmap(const BnMoEIO *io) {
+    return io && (io->mmap_base || (io->mmap_bases && io->n_mmap_bases > 0));
+}
+
+const uint8_t *bn_moe_mmap_base_for_proj(const BnMoEIO *io,
+                                         const BnMoEExpertMap *map,
+                                         int proj) {
+    if (!io || !map) return NULL;
+    if (io->mmap_bases && io->n_mmap_bases > 0) {
+        uint32_t shard_idx = moe_proj_shard_idx(map, proj);
+        if ((size_t)shard_idx >= io->n_mmap_bases)
+            return NULL;
+        return io->mmap_bases[shard_idx];
+    }
+    return io->mmap_base;
+}
+
 // madvise helper: issue WILLNEED or DONTNEED for expert projections.
 // proj_mask: bitmask (1=gate, 2=up, 4=down), advice: MADV_WILLNEED or MADV_DONTNEED.
 #if !defined(__EMSCRIPTEN__)
 void bn_moe_madvise_experts(const BnMoEIO *io, const BnMoEExpertMap *map,
                                  const int *indices, int n, int advice, int proj_mask) {
-    if (!io->mmap_base) return;
+    if (!bn_moe_io_has_mmap(io)) return;
     long page_size = sysconf(_SC_PAGESIZE);
     for (int k = 0; k < n; k++) {
         int eidx = indices[k];
@@ -175,8 +201,10 @@ void bn_moe_madvise_experts(const BnMoEIO *io, const BnMoEExpertMap *map,
             if (!((proj_mask >> proj) & 1)) continue;
             size_t offset, proj_bytes;
             bn_moe_proj_info(map, eidx, proj, &offset, &proj_bytes);
+            const uint8_t *base = bn_moe_mmap_base_for_proj(io, map, proj);
+            if (!base) continue;
             // Page-align: round down start, round up end
-            uintptr_t addr = (uintptr_t)io->mmap_base + offset;
+            uintptr_t addr = (uintptr_t)base + offset;
             uintptr_t aligned_start = addr & ~((uintptr_t)page_size - 1);
             size_t aligned_len = (addr + proj_bytes - aligned_start + page_size - 1) & ~((size_t)page_size - 1);
             madvise((void *)aligned_start, aligned_len, advice);
@@ -198,8 +226,9 @@ const void *bn_moe_load_expert_proj_into(const BnMoEIO *io, BnMoEStats *stats,
     stats->io_bytes += proj_bytes;
     stats->io_count++;
 
-    if (io->mmap_base)
-        return io->mmap_base + offset;
+    const uint8_t *base = bn_moe_mmap_base_for_proj(io, map, proj);
+    if (base)
+        return base + offset;
 
 #if !defined(__EMSCRIPTEN__)
     if (io->fd < 0 || proj_bytes > buf_size) return NULL;

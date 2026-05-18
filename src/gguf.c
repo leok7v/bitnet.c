@@ -1,8 +1,10 @@
 #include "gguf.h"
 #include "sh_log.h"
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 // --- Low-level read helpers (little-endian assumed) ---
 
@@ -164,6 +166,13 @@ static size_t align_up(size_t offset, size_t alignment) {
     return offset + (alignment - (offset % alignment)) % alignment;
 }
 
+static char *gguf_strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *out = (char *)malloc(n);
+    if (out) memcpy(out, s, n);
+    return out;
+}
+
 BnGGUFFile *bn_gguf_open(const uint8_t *buf, size_t size) {
     Reader r = { buf, 0, size, 0 };
 
@@ -243,6 +252,7 @@ BnGGUFFile *bn_gguf_open(const uint8_t *buf, size_t size) {
         }
         f->tensors[i].type = read_u32(&r);
         f->tensors[i].offset = read_u64(&r);
+        f->tensors[i].shard_idx = 0;
         if (r.error) goto fail;
     }
 
@@ -258,6 +268,11 @@ fail:
 
 void bn_gguf_free(BnGGUFFile *f) {
     if (!f) return;
+    if (f->owned_extra_files) {
+        for (size_t i = 0; i < f->n_owned_extra_files; i++)
+            bn_gguf_free(f->owned_extra_files[i]);
+        free(f->owned_extra_files);
+    }
     if (f->kvs) {
         for (uint64_t i = 0; i < f->n_kv; i++) {
             free(f->kvs[i].key);
@@ -281,7 +296,190 @@ void bn_gguf_free(BnGGUFFile *f) {
         }
         free(f->tensors);
     }
+    if (f->owned_maps) {
+        for (size_t i = 0; i < f->n_shards; i++)
+            bn_platform_unload_file(&f->owned_maps[i]);
+        free(f->owned_maps);
+    }
+    free(f->shard_raws);
+    free(f->shard_raw_sizes);
+    free(f->shard_data_offsets);
     free(f);
+}
+
+static int parse_shard_path(const char *path, int *cur, int *count,
+                            int *cur_width, int *count_width,
+                            size_t *cur_pos, size_t *count_pos,
+                            size_t *count_len) {
+    const char *of = strstr(path, "-of-");
+    if (!of) return 0;
+    const char *cur_start = of;
+    while (cur_start > path && cur_start[-1] >= '0' && cur_start[-1] <= '9')
+        cur_start--;
+    const char *count_start = of + 4;
+    const char *count_end = count_start;
+    while (*count_end >= '0' && *count_end <= '9')
+        count_end++;
+    if (cur_start == of || count_start == count_end)
+        return 0;
+
+    long c = strtol(cur_start, NULL, 10);
+    long n = strtol(count_start, NULL, 10);
+    if (c <= 0 || n <= 0 || c > INT_MAX || n > INT_MAX || c > n)
+        return 0;
+
+    *cur = (int)c;
+    *count = (int)n;
+    *cur_width = (int)(of - cur_start);
+    *count_width = (int)(count_end - count_start);
+    *cur_pos = (size_t)(cur_start - path);
+    *count_pos = (size_t)(count_start - path);
+    *count_len = (size_t)(count_end - count_start);
+    return 1;
+}
+
+static char *make_shard_path(const char *path, int shard_no,
+                             int cur_width, int count_width,
+                             size_t cur_pos, size_t count_pos,
+                             size_t count_len, int count) {
+    char cur_buf[32], count_buf[32];
+    snprintf(cur_buf, sizeof(cur_buf), "%0*d", cur_width, shard_no);
+    snprintf(count_buf, sizeof(count_buf), "%0*d", count_width, count);
+    size_t cur_len = strlen(cur_buf);
+    size_t total_len = strlen(path);
+    size_t out_len = total_len - (size_t)cur_width - count_len +
+                     cur_len + strlen(count_buf);
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) return NULL;
+    memcpy(out, path, cur_pos);
+    memcpy(out + cur_pos, cur_buf, cur_len);
+    size_t mid_start = cur_pos + (size_t)cur_width;
+    size_t mid_len = count_pos - mid_start;
+    memcpy(out + cur_pos + cur_len, path + mid_start, mid_len);
+    memcpy(out + cur_pos + cur_len + mid_len, count_buf, strlen(count_buf));
+    strcpy(out + cur_pos + cur_len + mid_len + strlen(count_buf),
+           path + count_pos + count_len);
+    return out;
+}
+
+BnGGUFFile *bn_gguf_open_file(const char *path) {
+    if (!path) return NULL;
+
+    int cur = 0, count = 0, cur_width = 0, count_width = 0;
+    size_t cur_pos = 0, count_pos = 0, count_len = 0;
+    if (!parse_shard_path(path, &cur, &count, &cur_width, &count_width,
+                          &cur_pos, &count_pos, &count_len))
+        count = 1;
+
+    BnMappedFile *maps = (BnMappedFile *)calloc((size_t)count, sizeof(BnMappedFile));
+    BnGGUFFile **files = (BnGGUFFile **)calloc((size_t)count, sizeof(BnGGUFFile *));
+    char **paths = (char **)calloc((size_t)count, sizeof(char *));
+    if (!maps || !files || !paths) {
+        free(maps); free(files); free(paths);
+        return NULL;
+    }
+
+    for (int i = 0; i < count; i++) {
+        paths[i] = count == 1
+            ? gguf_strdup(path)
+            : make_shard_path(path, i + 1, cur_width, count_width,
+                              cur_pos, count_pos, count_len, count);
+        if (!paths[i]) goto fail;
+        maps[i] = bn_platform_load_file(paths[i]);
+        if (!maps[i].data) {
+            SH_LOG_ERROR("Failed to load GGUF shard", "path", paths[i]);
+            goto fail;
+        }
+        files[i] = bn_gguf_open(maps[i].data, maps[i].size);
+        if (!files[i]) {
+            SH_LOG_ERROR("Failed to parse GGUF shard", "path", paths[i]);
+            goto fail;
+        }
+    }
+
+    BnGGUFFile *root = files[0];
+    root->owned_maps = maps;
+    root->n_shards = (size_t)count;
+    root->shard_raws = (uint8_t **)calloc((size_t)count, sizeof(uint8_t *));
+    root->shard_raw_sizes = (size_t *)calloc((size_t)count, sizeof(size_t));
+    root->shard_data_offsets = (size_t *)calloc((size_t)count, sizeof(size_t));
+    root->owned_extra_files = (BnGGUFFile **)calloc(count > 1 ? (size_t)(count - 1) : 1,
+                                                    sizeof(BnGGUFFile *));
+    if (!root->shard_raws || !root->shard_raw_sizes || !root->shard_data_offsets ||
+        !root->owned_extra_files)
+        goto fail_after_root;
+
+    uint64_t total_tensors = 0;
+    for (int i = 0; i < count; i++) {
+        if (files[i]->version != root->version) {
+            SH_LOG_ERROR("GGUF shard version mismatch");
+            goto fail_after_root;
+        }
+        if (files[i]->alignment != root->alignment) {
+            SH_LOG_ERROR("GGUF shard alignment mismatch");
+            goto fail_after_root;
+        }
+        if (files[i]->n_tensors > UINT64_MAX - total_tensors) {
+            SH_LOG_ERROR("Too many GGUF shard tensors");
+            goto fail_after_root;
+        }
+        total_tensors += files[i]->n_tensors;
+        root->shard_raws[i] = maps[i].data;
+        root->shard_raw_sizes[i] = maps[i].size;
+        root->shard_data_offsets[i] = files[i]->data_offset;
+    }
+    if (total_tensors > BN_GGUF_MAX_COUNT) {
+        SH_LOG_ERROR("Too many GGUF shard tensors");
+        goto fail_after_root;
+    }
+
+    BnGGUFTensorInfo *merged =
+        (BnGGUFTensorInfo *)calloc((size_t)total_tensors, sizeof(BnGGUFTensorInfo));
+    if (total_tensors > 0 && !merged) goto fail_after_root;
+
+    uint64_t out = 0;
+    for (int s = 0; s < count; s++) {
+        for (uint64_t i = 0; i < files[s]->n_tensors; i++) {
+            merged[out] = files[s]->tensors[i];
+            merged[out].name = files[s]->tensors[i].name;
+            merged[out].shard_idx = (uint32_t)s;
+            files[s]->tensors[i].name = NULL;
+            out++;
+        }
+    }
+    free(root->tensors);
+    root->tensors = merged;
+    root->n_tensors = total_tensors;
+
+    for (int i = 1; i < count; i++)
+        root->owned_extra_files[root->n_owned_extra_files++] = files[i];
+
+    for (int i = 0; i < count; i++) free(paths[i]);
+    free(paths);
+    free(files);
+    return root;
+
+fail_after_root:
+    free(root->shard_raws);
+    free(root->shard_raw_sizes);
+    free(root->shard_data_offsets);
+    free(root->owned_extra_files);
+    root->shard_raws = NULL;
+    root->shard_raw_sizes = NULL;
+    root->shard_data_offsets = NULL;
+    root->owned_extra_files = NULL;
+    root->owned_maps = NULL;
+    root->n_shards = 0;
+fail:
+    for (int i = 0; i < count; i++) {
+        if (files[i]) bn_gguf_free(files[i]);
+        bn_platform_unload_file(&maps[i]);
+        free(paths[i]);
+    }
+    free(paths);
+    free(files);
+    free(maps);
+    return NULL;
 }
 
 int bn_gguf_find_key(BnGGUFFile *f, const char *key) {
@@ -405,9 +603,19 @@ int bn_gguf_tensor_size(uint32_t type, uint64_t nelements, size_t *out) {
 void *bn_gguf_tensor_data(BnGGUFFile *f, int idx) {
     if (idx < 0 || (uint64_t)idx >= f->n_tensors) return NULL;
     BnGGUFTensorInfo *t = &f->tensors[idx];
-    if (t->offset > SIZE_MAX - f->data_offset) return NULL;
-    size_t offset = f->data_offset + t->offset;
-    if (offset >= f->raw_size) return NULL;
+    const uint8_t *raw = f->raw;
+    size_t raw_size = f->raw_size;
+    size_t data_offset = f->data_offset;
+    if (f->n_shards > 0) {
+        if (t->shard_idx >= f->n_shards) return NULL;
+        raw = f->shard_raws[t->shard_idx];
+        raw_size = f->shard_raw_sizes[t->shard_idx];
+        data_offset = f->shard_data_offsets[t->shard_idx];
+    }
+    if (!raw) return NULL;
+    if (t->offset > SIZE_MAX - data_offset) return NULL;
+    size_t offset = data_offset + t->offset;
+    if (offset >= raw_size) return NULL;
 
     // Compute total elements from dims (reject zero-dimension tensors)
     uint64_t nelements = 1;
@@ -422,10 +630,15 @@ void *bn_gguf_tensor_data(BnGGUFFile *f, int idx) {
         SH_LOG_ERROR("Unsupported or invalid tensor shape", "tensor", t->name ? t->name : "?");
         return NULL;
     }
-    if (tsize > f->raw_size - offset) {
+    if (tsize > raw_size - offset) {
         SH_LOG_ERROR("Tensor data exceeds buffer", "tensor", t->name ? t->name : "?");
         return NULL;
     }
 
-    return f->raw + offset;
+    return (void *)(raw + offset);
+}
+
+const BnMappedFile *bn_gguf_primary_file(BnGGUFFile *f) {
+    if (!f || !f->owned_maps || f->n_shards == 0) return NULL;
+    return &f->owned_maps[0];
 }

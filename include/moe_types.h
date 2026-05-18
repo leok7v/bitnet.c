@@ -8,6 +8,7 @@ typedef struct {
     size_t gate_offset, up_offset, down_offset;
     size_t expert_gate_bytes, expert_up_bytes, expert_down_bytes;
     size_t gate_stride, up_stride, down_stride;
+    uint32_t gate_shard_idx, up_shard_idx, down_shard_idx;
     int gate_type, up_type, down_type;
     int gate_rows, gate_cols;
     int up_rows, up_cols;
@@ -24,6 +25,8 @@ typedef struct {
 typedef struct {
     int fd;
     const uint8_t *mmap_base; // mmap'd file base pointer (NULL if using pread)
+    const uint8_t **mmap_bases; // optional per-shard mmap bases
+    size_t n_mmap_bases;
     int madvise_mode;         // 1 = madvise-guided mmap (WILLNEED/DONTNEED)
     void *prefetch;           // BnMoEPrefetch* for gate+up (opaque, pread only)
     void *prefetch_down;      // BnMoEPrefetch* for down proj (opaque, pread only)

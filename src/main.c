@@ -486,24 +486,18 @@ int main(int argc, char **argv) {
     SH_LOG_INFO("Loading model", "path", args.model_path);
     double t0 = bn_platform_time_ms();
 
-    BnMappedFile mf = bn_platform_load_file(args.model_path);
-    if (!mf.data) {
-        SH_LOG_ERROR("Failed to load file", "path", args.model_path);
+    BnGGUFFile *gf = bn_gguf_open_file(args.model_path);
+    if (!gf) {
+        SH_LOG_ERROR("Failed to parse GGUF", "path", args.model_path);
         return 1;
     }
+    const BnMappedFile *mf = bn_gguf_primary_file(gf);
     {
         char mb[32], ms[32];
-        snprintf(mb, sizeof(mb), "%.1f", mf.size / (1024.0 * 1024.0));
+        snprintf(mb, sizeof(mb), "%.1f",
+                 mf ? mf->size / (1024.0 * 1024.0) : 0.0);
         snprintf(ms, sizeof(ms), "%.0f", bn_platform_time_ms() - t0);
         SH_LOG_INFO("File loaded", "MB", mb, "ms", ms);
-    }
-
-    // Parse GGUF
-    BnGGUFFile *gf = bn_gguf_open(mf.data, mf.size);
-    if (!gf) {
-        SH_LOG_ERROR("Failed to parse GGUF");
-        bn_platform_unload_file(&mf);
-        return 1;
     }
     {
         char ver[8], nt[16], nkv[16];
@@ -531,28 +525,29 @@ int main(int argc, char **argv) {
     if (bn_model_load(&model, gf, args.max_seq_len, args.kv_f16, args.kv_tq_bits) != 0) {
         SH_LOG_ERROR("Failed to load model");
         bn_gguf_free(gf);
-        bn_platform_unload_file(&mf);
         return 1;
     }
-    bn_model_set_file(&model, mf);  // keep mmap/buffer alive
     model.config.flash_attn = args.flash_attn;
 
     // Set expert I/O for MoE: prefer mmap, fallback to pread
     if (model.config.n_experts > 0) {
         BnMoEIO *moe_io = bn_model_moe_io(&model);
-        if (!args.force_pread && mf.is_mmap == 1 && mf.data) {
-            bn_model_set_moe_mmap_base(&model, mf.data);
+        if (gf->n_shards > 1 && !args.force_pread && gf->shard_raws) {
+            bn_model_set_moe_mmap_shards(&model, (const uint8_t **)gf->shard_raws,
+                                         gf->n_shards);
+        } else if (gf->n_shards <= 1 && !args.force_pread && mf && mf->is_mmap == 1 && mf->data) {
+            bn_model_set_moe_mmap_base(&model, mf->data);
         }
-        if (mf.fd >= 0) {
-            bn_model_set_moe_fd(&model, mf.fd);
+        if (gf->n_shards <= 1 && mf && mf->fd >= 0) {
+            bn_model_set_moe_fd(&model, mf->fd);
         }
 
         // madvise-guided mmap: use WILLNEED prefetch hints
         if (args.force_madvise && args.force_pread) {
             SH_LOG_WARN("--madvise and --pread are mutually exclusive, ignoring --madvise");
-        } else if (args.force_madvise && !moe_io->mmap_base) {
+        } else if (args.force_madvise && !bn_moe_io_has_mmap(moe_io)) {
             SH_LOG_WARN("--madvise requires mmap (file not mmap'd), falling back to pread");
-        } else if (args.force_madvise && moe_io->mmap_base) {
+        } else if (args.force_madvise && bn_moe_io_has_mmap(moe_io)) {
 #if !defined(__EMSCRIPTEN__)
             // Only suppress readahead — don't evict. Let page cache manage eviction.
             bn_model_set_moe_madvise(&model, 1);
@@ -560,12 +555,12 @@ int main(int argc, char **argv) {
 #endif
         } else if (args.force_pread) {
             SH_LOG_INFO("Expert I/O mode", "mode", "pread (forced)");
-        } else if (moe_io->mmap_base) {
+        } else if (bn_moe_io_has_mmap(moe_io)) {
             SH_LOG_INFO("Expert I/O mode", "mode", "mmap");
         }
 
         if (args.prefault_moe) {
-            if (args.force_pread || !moe_io->mmap_base) {
+            if (args.force_pread || !bn_moe_io_has_mmap(moe_io)) {
                 SH_LOG_WARN("--prefault-moe requires mmap, ignoring");
             } else {
                 bn_moe_prefault_mmap(&model);
@@ -578,7 +573,7 @@ int main(int argc, char **argv) {
 
         // Create expert LRU cache (pread only, not needed for madvise)
         if (!moe_io->madvise_mode &&
-            args.cache_mb > 0 && !moe_io->mmap_base && moe_io->fd >= 0
+            args.cache_mb > 0 && !bn_moe_io_has_mmap(moe_io) && moe_io->fd >= 0
             && model.config.n_layers > 0) {
             BnMoEExpertMap *em = &model.weights.layers[0].moe.expert_map;
             bn_model_set_moe_cache(&model, bn_moe_cache_create(
@@ -652,8 +647,9 @@ int main(int argc, char **argv) {
         BnGPUBackend *gpu = bn_gpu_metal_create(sd);
         if (gpu) {
             // Zero-copy: let Metal wrap mmap'd weight data when explicitly enabled.
-            if (getenv("BN_METAL_ENABLE_MMAP_ZERO_COPY") && mf.is_mmap && mf.data)
-                bn_gpu_metal_set_mmap_range(gpu, mf.data, mf.size);
+            if (gf->n_shards <= 1 && getenv("BN_METAL_ENABLE_MMAP_ZERO_COPY") &&
+                mf && mf->is_mmap && mf->data)
+                bn_gpu_metal_set_mmap_range(gpu, mf->data, mf->size);
             double gpu_t0 = bn_platform_time_ms();
             if (bn_model_upload_weights(&model, gpu) == 0) {
                 char ms[16];
@@ -749,7 +745,6 @@ int main(int argc, char **argv) {
         SH_LOG_ERROR("Failed to create session");
         bn_model_free(&model);
         bn_gguf_free(gf);
-        bn_platform_unload_file(&mf);
         return 1;
     }
 
@@ -799,23 +794,12 @@ int main(int argc, char **argv) {
     // Load draft model for speculative decoding
     BnModel draft_model = {0};
     BnGGUFFile *draft_gf = NULL;
-    BnMappedFile draft_mf = {0};
     int has_draft = 0;
     if (args.draft_path) {
         SH_LOG_INFO("Loading draft model", "path", args.draft_path);
-        draft_mf = bn_platform_load_file(args.draft_path);
-        if (!draft_mf.data) {
-            SH_LOG_ERROR("Failed to load draft model file");
-            bn_sampler_free(&sampler);
-            bn_tokenizer_free(&tokenizer);
-            bn_model_free(&model);
-            bn_gguf_free(gf);
-            return 1;
-        }
-        draft_gf = bn_gguf_open(draft_mf.data, draft_mf.size);
+        draft_gf = bn_gguf_open_file(args.draft_path);
         if (!draft_gf) {
             SH_LOG_ERROR("Failed to parse draft GGUF");
-            bn_platform_unload_file(&draft_mf);
             bn_sampler_free(&sampler);
             bn_tokenizer_free(&tokenizer);
             bn_model_free(&model);
@@ -825,14 +809,12 @@ int main(int argc, char **argv) {
         if (bn_model_load(&draft_model, draft_gf, args.max_seq_len, args.kv_f16, args.kv_tq_bits) != 0) {
             SH_LOG_ERROR("Failed to load draft model");
             bn_gguf_free(draft_gf);
-            bn_platform_unload_file(&draft_mf);
             bn_sampler_free(&sampler);
             bn_tokenizer_free(&tokenizer);
             bn_model_free(&model);
             bn_gguf_free(gf);
             return 1;
         }
-        bn_model_set_file(&draft_model, draft_mf);
         draft_model.config.flash_attn = args.flash_attn;
         // Share thread pool (never run concurrently)
         bn_model_set_thread_pool(&draft_model, bn_model_pool(&model), 0);
@@ -1165,7 +1147,7 @@ int main(int argc, char **argv) {
     bn_session_free(session, NULL);
     bn_sampler_free(&sampler);
     bn_tokenizer_free(&tokenizer);
-    bn_model_free(&model);  // also unloads mmap'd file
+    bn_model_free(&model);
     bn_gguf_free(gf);
 
     return 0;

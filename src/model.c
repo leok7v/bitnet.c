@@ -137,6 +137,15 @@ void bn_model_set_moe_mmap_base(BnModel *model, const uint8_t *base) {
     if (io) io->mmap_base = base;
 }
 
+void bn_model_set_moe_mmap_shards(BnModel *model, const uint8_t **bases,
+                                  size_t n_bases) {
+    BnMoEIO *io = bn_model_moe_io(model);
+    if (io) {
+        io->mmap_bases = bases;
+        io->n_mmap_bases = n_bases;
+    }
+}
+
 void bn_model_set_moe_fd(BnModel *model, int fd) {
     BnMoEIO *io = bn_model_moe_io(model);
     if (io) io->fd = fd;

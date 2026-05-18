@@ -735,24 +735,15 @@ int main(int argc, char **argv) {
 #endif
 
     // Load model
-    BnMappedFile mf = bn_platform_load_file(model_path);
-    if (!mf.data) {
-        fprintf(stderr, "Failed to load %s\n", model_path);
-#ifdef BN_ENABLE_METAL
-        if (metal_gpu) bn_gpu_metal_destroy(metal_gpu);
-#endif
-        return 1;
-    }
-
-    BnGGUFFile *gf = bn_gguf_open(mf.data, mf.size);
+    BnGGUFFile *gf = bn_gguf_open_file(model_path);
     if (!gf) {
         fprintf(stderr, "Failed to parse GGUF\n");
 #ifdef BN_ENABLE_METAL
         if (metal_gpu) bn_gpu_metal_destroy(metal_gpu);
 #endif
-        bn_platform_unload_file(&mf);
         return 1;
     }
+    const BnMappedFile *mf = bn_gguf_primary_file(gf);
 
     BnModel model = {0};
     int bench_seq_len = n_toks + 8;
@@ -764,16 +755,17 @@ int main(int argc, char **argv) {
         if (metal_gpu) bn_gpu_metal_destroy(metal_gpu);
 #endif
         bn_gguf_free(gf);
-        bn_platform_unload_file(&mf);
         return 1;
     }
-    bn_model_set_file(&model, mf);
     model.config.flash_attn = flash_attn;
     if (model.config.n_experts > 0) {
-        if ((mf.is_mmap == 1 || mf.is_mmap == 0) && mf.data)
-            bn_model_set_moe_mmap_base(&model, mf.data);
-        if (mf.fd >= 0)
-            bn_model_set_moe_fd(&model, mf.fd);
+        if (gf->n_shards > 1 && gf->shard_raws)
+            bn_model_set_moe_mmap_shards(&model, (const uint8_t **)gf->shard_raws,
+                                         gf->n_shards);
+        else if (gf->n_shards <= 1 && mf && (mf->is_mmap == 1 || mf->is_mmap == 0) && mf->data)
+            bn_model_set_moe_mmap_base(&model, mf->data);
+        if (gf->n_shards <= 1 && mf && mf->fd >= 0)
+            bn_model_set_moe_fd(&model, mf->fd);
     }
 
 #ifdef BN_ENABLE_WEBGPU
@@ -812,8 +804,8 @@ int main(int argc, char **argv) {
 
 #ifdef BN_ENABLE_METAL
     if (use_metal) {
-        if (mf.data)
-            bn_gpu_metal_set_mmap_range(metal_gpu, mf.data, mf.size);
+        if (gf->n_shards <= 1 && mf && mf->data)
+            bn_gpu_metal_set_mmap_range(metal_gpu, mf->data, mf->size);
         if (bn_model_upload_weights(&model, metal_gpu) != 0) {
             fprintf(stderr, "Failed to upload model weights to Metal\n");
             bn_gpu_metal_destroy(metal_gpu);
