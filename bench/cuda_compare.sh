@@ -2,13 +2,16 @@
 # Compare bitnet.c CUDA prompt/decode throughput against llama.cpp CUDA.
 #
 # This is a short parity gate for Qwen GGUFs. The workloads are not identical:
-# bitnet.c uses bench_kernels' random next-token loop, while llama.cpp uses
-# llama-bench pp/tg. Treat the ratio as a directional CUDA backend regression
-# signal, not a formal benchmark.
+# bitnet.c prompt processing is measured with bench_kernels. Decode defaults to
+# the real bitnet CLI generation path so logits/readback are included like
+# llama-bench tg. Set BITNET_TG_MODE=bench to use bench_kernels' random
+# next-token loop instead. Treat the ratio as a directional CUDA backend
+# regression signal, not a formal benchmark.
 
 set -uo pipefail
 
 BITNET_BENCH="${BITNET_BENCH:-./bench_kernels}"
+BITNET_CLI="${BITNET_CLI:-./bitnet}"
 LLAMA_BENCH="${LLAMA_BENCH:-/home/mark/artalis.io/tools/llama.cpp/build/bin/llama-bench}"
 LLAMA_LIB_DIR="${LLAMA_LIB_DIR:-$(dirname "$LLAMA_BENCH")}"
 THREADS="${THREADS:-8}"
@@ -18,6 +21,8 @@ PREFILL_TOKS="${PREFILL_TOKS:-16}"
 ITERS="${ITERS:-10}"
 CUDA_DEVICE="${BN_CUDA_DEVICE:-auto}"
 MODEL_ROOT="${BN_MODEL_ROOT:-${MODEL_ROOT:-/data/models/gguf}}"
+MAXSEQ="${MAXSEQ:-512}"
+BITNET_TG_MODE="${BITNET_TG_MODE:-generate}"
 
 find_first_model() {
     pattern=$1
@@ -56,6 +61,11 @@ if [ ! -x "$BITNET_BENCH" ]; then
     exit 1
 fi
 
+if [ "$BITNET_TG_MODE" = "generate" ] && [ ! -x "$BITNET_CLI" ]; then
+    echo "ERROR: $BITNET_CLI not found or not executable" >&2
+    exit 1
+fi
+
 if [ ! -x "$LLAMA_BENCH" ]; then
     echo "ERROR: $LLAMA_BENCH not found or not executable" >&2
     exit 1
@@ -76,10 +86,24 @@ for model in $MODELS; do
         printf '%s\n' "$bitnet_out" >&2
         continue
     fi
-    bitnet_tps=$(printf '%s\n' "$bitnet_out" |
-        awk '/Throughput:/ { v=$2 } END { if (v == "") v="0"; print v }')
     bitnet_pp=$(printf '%s\n' "$bitnet_out" |
         awk '/^Prefill:/ { v=$2 } END { if (v == "") v="0"; print v }')
+
+    if [ "$BITNET_TG_MODE" = "generate" ]; then
+        if ! bitnet_tg_out=$(BN_CUDA_DEVICE="$CUDA_DEVICE" "$BITNET_CLI" \
+            "$model" --cuda -n "$TOKS" --maxseq "$MAXSEQ" --quiet 2>&1); then
+            echo -e "$(basename "$model")\t$bitnet_pp\tSKIP\t0\tERROR\tbitnet generate failed\t0\tFAIL"
+            printf '%s\n' "$bitnet_tg_out" >&2
+            continue
+        fi
+        bitnet_tps=$(printf '%s\n' "$bitnet_tg_out" |
+            sed -n 's/.*tok\/s=\([0-9.][0-9.]*\).*/\1/p' |
+            tail -n 1)
+        if [ -z "$bitnet_tps" ]; then bitnet_tps="0"; fi
+    else
+        bitnet_tps=$(printf '%s\n' "$bitnet_out" |
+            awk '/Throughput:/ { v=$2 } END { if (v == "") v="0"; print v }')
+    fi
 
     if ! llama_out=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         "$LLAMA_BENCH" -m "$model" -p "$PREFILL_TOKS" -n "$LLAMA_TOKS" -t "$THREADS" -ngl 99 2>&1); then
