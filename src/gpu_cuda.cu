@@ -1376,6 +1376,44 @@ static __global__ void rmsnorm_kernel(float *out, const float *x,
         out[i] = x[i] * scale * weight[i];
 }
 
+static __global__ void per_head_rmsnorm_kernel(float *x,
+                                               const float *weight,
+                                               int n_heads,
+                                               int head_size,
+                                               float eps,
+                                               int per_head_weight,
+                                               size_t x_offset) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    if (h >= n_heads || head_size <= 0) return;
+
+    float *xh = x + x_offset + (size_t)h * head_size;
+    const float *wh = weight + (per_head_weight ? (size_t)h * head_size : 0);
+    float ss = 0.0f;
+    for (int i = tid; i < head_size; i += blockDim.x)
+        ss += xh[i] * xh[i];
+
+    extern __shared__ float scratch[];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        ss += __shfl_down_sync(0xffffffffu, ss, offset);
+    if (lane == 0) scratch[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) >> 5;
+        float total = lane < n_warps ? scratch[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        if (lane == 0) scratch[0] = total;
+    }
+    __syncthreads();
+
+    float scale = rsqrtf(scratch[0] / (float)head_size + eps);
+    for (int i = tid; i < head_size; i += blockDim.x)
+        xh[i] = xh[i] * scale * wh[i];
+}
+
 static __global__ void residual_rmsnorm_kernel(float *x, const float *r,
                                                float *out,
                                                const float *weight,
@@ -2567,6 +2605,7 @@ static const char *cuda_op_name(int code) {
     case BN_GPU_CODE_FUSED_GATEUP_SILU: return "fused_gateup";
     case BN_GPU_CODE_RMSNORM: return "rmsnorm";
     case BN_GPU_CODE_RESIDUAL_RMSNORM: return "residual_rmsnorm";
+    case BN_GPU_CODE_PER_HEAD_RMSNORM: return "per_head_rmsnorm";
     case BN_GPU_CODE_COPY: return "copy";
     case BN_GPU_CODE_BIAS_ADD: return "bias_add";
     case BN_GPU_CODE_RESIDUAL_ADD: return "residual_add";
@@ -2613,6 +2652,8 @@ static int cuda_op_writes_buf(const BnGPUOp *op, int buf) {
     case BN_GPU_CODE_Q8_MATVEC_SPLIT:
     case BN_GPU_CODE_Q5K_MATVEC_SPLIT:
         return op->buf_aux == buf || (int)op->rows == buf;
+    case BN_GPU_CODE_PER_HEAD_RMSNORM:
+        return op->buf_in == buf;
     default:
         return 0;
     }
@@ -2628,6 +2669,7 @@ static int cuda_op_reads_buf(const BnGPUOp *op, int buf) {
     case BN_GPU_CODE_Q5K_MATVEC_SPLIT:
     case BN_GPU_CODE_FUSED_GATEUP_SILU:
     case BN_GPU_CODE_RMSNORM:
+    case BN_GPU_CODE_PER_HEAD_RMSNORM:
     case BN_GPU_CODE_COPY:
     case BN_GPU_CODE_BIAS_ADD:
     case BN_GPU_CODE_SILU_ACT:
@@ -2716,7 +2758,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
         cudaEventCreate(&ev_stop);
     }
 
-    if (getenv("BN_CUDA_DUMP_OPS") && n_ops > 10) {
+    if (getenv("BN_CUDA_DUMP_OPS") && n_ops > 0) {
         static int dumped = 0;
         if (!dumped) {
             int limit = n_ops < 256 ? n_ops : 256;
@@ -3228,6 +3270,20 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 threads, (size_t)threads * sizeof(float),
                 in, aux, out, (const float *)w->data, n,
                 cuda_u32_to_f32(op->p[1]));
+            break;
+        }
+        case BN_GPU_CODE_PER_HEAD_RMSNORM: {
+            BnCudaBuffer *w = (BnCudaBuffer *)op->W_buf;
+            float *in = cuda_act(ctx, op->buf_in);
+            int head_size = (int)op->p[0];
+            int n_heads = op->rows;
+            size_t x_offset = (size_t)op->p[3];
+            if (!w || !w->data || !in || n_heads <= 0 || head_size <= 0)
+                return -1;
+            BN_CUDA_LAUNCH(ctx, per_head_rmsnorm_kernel, n_heads, threads,
+                (size_t)threads * sizeof(float),
+                in, (const float *)w->data, n_heads, head_size,
+                cuda_u32_to_f32(op->p[1]), (int)op->p[2], x_offset);
             break;
         }
         case BN_GPU_CODE_COPY: {
@@ -3776,8 +3832,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->free_activations = cuda_free_activations;
     gpu->write_activation = cuda_write_activation;
     gpu->read_activation = cuda_read_activation;
-    if (!getenv("BN_CUDA_DISABLE_GRAPH"))
-        gpu->execute = cuda_execute;
+    gpu->execute = cuda_execute;
     gpu->ctx = ctx;
     gpu->kind = BN_GPU_BACKEND_CUDA;
     gpu->max_storage_binding_size = 0;

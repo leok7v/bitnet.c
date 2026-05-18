@@ -145,7 +145,7 @@ float *bn_transformer_forward(BnModel *m, BnSession *s, int token, int pos) {
     // are slower there. The experimental CUDA backend has no graph path yet,
     // so keep it attached to exercise backend-owned matvec buffers.
     BnGPUBackend *gpu = bn_model_gpu(m);
-    int disable_gpu = !(gpu && gpu->kind == BN_GPU_BACKEND_CUDA);
+    int disable_gpu = !(gpu && gpu->kind == BN_GPU_BACKEND_CUDA && gpu->execute);
     if (disable_gpu)
         bn_model_set_gpu_disabled(m, 1);
     int rc = forward_layers(m, s, token, pos);
@@ -162,7 +162,7 @@ int bn_transformer_forward_no_logits(BnModel *m, BnSession *s,
         return 0;
 
     BnGPUBackend *gpu = bn_model_gpu(m);
-    int disable_gpu = !(gpu && gpu->kind == BN_GPU_BACKEND_CUDA);
+    int disable_gpu = !(gpu && gpu->kind == BN_GPU_BACKEND_CUDA && gpu->execute);
     if (disable_gpu)
         bn_model_set_gpu_disabled(m, 1);
     int rc = forward_layers(m, s, token, pos);

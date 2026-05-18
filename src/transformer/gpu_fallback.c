@@ -137,9 +137,8 @@ int bn_transformer_gpu_fallback_cpu_attention(
     BnLayerShapePlan shape;
     bn_transformer_plan_layer_shape(&shape, c, lw, layer,
                                     bn_model_tq_state(m) != NULL);
-    if (!shape.is_attn || shape.q_gated || shape.q_wide ||
-        c->kv_tq_bits > 0 || c->kv_f16 ||
-        lw->attn.q_norm || lw->attn.k_norm || lw->norm.attn_sub_norm)
+    if (!shape.is_attn || shape.q_gated ||
+        c->kv_tq_bits > 0 || c->kv_f16 || lw->norm.attn_sub_norm)
         return -1;
 
     if (bn_transformer_gpu_emit_context_flush(emit, gpu) != 0)
@@ -167,7 +166,7 @@ int bn_transformer_gpu_fallback_cpu_attention(
                     bn_model_pool(m));
 
     if (lw->attn.q_bias) {
-        for (int i = 0; i < dim; i++) s->q[i] += lw->attn.q_bias[i];
+        for (int i = 0; i < shape.q_dim; i++) s->q[i] += lw->attn.q_bias[i];
     }
     if (lw->attn.k_bias) {
         for (int i = 0; i < kv_dim; i++) key_cache_row[i] += lw->attn.k_bias[i];
@@ -175,6 +174,20 @@ int bn_transformer_gpu_fallback_cpu_attention(
     if (lw->attn.v_bias) {
         for (int i = 0; i < kv_dim; i++)
             value_cache_row[i] += lw->attn.v_bias[i];
+    }
+    if (lw->attn.q_norm) {
+        for (int h = 0; h < c->n_heads; h++)
+            fallback_rmsnorm(s->q + (size_t)h * head_size,
+                             s->q + (size_t)h * head_size,
+                             lw->attn.q_norm + (size_t)h * shape.qk_stride,
+                             head_size, c->norm_eps);
+    }
+    if (lw->attn.k_norm) {
+        for (int h = 0; h < n_kv_heads; h++)
+            fallback_rmsnorm(key_cache_row + (size_t)h * head_size,
+                             key_cache_row + (size_t)h * head_size,
+                             lw->attn.k_norm + (size_t)h * shape.qk_stride,
+                             head_size, c->norm_eps);
     }
 
     bn_transformer_cpu_apply_rope_heads(s->q, c->n_heads, head_size,
@@ -525,9 +538,8 @@ int bn_transformer_gpu_debug_compare_attention(
     BnLayerShapePlan shape;
     bn_transformer_plan_layer_shape(&shape, c, lw, layer,
                                     bn_model_tq_state(m) != NULL);
-    if (!shape.is_attn || shape.q_gated || shape.q_wide ||
-        c->kv_tq_bits > 0 || c->kv_f16 ||
-        lw->attn.q_norm || lw->attn.k_norm || lw->norm.attn_sub_norm)
+    if (!shape.is_attn || shape.q_gated ||
+        c->kv_tq_bits > 0 || c->kv_f16 || lw->norm.attn_sub_norm)
         return -1;
 
     float *cpu_in = (float *)malloc((size_t)dim * sizeof(float));
@@ -586,7 +598,7 @@ int bn_transformer_gpu_debug_compare_attention(
                     bn_model_pool(m));
 
     if (lw->attn.q_bias) {
-        for (int i = 0; i < dim; i++) s->q[i] += lw->attn.q_bias[i];
+        for (int i = 0; i < shape.q_dim; i++) s->q[i] += lw->attn.q_bias[i];
     }
     if (lw->attn.k_bias) {
         for (int i = 0; i < kv_dim; i++) key_cache_row[i] += lw->attn.k_bias[i];
@@ -594,6 +606,20 @@ int bn_transformer_gpu_debug_compare_attention(
     if (lw->attn.v_bias) {
         for (int i = 0; i < kv_dim; i++)
             value_cache_row[i] += lw->attn.v_bias[i];
+    }
+    if (lw->attn.q_norm) {
+        for (int h = 0; h < c->n_heads; h++)
+            fallback_rmsnorm(s->q + (size_t)h * head_size,
+                             s->q + (size_t)h * head_size,
+                             lw->attn.q_norm + (size_t)h * shape.qk_stride,
+                             head_size, c->norm_eps);
+    }
+    if (lw->attn.k_norm) {
+        for (int h = 0; h < n_kv_heads; h++)
+            fallback_rmsnorm(key_cache_row + (size_t)h * head_size,
+                             key_cache_row + (size_t)h * head_size,
+                             lw->attn.k_norm + (size_t)h * shape.qk_stride,
+                             head_size, c->norm_eps);
     }
 
     bn_transformer_cpu_apply_rope_heads(s->q, c->n_heads, head_size,
@@ -798,6 +824,24 @@ int bn_transformer_gpu_debug_compare_qkv(
     }
     if (lw->attn.v_bias) {
         for (int i = 0; i < kv_dim; i++) cpu_v[i] += lw->attn.v_bias[i];
+    }
+    if (lw->attn.q_norm) {
+        int head_size = m->config.head_size;
+        int qk_stride = m->config.qk_norm_per_head ? head_size : 0;
+        for (int h = 0; h < m->config.n_heads; h++)
+            fallback_rmsnorm(cpu_q + (size_t)h * head_size,
+                             cpu_q + (size_t)h * head_size,
+                             lw->attn.q_norm + (size_t)h * qk_stride,
+                             head_size, m->config.norm_eps);
+    }
+    if (lw->attn.k_norm) {
+        int head_size = m->config.head_size;
+        int qk_stride = m->config.qk_norm_per_head ? head_size : 0;
+        for (int h = 0; h < m->config.n_kv_heads; h++)
+            fallback_rmsnorm(cpu_k + (size_t)h * head_size,
+                             cpu_k + (size_t)h * head_size,
+                             lw->attn.k_norm + (size_t)h * qk_stride,
+                             head_size, m->config.norm_eps);
     }
 
     debug_compare_vec("qkv_q_compare", layer, pos, cpu_q, gpu_q, q_dim);

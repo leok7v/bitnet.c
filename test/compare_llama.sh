@@ -6,6 +6,7 @@
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf -n 50
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --prompt "The sum of 2 + 2 ="
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --metal
+#   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --cuda --llama-cuda
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --metal --llama-metal --flash
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --metal --llama-gpu-layers 12
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --metal --llama-metal --llama-flash-off
@@ -27,12 +28,15 @@ LLAMA_ARGS=(-ngl 0 -dev none)
 LLAMA_FLASH=()
 LLAMA_THREADS=1
 CUSTOM_PROMPTS=()
+LLAMA_BIN_DIR="${LLAMA_BIN_DIR:-/home/mark/artalis.io/tools/llama.cpp/build/bin}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n) N_TOKENS="$2"; shift 2 ;;
         --prompt) CUSTOM_PROMPTS+=("$2"); shift 2 ;;
         --metal) BITNET_ARGS+=(--metal); shift ;;
         --llama-metal) LLAMA_ARGS=(-ngl 99); shift ;;
+        --cuda) BITNET_ARGS+=(--cuda); shift ;;
+        --llama-cuda) LLAMA_ARGS=(-ngl 99); shift ;;
         --llama-gpu-layers) LLAMA_ARGS=(-ngl "$2"); shift 2 ;;
         --webgpu|--gpu) BITNET_ARGS+=(--webgpu); shift ;;
         --no-prefill) BITNET_ARGS+=(--no-prefill); shift ;;
@@ -60,15 +64,22 @@ done
 
 # Check dependencies
 BITNET="./bitnet"
-LLAMA="llama-completion"
-LLAMA_TOKENIZE="llama-tokenize"
+LLAMA="${LLAMA:-llama-completion}"
+LLAMA_TOKENIZE="${LLAMA_TOKENIZE:-llama-tokenize}"
+if [[ "$LLAMA" == "llama-completion" && -x "$LLAMA_BIN_DIR/llama-completion" ]]; then
+    LLAMA="$LLAMA_BIN_DIR/llama-completion"
+fi
+if [[ "$LLAMA_TOKENIZE" == "llama-tokenize" && -x "$LLAMA_BIN_DIR/llama-tokenize" ]]; then
+    LLAMA_TOKENIZE="$LLAMA_BIN_DIR/llama-tokenize"
+fi
+LLAMA_LIB_DIR="${LLAMA_LIB_DIR:-$(dirname "$LLAMA")}"
 if [[ ! -x "$BITNET" ]]; then
     echo "ERROR: $BITNET not found. Run 'make' first." >&2; exit 1
 fi
-if ! command -v "$LLAMA" &>/dev/null; then
+if [[ ! -x "$LLAMA" ]] && ! command -v "$LLAMA" &>/dev/null; then
     echo "ERROR: $LLAMA not found. Run 'brew install llama.cpp'." >&2; exit 1
 fi
-if (( STRICT )) && ! command -v "$LLAMA_TOKENIZE" &>/dev/null; then
+if (( STRICT )) && [[ ! -x "$LLAMA_TOKENIZE" ]] && ! command -v "$LLAMA_TOKENIZE" &>/dev/null; then
     echo "ERROR: $LLAMA_TOKENIZE not found. Run 'brew install llama.cpp'." >&2; exit 1
 fi
 if [[ ! -f "$MODEL" ]]; then
@@ -78,7 +89,8 @@ fi
 first_token_id() {
     local text="$1"
     local ids
-    ids=$("$LLAMA_TOKENIZE" -m "$MODEL" --ids --no-bos -p "$text" --log-disable 2>/dev/null) || return 1
+    ids=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$LLAMA_TOKENIZE" -m "$MODEL" --ids --no-bos -p "$text" --log-disable 2>/dev/null) || return 1
     ids="${ids#[}"
     ids="${ids%]}"
     ids="${ids//[[:space:]]/}"
@@ -91,7 +103,8 @@ first_token_id() {
 token_ids_csv() {
     local text="$1"
     local ids
-    ids=$("$LLAMA_TOKENIZE" -m "$MODEL" --ids --no-bos -p "$text" --log-disable 2>/dev/null) || return 1
+    ids=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$LLAMA_TOKENIZE" -m "$MODEL" --ids --no-bos -p "$text" --log-disable 2>/dev/null) || return 1
     ids="${ids#[}"
     ids="${ids%]}"
     ids="${ids//[[:space:]]/}"
@@ -171,7 +184,8 @@ for prompt in "${PROMPTS[@]}"; do
     if (( ${#LLAMA_FLASH[@]} > 0 )); then
         llama_run_args+=("${LLAMA_FLASH[@]}")
     fi
-    llama_out=$("$LLAMA" -m "$MODEL" "${llama_run_args[@]}" -p "$prompt" -n "$N_TOKENS" \
+    llama_out=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$LLAMA" -m "$MODEL" "${llama_run_args[@]}" -p "$prompt" -n "$N_TOKENS" \
         --temp 0 --no-display-prompt -no-cnv --simple-io --verbosity 1 \
         -t "$LLAMA_THREADS" 2>"$llama_stderr" | sed 's/> EOF by user$//') || true
 

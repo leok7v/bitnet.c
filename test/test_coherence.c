@@ -1042,6 +1042,12 @@ int main(int argc, char **argv) {
                 printf("  CUDA: weight upload failed, skipping\n");
                 bn_gpu_cuda_destroy(gpu);
                 total_skip++;
+            } else if (gpu->init_activations &&
+                       gpu->init_activations(gpu->ctx, &model.config) != 0) {
+                printf("  CUDA: activation init failed, skipping\n");
+                bn_model_release_gpu(&model);
+                bn_gpu_cuda_destroy(gpu);
+                total_skip++;
             } else {
                 int gpu_tokens[N_DECODE_STEPS];
 

@@ -33,12 +33,10 @@ int bn_transformer_gpu_logits_needs_cpu_fallback(
 }
 
 void bn_transformer_gpu_report_fallback(const char *reason) {
-    static int debug_printed = 0;
-    if (debug_printed || !getenv("BN_GPU_DEBUG_FALLBACK"))
+    if (!getenv("BN_GPU_DEBUG_FALLBACK"))
         return;
 
     fprintf(stderr, "[gpu:fallback] %s\n", reason ? reason : "unknown");
-    debug_printed = 1;
 }
 
 float *bn_transformer_gpu_reject_forward(
@@ -66,8 +64,12 @@ int bn_transformer_gpu_validate_forward(
         return -1; \
     } while (0)
 
-    if (!gpu || !gpu->execute || !gpu->write_activation)
-        GPU_POLICY_REJECT("backend missing execute/write_activation");
+    if (!gpu)
+        GPU_POLICY_REJECT("backend missing");
+    if (!gpu->execute)
+        GPU_POLICY_REJECT("backend missing execute");
+    if (!gpu->write_activation)
+        GPU_POLICY_REJECT("backend missing write_activation");
 
     if (token < 0 || token >= c->vocab_size)
         GPU_POLICY_REJECT("token out of bounds");

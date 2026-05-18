@@ -1,10 +1,10 @@
 #!/bin/bash
 # Compare bitnet.c CUDA decode smoke throughput against llama.cpp CUDA tg16.
 #
-# This is a short local parity gate for the Qwen2.5 GGUFs commonly present in
-# ./models. The workloads are not identical: bitnet.c uses bench_kernels'
-# random next-token loop, while llama.cpp uses llama-bench tg16. Treat the ratio
-# as a directional CUDA backend regression signal, not a formal benchmark.
+# This is a short parity gate for Qwen GGUFs. The workloads are not identical:
+# bitnet.c uses bench_kernels' random next-token loop, while llama.cpp uses
+# llama-bench tg16. Treat the ratio as a directional CUDA backend regression
+# signal, not a formal benchmark.
 
 set -uo pipefail
 
@@ -17,7 +17,35 @@ TOKS="${TOKS:-$LLAMA_TOKS}"
 PREFILL_TOKS="${PREFILL_TOKS:-16}"
 ITERS="${ITERS:-10}"
 CUDA_DEVICE="${BN_CUDA_DEVICE:-auto}"
-MODELS="${MODELS:-models/qwen2.5-0.5b-instruct-q4_k_m.gguf models/qwen2.5-0.5b-instruct-q8_0.gguf}"
+MODEL_ROOT="${BN_MODEL_ROOT:-${MODEL_ROOT:-/data/models/gguf}}"
+
+find_first_model() {
+    pattern=$1
+    if [ -n "$MODEL_ROOT" ] && [ -d "$MODEL_ROOT" ]; then
+        find "$MODEL_ROOT" -type f -iname "$pattern" | sort | head -n 1
+    fi
+}
+
+if [ -z "${MODELS:-}" ]; then
+    MODELS=""
+    for pattern in \
+        "Qwen2.5*Q4_K_M.gguf" \
+        "Qwen3-4B*Q4_K_M.gguf" \
+        "Qwen3.5-27B*Q5_K_M.gguf" \
+        "qwen3.6*35b*a3b*Q8_0.gguf" \
+        "qwen2.5-0.5b-instruct-q4_k_m.gguf" \
+        "qwen2.5-0.5b-instruct-q8_0.gguf"; do
+        found=$(find_first_model "$pattern")
+        if [ -n "$found" ]; then
+            MODELS="${MODELS}${MODELS:+ }$found"
+        fi
+    done
+fi
+
+if [ -z "$MODELS" ]; then
+    echo "ERROR: no models found; set MODELS or BN_MODEL_ROOT" >&2
+    exit 1
+fi
 
 if [ ! -x "$BITNET_BENCH" ]; then
     echo "ERROR: $BITNET_BENCH not found or not executable" >&2
@@ -37,14 +65,22 @@ for model in $MODELS; do
         continue
     fi
 
-    bitnet_out=$(BN_CUDA_DEVICE="$CUDA_DEVICE" "$BITNET_BENCH" "$model" \
+    if ! bitnet_out=$(BN_CUDA_DEVICE="$CUDA_DEVICE" "$BITNET_BENCH" "$model" \
         --cuda --iters "$ITERS" --toks "$TOKS" --prefill-toks "$PREFILL_TOKS" \
-        --prefill-iters 1 --threads "$THREADS" --random-gen 2>&1)
+        --prefill-iters 1 --threads "$THREADS" --random-gen 2>&1); then
+        echo -e "$(basename "$model")\tERROR\tbitnet bench failed\t0\tFAIL"
+        printf '%s\n' "$bitnet_out" >&2
+        continue
+    fi
     bitnet_tps=$(printf '%s\n' "$bitnet_out" |
         awk '/Throughput:/ { v=$2 } END { if (v == "") v="0"; print v }')
 
-    llama_out=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$LLAMA_BENCH" -m "$model" -n "$LLAMA_TOKS" -t "$THREADS" -ngl 99 2>&1)
+    if ! llama_out=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$LLAMA_BENCH" -m "$model" -n "$LLAMA_TOKS" -t "$THREADS" -ngl 99 2>&1); then
+        echo -e "$(basename "$model")\t$bitnet_tps\tllama-bench failed\t0\tFAIL"
+        printf '%s\n' "$llama_out" >&2
+        continue
+    fi
     llama_tps=$(printf '%s\n' "$llama_out" |
         awk '$0 ~ /tg[0-9]+/ { for (i = 1; i <= NF; i++) if ($i == "±") v=$(i - 1) } END { if (v == "") v="0"; print v }')
 

@@ -284,7 +284,7 @@ bench_layers: CFLAGS += -DBN_BENCH_LAYERS
 bench_layers: $(BENCH_SRCS) $(BENCH_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-.PHONY: debug asan bench bench_suite bench_llama_compare bench_llama_topk bench_llama_topk_server bench_cuda_compare bench_kernels_run bitnet_scalar bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers test test_architecture test_backend_matrix test_model_matrix test_gguf test_quant test_avx512_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_qwen36_cuda test_gemma4 test_gemma4_avx2 test_gemma4_webgpu test_gemma4_cuda test_gemma4_backend_matrix test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence pgo avx2-check avx512-check fetch-wgpu clean
+.PHONY: debug asan bench bench_suite bench_llama_compare bench_llama_topk bench_llama_topk_server bench_cuda_compare bench_qwen_cuda_matrix bench_kernels_run bitnet_scalar bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers test test_architecture test_backend_matrix test_model_matrix test_gguf test_quant test_avx512_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_qwen36_cuda test_gemma4 test_gemma4_avx2 test_gemma4_webgpu test_gemma4_cuda test_gemma4_backend_matrix test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence pgo avx2-check avx512-check fetch-wgpu clean
 
 bench: $(MAIN_TARGET)
 	./bench/bench_suite.sh
@@ -297,6 +297,9 @@ bench_llama_compare: bench_avx2
 
 bench_cuda_compare: bench_kernels
 	./bench/cuda_compare.sh
+
+bench_qwen_cuda_matrix: bitnet test_coherence bench_kernels
+	./bench/qwen_cuda_matrix.sh
 
 LLAMA_TOPK_MODEL ?= models/qwen2.5-3b-instruct-q4_0.gguf
 LLAMA_TOPK_ARGS ?= --metal --llama-metal --flash --maxseq 512 --gpu-max-storage-binding-mb 4096 --top-k 10 --min-overlap 3 --benchmark --bench-runs 3

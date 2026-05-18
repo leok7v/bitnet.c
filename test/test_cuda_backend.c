@@ -25,6 +25,60 @@ static void run_matvec_case(BnGPUBackend *gpu, const void *data,
     expect_close(out, ref, rows);
 }
 
+static uint32_t f32_bits(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    return bits;
+}
+
+static void run_per_head_rmsnorm_case(BnGPUBackend *gpu) {
+    BnConfig cfg = {0};
+    cfg.dim = 8;
+    cfg.hidden_dim = 8;
+    cfg.n_layers = 1;
+    cfg.n_heads = 2;
+    cfg.n_kv_heads = 2;
+    cfg.vocab_size = 16;
+    cfg.seq_len = 8;
+    cfg.rope_theta = BN_DEFAULT_ROPE_THETA;
+    cfg.head_size = 4;
+    cfg.kv_dim = 8;
+    cfg.kv_mul = 1;
+    assert(gpu->init_activations(gpu->ctx, &cfg) == 0);
+
+    float in[8] = { 1.0f, -2.0f, 3.0f, -4.0f, 2.0f, 1.0f, -1.0f, 0.5f };
+    float weight[4] = { 1.0f, 0.5f, 1.5f, -2.0f };
+    float out[8] = { 0 };
+    float ref[8] = { 0 };
+    for (int h = 0; h < 2; h++) {
+        float ss = 0.0f;
+        for (int i = 0; i < 4; i++)
+            ss += in[h * 4 + i] * in[h * 4 + i];
+        float scale = 1.0f / sqrtf(ss / 4.0f + 1e-5f);
+        for (int i = 0; i < 4; i++)
+            ref[h * 4 + i] = in[h * 4 + i] * scale * weight[i];
+    }
+
+    void *w = gpu->buffer_create(gpu->ctx, weight, sizeof(weight),
+                                 BN_GGUF_TENSOR_F32, 1, 4);
+    assert(w != NULL);
+    assert(gpu->write_activation(gpu->ctx, BN_GPU_VALUE_Q, in,
+                                 sizeof(in), 0) == 0);
+    BnGPUOp op = {0};
+    op.op_code = BN_GPU_CODE_PER_HEAD_RMSNORM;
+    op.W_buf = w;
+    op.buf_in = BN_GPU_VALUE_Q;
+    op.rows = 2;
+    op.p[0] = 4;
+    op.p[1] = f32_bits(1e-5f);
+    op.p[2] = 0;
+    assert(gpu->execute(gpu->ctx, &op, 1, BN_GPU_VALUE_Q, out, 8) == 0);
+    expect_close(out, ref, 8);
+
+    gpu->buffer_destroy(gpu->ctx, w);
+    gpu->free_activations(gpu->ctx);
+}
+
 int main(void) {
 #ifndef BN_ENABLE_CUDA
     printf("CUDA backend test skipped: BN_ENABLE_CUDA not set\n");
@@ -194,6 +248,8 @@ int main(void) {
     }
     run_matvec_case(gpu, &q8k, sizeof(q8k), BN_GGUF_TENSOR_Q8_K,
                     1, BN_QK_K, xk, &ref_q8k);
+
+    run_per_head_rmsnorm_case(gpu);
 
     bn_gpu_cuda_destroy(gpu);
 
