@@ -87,8 +87,11 @@ run_case() {
 }
 
 run_case "Qwen 2.5 dense" "BN_MODEL_QWEN25" \
-    "qwen2_5" \
+    "qwen2_5/3b" \
     "Qwen2.5*.gguf" "qwen2.5*.gguf"
+run_case "Qwen 2.5 sparse MoE" "BN_MODEL_QWEN25_MOE" \
+    "qwen2_5/moe_2x1_5b" \
+    "Qwen2.5*MOE*.gguf" "qwen2.5*moe*.gguf"
 run_case "Qwen 3 dense" "BN_MODEL_QWEN3_DENSE" \
     "qwen3/4b" \
     "Qwen3-*B*.gguf" "qwen3-*b*.gguf"
