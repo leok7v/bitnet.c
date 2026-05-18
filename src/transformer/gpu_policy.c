@@ -32,6 +32,33 @@ int bn_transformer_gpu_logits_needs_cpu_fallback(
     return bn_qweight_data_size(logits->cpu_weight) > max_storage_binding;
 }
 
+static int small_dense_cuda_native_by_default(
+    const BnConfig *c,
+    const BnWeights *w) {
+    if (!c || !w || c->n_experts > 0 || c->full_attn_interval > 0 ||
+        c->dim > 2560)
+        return 0;
+    if (w->output_weight.data) {
+        if (w->output_weight.type != BN_GGUF_TENSOR_Q8_0)
+            return 0;
+    } else if (w->emb_type != BN_GGUF_TENSOR_Q8_0) {
+        return 0;
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        const BnLayerWeights *lw = &w->layers[l];
+        const BnQWeight *weights[] = {
+            &lw->attn.wq, &lw->attn.wk, &lw->attn.wv, &lw->attn.wo,
+            &lw->ffn.ffn_gate, &lw->ffn.ffn_up, &lw->ffn.ffn_down,
+        };
+        int n_weights = (int)(sizeof(weights) / sizeof(weights[0]));
+        for (int i = 0; i < n_weights; i++) {
+            if (weights[i]->data && weights[i]->type != BN_GGUF_TENSOR_Q8_0)
+                return 0;
+        }
+    }
+    return 1;
+}
+
 void bn_transformer_gpu_report_fallback(const char *reason) {
     if (!getenv("BN_GPU_DEBUG_FALLBACK"))
         return;
@@ -95,7 +122,8 @@ int bn_transformer_gpu_validate_forward(
 
     if (!getenv("BN_CUDA_ENABLE_SMALL_KQUANT_NATIVE") &&
         gpu->kind == BN_GPU_BACKEND_CUDA && c->dim <= 2560 &&
-        c->n_experts <= 0 && c->full_attn_interval <= 0)
+        c->n_experts <= 0 && c->full_attn_interval <= 0 &&
+        !small_dense_cuda_native_by_default(c, w))
         GPU_POLICY_REJECT("small dense cuda graph disabled");
 
     if (c->dim > BN_TRANSFORMER_GPU_MAX_VLA_ELEMS)

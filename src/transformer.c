@@ -129,7 +129,26 @@ static int should_disable_cuda_matvec_fallback(const BnModel *m,
     if (m->config.n_experts > 0 || m->config.full_attn_interval > 0 ||
         m->config.dim > 2560)
         return 0;
-    return 1;
+    const BnWeights *w = &m->weights;
+    if (w->output_weight.data) {
+        if (w->output_weight.type != BN_GGUF_TENSOR_Q8_0)
+            return 1;
+    } else if (w->emb_type != BN_GGUF_TENSOR_Q8_0) {
+        return 1;
+    }
+    for (int l = 0; l < m->config.n_layers; l++) {
+        const BnLayerWeights *lw = &w->layers[l];
+        const BnQWeight *weights[] = {
+            &lw->attn.wq, &lw->attn.wk, &lw->attn.wv, &lw->attn.wo,
+            &lw->ffn.ffn_gate, &lw->ffn.ffn_up, &lw->ffn.ffn_down,
+        };
+        int n_weights = (int)(sizeof(weights) / sizeof(weights[0]));
+        for (int i = 0; i < n_weights; i++) {
+            if (weights[i]->data && weights[i]->type != BN_GGUF_TENSOR_Q8_0)
+                return 1;
+        }
+    }
+    return 0;
 }
 
 // Final RMSNorm + logits computation. Reads s->x, writes s->logits.
