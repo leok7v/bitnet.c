@@ -64,15 +64,23 @@ static void moe_batch_route(float *logits, int *all_indices, float *all_weights,
     for (int t = 0; t < n_tokens; t++) {
         float *row = logits + (size_t)t * n_experts;
         float max_val = row[0];
-        for (int e = 1; e < n_experts; e++)
+        if (!isfinite(max_val))
+            max_val = -INFINITY;
+        for (int e = 1; e < n_experts; e++) {
+            if (!isfinite(row[e]))
+                row[e] = -INFINITY;
             if (row[e] > max_val) max_val = row[e];
+        }
+        if (!isfinite(max_val))
+            max_val = 0.0f;
 
         float sum = 0.0f;
         for (int e = 0; e < n_experts; e++) {
-            row[e] = expf(row[e] - max_val);
+            row[e] = isfinite(row[e]) ? expf(row[e] - max_val) : 0.0f;
             sum += row[e];
         }
 
+        int picked = 0;
         for (int i = 0; i < k; i++) {
             int best = -1;
             float best_val = -1.0f;
@@ -82,9 +90,15 @@ static void moe_batch_route(float *logits, int *all_indices, float *all_weights,
                     best = e;
                 }
             }
+            if (best < 0 || best_val <= 0.0f || sum <= 0.0f) {
+                all_indices[(size_t)t * k + i] = -1;
+                all_weights[(size_t)t * k + i] = 0.0f;
+                continue;
+            }
             all_indices[(size_t)t * k + i] = best;
             all_weights[(size_t)t * k + i] = best_val / sum;
             row[best] = -1.0f;
+            picked++;
         }
 
         float wsum = 0.0f;
@@ -93,6 +107,10 @@ static void moe_batch_route(float *logits, int *all_indices, float *all_weights,
         if (wsum > 0.0f)
             for (int i = 0; i < k; i++)
                 all_weights[(size_t)t * k + i] /= wsum;
+        else if (picked == 0 && n_experts > 0) {
+            all_indices[(size_t)t * k] = 0;
+            all_weights[(size_t)t * k] = 1.0f;
+        }
     }
 }
 

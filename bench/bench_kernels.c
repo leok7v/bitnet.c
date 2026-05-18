@@ -566,6 +566,9 @@ done_free_tokens:
 }
 
 static void bench_toks(BnModel *m, BnSession *s, int n_gen, int random_gen) {
+    if (n_gen <= 0)
+        return;
+
     // Generate tokens and measure throughput
     int warmup = 4;
     int total = warmup + n_gen;
