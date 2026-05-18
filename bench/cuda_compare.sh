@@ -100,6 +100,14 @@ for model in $MODELS; do
             sed -n 's/.*tok\/s=\([0-9.][0-9.]*\).*/\1/p' |
             tail -n 1)
         if [ -z "$bitnet_tps" ]; then bitnet_tps="0"; fi
+        bitnet_generated=$(printf '%s\n' "$bitnet_tg_out" |
+            sed -n 's/.*Generation complete | tokens=\(-\{0,1\}[0-9][0-9]*\).*/\1/p' |
+            tail -n 1)
+        if [ -z "$bitnet_generated" ] || [ "$bitnet_generated" -le 0 ] || [ "$bitnet_tps" = "0" ]; then
+            echo -e "$(basename "$model")\t$bitnet_pp\tSKIP\t0\tERROR\tbitnet generate invalid\t0\tFAIL"
+            printf '%s\n' "$bitnet_tg_out" >&2
+            continue
+        fi
     else
         bitnet_tps=$(printf '%s\n' "$bitnet_out" |
             awk '/Throughput:/ { v=$2 } END { if (v == "") v="0"; print v }')
