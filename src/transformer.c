@@ -120,6 +120,18 @@ static int forward_layers(BnModel *m, BnSession *sess, int token, int pos) {
     return 0;
 }
 
+static int should_disable_cuda_matvec_fallback(const BnModel *m,
+                                               const BnGPUBackend *gpu) {
+    if (!m || !gpu || gpu->kind != BN_GPU_BACKEND_CUDA)
+        return 0;
+    if (getenv("BN_CUDA_ENABLE_SMALL_KQUANT_NATIVE"))
+        return 0;
+    if (m->config.n_experts > 0 || m->config.full_attn_interval > 0 ||
+        m->config.dim > 2560)
+        return 0;
+    return 1;
+}
+
 // Final RMSNorm + logits computation. Reads s->x, writes s->logits.
 // Returns s->logits.
 static float *forward_logits(BnModel *m, BnSession *sess) {
@@ -148,7 +160,8 @@ float *bn_transformer_forward(BnModel *m, BnSession *s, int token, int pos) {
     BnGPUBackend *gpu = bn_model_gpu(m);
     int keep_cuda_matvec =
         gpu && gpu->kind == BN_GPU_BACKEND_CUDA && gpu->execute &&
-        m->config.n_experts <= 0 && m->config.full_attn_interval <= 0;
+        m->config.n_experts <= 0 && m->config.full_attn_interval <= 0 &&
+        !should_disable_cuda_matvec_fallback(m, gpu);
     int disable_gpu = !keep_cuda_matvec;
     if (disable_gpu)
         bn_model_set_gpu_disabled(m, 1);
@@ -168,7 +181,8 @@ int bn_transformer_forward_no_logits(BnModel *m, BnSession *s,
     BnGPUBackend *gpu = bn_model_gpu(m);
     int keep_cuda_matvec =
         gpu && gpu->kind == BN_GPU_BACKEND_CUDA && gpu->execute &&
-        m->config.n_experts <= 0 && m->config.full_attn_interval <= 0;
+        m->config.n_experts <= 0 && m->config.full_attn_interval <= 0 &&
+        !should_disable_cuda_matvec_fallback(m, gpu);
     int disable_gpu = !keep_cuda_matvec;
     if (disable_gpu)
         bn_model_set_gpu_disabled(m, 1);

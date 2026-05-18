@@ -107,8 +107,11 @@ int bn_transformer_gpu_fallback_cpu_layer(
     if (bn_transformer_gpu_read_x(gpu, s->x,
                                   (size_t)dim * sizeof(float)) != 0)
         return -1;
-    if (bn_transformer_cpu_forward_layer(m, sess, layer, pos, cache_pos,
-                                         rope_dims, rope_cos, rope_sin) != 0)
+    bn_model_set_gpu_disabled(m, 1);
+    int rc = bn_transformer_cpu_forward_layer(m, sess, layer, pos, cache_pos,
+                                              rope_dims, rope_cos, rope_sin);
+    bn_model_set_gpu_disabled(m, 0);
+    if (rc != 0)
         return -1;
     if (bn_transformer_gpu_write_x(gpu, s->x,
                                    (size_t)dim * sizeof(float)) != 0)
@@ -212,6 +215,36 @@ int bn_transformer_gpu_fallback_cpu_attention(
         emit, next_norm, dim, u_eps);
 }
 
+static void fallback_cpu_forward_ffn_from_xb(BnModel *m,
+                                             BnSession *sess,
+                                             BnLayerWeights *lw,
+                                             const BnFFNPlan *ffn_plan,
+                                             int dim) {
+    BnRunState *s = &sess->state;
+    int hidden_dim = ffn_plan->hidden_dim;
+    if (ffn_plan->has_gate) {
+        BnMatvecTask ffn[2] = {
+            { s->hb, &lw->ffn.ffn_gate, NULL, 0 },
+            { s->hb2, &lw->ffn.ffn_up, NULL, 0 },
+        };
+        bn_quant_matvec_batch(ffn, 2, s->xb, s->x_q, bn_model_pool(m));
+    } else {
+        bn_quant_matvec(s->hb, &lw->ffn.ffn_up, s->xb, s->x_q,
+                        bn_model_pool(m));
+    }
+    bn_transformer_cpu_apply_ffn_activation(s, ffn_plan, hidden_dim, 0);
+    if (ffn_plan->has_sub_norm)
+        fallback_rmsnorm(s->hb, s->hb, lw->norm.ffn_sub_norm,
+                         hidden_dim, m->config.norm_eps);
+    bn_quant_matvec(s->xb, &lw->ffn.ffn_down, s->hb, s->x_q,
+                    bn_model_pool(m));
+    if ((m->config.arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
+        lw->norm.ffn_post_norm)
+        fallback_rmsnorm(s->xb, s->xb, lw->norm.ffn_post_norm,
+                         dim, m->config.norm_eps);
+    bn_transformer_cpu_residual_add(s->x, s->xb, dim);
+}
+
 int bn_transformer_gpu_fallback_cpu_ffn(
     BnTransformerGPUEmitContext *emit,
     const BnGPUBackend *gpu,
@@ -231,7 +264,7 @@ int bn_transformer_gpu_fallback_cpu_ffn(
     if (bn_transformer_gpu_read_xb(gpu, s->xb,
                                    (size_t)dim * sizeof(float)) != 0)
         return -1;
-    bn_transformer_cpu_forward_ffn_block(m, sess, lw, ffn_plan);
+    fallback_cpu_forward_ffn_from_xb(m, sess, lw, ffn_plan, dim);
     if (bn_transformer_gpu_write_x(gpu, s->x,
                                    (size_t)dim * sizeof(float)) != 0)
         return -1;
@@ -463,13 +496,26 @@ int bn_transformer_gpu_debug_compare_ffn_state(
     float *cpu_xb = (float *)malloc((size_t)dim * sizeof(float));
     float *gpu_x = (float *)malloc((size_t)dim * sizeof(float));
     float *gpu_xb = (float *)malloc((size_t)dim * sizeof(float));
-    if (!cpu_x_in || !cpu_xb_in || !cpu_x || !cpu_xb || !gpu_x || !gpu_xb) {
+    float *cpu_hb = NULL;
+    float *cpu_hb2 = NULL;
+    float *gpu_hb = NULL;
+    int hidden_dim = ffn_plan ? ffn_plan->hidden_dim : 0;
+    if (hidden_dim > 0) {
+        cpu_hb = (float *)malloc((size_t)hidden_dim * sizeof(float));
+        cpu_hb2 = (float *)malloc((size_t)hidden_dim * sizeof(float));
+        gpu_hb = (float *)malloc((size_t)hidden_dim * sizeof(float));
+    }
+    if (!cpu_x_in || !cpu_xb_in || !cpu_x || !cpu_xb || !gpu_x || !gpu_xb ||
+        (hidden_dim > 0 && (!cpu_hb || !cpu_hb2 || !gpu_hb))) {
         free(cpu_x_in);
         free(cpu_xb_in);
         free(cpu_x);
         free(cpu_xb);
         free(gpu_x);
         free(gpu_xb);
+        free(cpu_hb);
+        free(cpu_hb2);
+        free(gpu_hb);
         return -1;
     }
 
@@ -488,12 +534,45 @@ int bn_transformer_gpu_debug_compare_ffn_state(
 
     memcpy(s->x, cpu_x_in, (size_t)dim * sizeof(float));
     memcpy(s->xb, cpu_xb_in, (size_t)dim * sizeof(float));
-    bn_transformer_cpu_forward_ffn_block(m, sess, lw, ffn_plan);
+    if (hidden_dim > 0) {
+        if (ffn_plan->has_gate) {
+            debug_quant_matvec_prepared(m, cpu_hb, &lw->ffn.ffn_gate,
+                                        s->xb, s->x_q);
+            debug_quant_matvec_prepared(m, cpu_hb2, &lw->ffn.ffn_up,
+                                        s->xb, s->x_q);
+            for (int i = 0; i < hidden_dim; i++) {
+                float g = cpu_hb[i];
+                if (ffn_plan->activation == 1) {
+                    float r = g > 0.0f ? g : 0.0f;
+                    cpu_hb[i] = r * r * cpu_hb2[i];
+                } else {
+                    cpu_hb[i] = (g / (1.0f + expf(-g))) * cpu_hb2[i];
+                }
+            }
+        } else {
+            debug_quant_matvec_prepared(m, cpu_hb, &lw->ffn.ffn_up,
+                                        s->xb, s->x_q);
+            for (int i = 0; i < hidden_dim; i++) {
+                float v = cpu_hb[i];
+                if (ffn_plan->activation == 1) {
+                    float r = v > 0.0f ? v : 0.0f;
+                    cpu_hb[i] = r * r;
+                } else {
+                    cpu_hb[i] = v / (1.0f + expf(-v));
+                }
+            }
+        }
+    }
+    fallback_cpu_forward_ffn_from_xb(m, sess, lw, ffn_plan, dim);
     memcpy(cpu_x, s->x, (size_t)dim * sizeof(float));
     if (next_norm)
         fallback_rmsnorm(cpu_xb, cpu_x, next_norm, dim, m->config.norm_eps);
 
-    if (bn_transformer_gpu_read_x(gpu, gpu_x,
+    if ((hidden_dim > 0 &&
+         bn_transformer_gpu_read_activation_buf(
+             gpu, BN_GPU_VALUE_HB, gpu_hb,
+             (size_t)hidden_dim * sizeof(float)) != 0) ||
+        bn_transformer_gpu_read_x(gpu, gpu_x,
                                   (size_t)dim * sizeof(float)) != 0 ||
         (next_norm && bn_transformer_gpu_read_xb(gpu, gpu_xb,
                                                  (size_t)dim * sizeof(float)) != 0)) {
@@ -503,8 +582,14 @@ int bn_transformer_gpu_debug_compare_ffn_state(
         free(cpu_xb);
         free(gpu_x);
         free(gpu_xb);
+        free(cpu_hb);
+        free(cpu_hb2);
+        free(gpu_hb);
         return -1;
     }
+    if (hidden_dim > 0)
+        debug_compare_vec("ffn_hidden_compare", layer, pos, cpu_hb, gpu_hb,
+                          hidden_dim);
     debug_compare_vec("ffn_state_compare", layer, pos, cpu_x, gpu_x, dim);
     if (next_norm)
         debug_compare_vec("ffn_next_norm_compare", layer, pos, cpu_xb, gpu_xb,
@@ -517,6 +602,9 @@ int bn_transformer_gpu_debug_compare_ffn_state(
     free(cpu_xb);
     free(gpu_x);
     free(gpu_xb);
+    free(cpu_hb);
+    free(cpu_hb2);
+    free(gpu_hb);
     return 0;
 }
 

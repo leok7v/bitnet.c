@@ -93,6 +93,11 @@ int bn_transformer_gpu_validate_forward(
          c->full_attn_interval > 0 || c->n_experts > 0))
         GPU_POLICY_REJECT("large arch/hybrid/moe gpu graph disabled");
 
+    if (!getenv("BN_CUDA_ENABLE_SMALL_KQUANT_NATIVE") &&
+        gpu->kind == BN_GPU_BACKEND_CUDA && c->dim <= 2560 &&
+        c->n_experts <= 0 && c->full_attn_interval <= 0)
+        GPU_POLICY_REJECT("small dense cuda graph disabled");
+
     if (c->dim > BN_TRANSFORMER_GPU_MAX_VLA_ELEMS)
         GPU_POLICY_REJECT("dim exceeds VLA limit");
 

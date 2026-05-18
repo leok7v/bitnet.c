@@ -135,6 +135,8 @@ static int gpu_qkv_resources_missing(
         return !(res && res->packed_qkv);
     if (!lw->attn.wq.data)
         return 0;
+    if (!(res && res->wq && res->wk && res->wv))
+        return 1;
 
     int has_qkv = res && res->qkv_stacked && !plan->q_gated &&
                   !lw->attn.q_bias && !lw->attn.k_bias && !lw->attn.v_bias;
@@ -162,6 +164,10 @@ static int gpu_dense_ffn_resources_missing(
     const BnTransformerGPUDenseFFNResources *res) {
     if (lw->moe.router_weight)
         return 0;
+    if ((lw->ffn.ffn_gate.data && !(res && res->ffn_gate)) ||
+        (lw->ffn.ffn_up.data && !(res && res->ffn_up)) ||
+        (lw->ffn.ffn_down.data && !(res && res->ffn_down)))
+        return 1;
     if (plan->has_gate && lw->ffn.ffn_gate.data) {
         int has_gateup = res && res->gateup_stacked &&
                          lw->ffn.ffn_gate.rows == lw->ffn.ffn_up.rows &&
