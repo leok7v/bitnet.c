@@ -127,6 +127,53 @@ static int gpu_patch_cached_decode_ops(BnGPUOp *ops, int n_ops,
     return 0;
 }
 
+static int gpu_qkv_resources_missing(
+    const BnLayerWeights *lw,
+    const BnLayerShapePlan *plan,
+    const BnTransformerGPUQKVResources *res) {
+    if (lw->ssm.wqkv.data)
+        return !(res && res->packed_qkv);
+    if (!lw->attn.wq.data)
+        return 0;
+
+    int has_qkv = res && res->qkv_stacked && !plan->q_gated &&
+                  !lw->attn.q_bias && !lw->attn.k_bias && !lw->attn.v_bias;
+    int has_qk = res && res->qk_stacked && !plan->q_gated &&
+                 lw->attn.wq.rows == plan->q_dim &&
+                 lw->attn.wk.rows == plan->kv_dim &&
+                 lw->attn.wq.cols == lw->attn.wk.cols &&
+                 lw->attn.wq.type == lw->attn.wk.type;
+    if (has_qkv)
+        return 0;
+    if (has_qk)
+        return !(res && res->wv);
+    return !(res && res->wq && res->wk && res->wv);
+}
+
+static int gpu_attention_resources_missing(
+    const BnLayerWeights *lw,
+    const BnTransformerGPUAttentionResources *res) {
+    return lw->attn.wo.data && !(res && res->wo);
+}
+
+static int gpu_dense_ffn_resources_missing(
+    const BnLayerWeights *lw,
+    const BnFFNPlan *plan,
+    const BnTransformerGPUDenseFFNResources *res) {
+    if (lw->moe.router_weight)
+        return 0;
+    if (plan->has_gate && lw->ffn.ffn_gate.data) {
+        int has_gateup = res && res->gateup_stacked &&
+                         lw->ffn.ffn_gate.rows == lw->ffn.ffn_up.rows &&
+                         lw->ffn.ffn_gate.cols == lw->ffn.ffn_up.cols;
+        if (!has_gateup && !(res && res->ffn_gate && res->ffn_up))
+            return 1;
+    } else if (lw->ffn.ffn_up.data && !(res && res->ffn_up)) {
+        return 1;
+    }
+    return lw->ffn.ffn_down.data && !(res && res->ffn_down);
+}
+
 // GPU-resident forward pass: one submit per token, reads back logits only.
 // Supports classic transformer only (no MoE, no SSM, no gated-Q, no wide-Q,
 // no Q/K norms, no sub-norms, no FP16 KV cache).
@@ -371,6 +418,17 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         BnLayerShapePlan plan;
         bn_transformer_plan_layer_shape(&plan, c, lw, l, bn_model_tq_state(m) != NULL);
         int is_attn = plan.is_attn;
+        BnFFNPlan layer_ffn_plan;
+        int layer_ffn_plan_valid = 0;
+        BnTransformerGPUDenseFFNResources layer_ffn_res = {0};
+        if (!lw->moe.router_weight) {
+            bn_transformer_plan_ffn(
+                &layer_ffn_plan, c, lw, gpu, backend, l, 1);
+            layer_ffn_plan_valid = 1;
+            layer_ffn_res =
+                bn_transformer_gpu_resolve_dense_ffn_resources(
+                    gpu, backend, lw, l);
+        }
 
         // ---- SSM layer: CPU fallback until the WebGPU SSM path is token-coherent ----
         if (!is_attn) {
@@ -420,6 +478,20 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         int use_q4_q8_ffn = use_q4_q8_layer && !q4_q8_attn_only;
         BnTransformerGPUAttentionResources attn_res =
             bn_transformer_gpu_resolve_attention_resources(gpu, backend, lw, l);
+        if (gpu_qkv_resources_missing(lw, &plan, &qkv_res) ||
+            gpu_attention_resources_missing(lw, &attn_res) ||
+            (layer_ffn_plan_valid &&
+             gpu_dense_ffn_resources_missing(
+                 lw, &layer_ffn_plan, &layer_ffn_res))) {
+            void *next_norm = bn_transformer_gpu_resolve_next_norm(
+                backend, l, c->n_layers, output_norm);
+            if (bn_transformer_gpu_fallback_cpu_layer(
+                    &emit, gpu, m, sess, l, pos, cache_pos, rope_dims,
+                    rope_cos, rope_sin, dim, u_eps, next_norm) != 0)
+                return bn_transformer_gpu_reject_forward(
+                    &emit, "gpu missing-qweight cpu-layer fallback failed");
+            continue;
+        }
         if (cpu_fallback_attn_layer == l ||
             (cpu_fallback_attn_from_layer >= 0 &&
              l >= cpu_fallback_attn_from_layer)) {
@@ -525,7 +597,10 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         void *next_norm = bn_transformer_gpu_resolve_next_norm(
             backend, l, c->n_layers, output_norm);
         BnFFNPlan ffn_plan;
-        bn_transformer_plan_ffn(&ffn_plan, c, lw, gpu, backend, l, 1);
+        if (layer_ffn_plan_valid)
+            ffn_plan = layer_ffn_plan;
+        else
+            bn_transformer_plan_ffn(&ffn_plan, c, lw, gpu, backend, l, 1);
         if ((cpu_fallback_ffn_layer >= 0 && l == cpu_fallback_ffn_layer) ||
             (cpu_fallback_ffn_from_layer >= 0 &&
              l >= cpu_fallback_ffn_from_layer)) {
@@ -536,8 +611,7 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                     &emit, "gpu cpu-ffn fallback failed");
             continue;
         }
-        BnTransformerGPUDenseFFNResources ffn_res =
-            bn_transformer_gpu_resolve_dense_ffn_resources(gpu, backend, lw, l);
+        BnTransformerGPUDenseFFNResources ffn_res = layer_ffn_res;
         int ffn_down_input_buf = -1;
         int skip_ffn_down = cpu_fallback_ffn_down_from_layer >= 0 &&
                             l >= cpu_fallback_ffn_down_from_layer;

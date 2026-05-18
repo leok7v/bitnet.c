@@ -862,12 +862,16 @@ int bn_transformer_gpu_fallback_logits(
     int dim) {
     BnRunState *s = &sess->state;
     double t0 = bn_platform_time_ms();
-    if (bn_transformer_gpu_emit_context_flush(emit, gpu) != 0)
+    if (bn_transformer_gpu_emit_context_flush(emit, gpu) != 0) {
+        bn_transformer_gpu_report_fallback("gpu logits cpu fallback flush failed");
         return -1;
+    }
     double t_flush = bn_platform_time_ms();
     if (bn_transformer_gpu_read_xb(gpu, s->xb,
-                                   (size_t)dim * sizeof(float)) != 0)
+                                   (size_t)dim * sizeof(float)) != 0) {
+        bn_transformer_gpu_report_fallback("gpu logits cpu fallback read_xb failed");
         return -1;
+    }
     double t_read = bn_platform_time_ms();
     bn_quant_matvec(s->logits, logits->cpu_weight, s->xb, s->x_q,
                     bn_model_pool(m));
