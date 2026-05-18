@@ -951,11 +951,22 @@ static __global__ void matvec_split_kernel(float *out0, float *out1,
     if (row >= total_rows) return;
 
     float sum = cuda_dot_row(wdata, x, row, cols, type);
+    float sum2 = 0.0f;
+    if (split1 == 1 && row < split0)
+        sum2 = cuda_dot_row(wdata, x, row + split0, cols, type);
     extern __shared__ float scratch[];
+    float *scratch2 = scratch + blockDim.x;
     sum = cuda_block_reduce_sum(sum, scratch);
+    if (split1 == 1)
+        sum2 = cuda_block_reduce_sum(sum2, scratch2);
     if (tid != 0) return;
 
-    if (row < split0) {
+    if (split1 == 1) {
+        if (row < split0) {
+            float gate = sum;
+            out0[row] = (gate / (1.0f + expf(-gate))) * sum2;
+        }
+    } else if (row < split0) {
         float v = sum;
         if (bias0) v += bias0[row];
         out0[row] = v;
@@ -3200,7 +3211,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 }
             }
             BN_CUDA_LAUNCH(ctx, matvec_split_kernel, total_rows, threads,
-                (size_t)threads * sizeof(float),
+                (size_t)threads * sizeof(float) * (split1 == 1 ? 2u : 1u),
                 out0, out1, out2, w->data, in, bias0, total_rows, cols,
                 op->type, split0, split1, (size_t)op->p[6],
                 (size_t)op->p[7]);
