@@ -1,9 +1,9 @@
 #!/bin/bash
-# Compare bitnet.c CUDA decode smoke throughput against llama.cpp CUDA tg16.
+# Compare bitnet.c CUDA prompt/decode throughput against llama.cpp CUDA.
 #
 # This is a short parity gate for Qwen GGUFs. The workloads are not identical:
 # bitnet.c uses bench_kernels' random next-token loop, while llama.cpp uses
-# llama-bench tg16. Treat the ratio as a directional CUDA backend regression
+# llama-bench pp/tg. Treat the ratio as a directional CUDA backend regression
 # signal, not a formal benchmark.
 
 set -uo pipefail
@@ -30,8 +30,12 @@ if [ -z "${MODELS:-}" ]; then
     MODELS=""
     for pattern in \
         "Qwen2.5*Q4_K_M.gguf" \
+        "Qwen2.5*MOE*Q4*k*m.gguf" \
         "Qwen3-4B*Q4_K_M.gguf" \
+        "Qwen3-30B-A3B-Q4_K_M.gguf" \
         "Qwen3.5-27B*Q5_K_M.gguf" \
+        "Qwen3.5-397B-A17B-UD-Q3_K_XL-00001-of-00005.gguf" \
+        "Qwen3.6-27B-Q4_K_M.gguf" \
         "qwen3.6*35b*a3b*Q8_0.gguf" \
         "qwen2.5-0.5b-instruct-q4_k_m.gguf" \
         "qwen2.5-0.5b-instruct-q8_0.gguf"; do
@@ -57,7 +61,7 @@ if [ ! -x "$LLAMA_BENCH" ]; then
     exit 1
 fi
 
-echo -e "model\tbitnet_tok_s\tllama_tg16_tok_s\tratio\tstatus"
+echo -e "model\tbitnet_pp_tok_s\tllama_pp_tok_s\tpp_ratio\tbitnet_tg_tok_s\tllama_tg_tok_s\ttg_ratio\tstatus"
 
 for model in $MODELS; do
     if [ ! -f "$model" ]; then
@@ -74,20 +78,30 @@ for model in $MODELS; do
     fi
     bitnet_tps=$(printf '%s\n' "$bitnet_out" |
         awk '/Throughput:/ { v=$2 } END { if (v == "") v="0"; print v }')
+    bitnet_pp=$(printf '%s\n' "$bitnet_out" |
+        awk '/^Prefill:/ { v=$2 } END { if (v == "") v="0"; print v }')
 
     if ! llama_out=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$LLAMA_BENCH" -m "$model" -n "$LLAMA_TOKS" -t "$THREADS" -ngl 99 2>&1); then
-        echo -e "$(basename "$model")\t$bitnet_tps\tllama-bench failed\t0\tFAIL"
+        "$LLAMA_BENCH" -m "$model" -p "$PREFILL_TOKS" -n "$LLAMA_TOKS" -t "$THREADS" -ngl 99 2>&1); then
+        echo -e "$(basename "$model")\t$bitnet_pp\tllama-bench failed\t0\t$bitnet_tps\tllama-bench failed\t0\tFAIL"
         printf '%s\n' "$llama_out" >&2
         continue
     fi
     llama_tps=$(printf '%s\n' "$llama_out" |
         awk '$0 ~ /tg[0-9]+/ { for (i = 1; i <= NF; i++) if ($i == "±") v=$(i - 1) } END { if (v == "") v="0"; print v }')
+    llama_pp=$(printf '%s\n' "$llama_out" |
+        awk '$0 ~ /pp[0-9]+/ { for (i = 1; i <= NF; i++) if ($i == "±") v=$(i - 1) } END { if (v == "") v="0"; print v }')
 
-    ratio=$(awk -v b="$bitnet_tps" -v l="$llama_tps" \
+    tg_ratio=$(awk -v b="$bitnet_tps" -v l="$llama_tps" \
         'BEGIN { if (l > 0) printf "%.3f", b / l; else print "0" }')
-    status=$(awk -v r="$ratio" \
-        'BEGIN { if (r >= 1.0) print "PASS_PARITY"; else if (r >= 0.8) print "WARN_CLOSE"; else print "FAIL" }')
+    pp_ratio=$(awk -v b="$bitnet_pp" -v l="$llama_pp" \
+        'BEGIN { if (l > 0) printf "%.3f", b / l; else print "0" }')
+    status=$(awk -v p="$pp_ratio" -v t="$tg_ratio" \
+        'BEGIN {
+            if (p >= 1.0 && t >= 1.0) print "PASS_PARITY";
+            else if (p >= 0.8 && t >= 0.8) print "WARN_CLOSE";
+            else print "FAIL";
+        }')
 
-    echo -e "$(basename "$model")\t$bitnet_tps\t$llama_tps\t$ratio\t$status"
+    echo -e "$(basename "$model")\t$bitnet_pp\t$llama_pp\t$pp_ratio\t$bitnet_tps\t$llama_tps\t$tg_ratio\t$status"
 done
