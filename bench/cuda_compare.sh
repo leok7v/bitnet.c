@@ -111,6 +111,11 @@ for model in $MODELS; do
         printf '%s\n' "$llama_out" >&2
         continue
     fi
+    if printf '%s\n' "$llama_out" | grep -qiE 'cuda init failed|failed to initialize CUDA|no CUDA-capable device'; then
+        echo -e "$(basename "$model")\t$bitnet_pp\tllama CUDA unavailable\t0\t$bitnet_tps\tllama CUDA unavailable\t0\tFAIL"
+        printf '%s\n' "$llama_out" >&2
+        continue
+    fi
     llama_tps=$(printf '%s\n' "$llama_out" |
         awk '$0 ~ /tg[0-9]+/ { for (i = 1; i <= NF; i++) if ($i == "±") v=$(i - 1) } END { if (v == "") v="0"; print v }')
     llama_pp=$(printf '%s\n' "$llama_out" |
