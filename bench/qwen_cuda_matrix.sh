@@ -16,6 +16,7 @@ BITNET="${BITNET:-./bitnet}"
 REQUIRE_MODELS="${REQUIRE_MODELS:-0}"
 RUN_COHERENCE="${RUN_COHERENCE:-1}"
 RUN_SHARDED_MOE_SMOKE="${RUN_SHARDED_MOE_SMOKE:-1}"
+RUN_SHARDED_MOE_COHERENCE="${RUN_SHARDED_MOE_COHERENCE:-1}"
 RUN_LLAMA_COMPARE="${RUN_LLAMA_COMPARE:-0}"
 RUN_BENCH="${RUN_BENCH:-0}"
 N_TOKENS="${N_TOKENS:-8}"
@@ -60,12 +61,13 @@ run_case() {
 
     if path=$(find_model "$env_name" "$rel_dir" "$@"); then
         if [[ "$path" == *-of-*.gguf ]]; then
-            echo "RUN $name sharded mmap smoke: $path"
+            echo "RUN $name sharded mmap: $path"
             ran=$((ran + 1))
-            if [ "$RUN_SHARDED_MOE_SMOKE" = "1" ]; then
+            if [ "$RUN_COHERENCE" = "1" ] && [ "$RUN_SHARDED_MOE_COHERENCE" = "1" ]; then
+                "$COHERENCE" "$path" --cuda --require-all-tokens || fail=1
+            elif [ "$RUN_SHARDED_MOE_SMOKE" = "1" ]; then
                 "$BITNET" "$path" -n 0 --maxseq 32 --quiet || fail=1
             fi
-            echo "  CUDA coherence skipped for sharded MoE size; mmap runtime smoke covered"
             return
         fi
         echo "RUN $name: $path"
