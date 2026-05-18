@@ -79,9 +79,9 @@ run_case() {
         if [ "$RUN_COHERENCE" = "1" ]; then
             if [ "$strict_kquant_fallback" = "1" ]; then
                 BN_CUDA_DISABLE_Q4_K=1 BN_CUDA_DISABLE_Q6_K=1 \
-                    "$COHERENCE" "$path" --cuda || fail=1
+                    "$COHERENCE" "$path" --cuda --require-all-tokens || fail=1
             else
-                "$COHERENCE" "$path" --cuda || fail=1
+                "$COHERENCE" "$path" --cuda --require-all-tokens || fail=1
             fi
         fi
         if [ "$RUN_LLAMA_COMPARE" = "1" ]; then

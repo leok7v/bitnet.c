@@ -358,7 +358,7 @@ static int test_gpu_matvec_weight(const char *backend_name,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <model.gguf> [--webgpu] [--metal] [--cuda] [--prompt <text>] [--cpu-fallback-layer N] [--cpu-fallback-from-layer N] [--cpu-attn-layer N] [--cpu-attn-from-layer N] [--cpu-ffn-layer N] [--cpu-ffn-from-layer N] [--cpu-ffn-down-from-layer N] [--compare-attention-layer N] [--compare-attention-pos N] [--compare-gqa-layer N] [--compare-gqa-pos N] [--compare-qkv-layer N] [--compare-qkv-pos N] [--compare-ffn-down-layer N] [--compare-ffn-down-pos N] [--compare-ffn-state-layer N] [--compare-ffn-state-pos N] [--compare-logits] [--compare-hidden] [--compare-kv-cache] [--cpu-disable-prepared-qweights] [--metal-q4-prepared] [--metal-full-barriers] [--metal-disable-barriers] [--metal-disable-q4-q8] [--metal-cpu-rmsnorm] [--q4-q8-from-layer N] [--q4-q8-to-layer N] [--q4-q8-tail-native N] [--q4-q8-attn-only] [--q4-q8-ffn-only] [--disable-qkv-split] [--disable-gateup-split] [--disable-fused-gateup] [--split-residual-rmsnorm] [--flash] [--kv16]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> [--webgpu] [--metal] [--cuda] [--prompt <text>] [--require-all-tokens] [--cpu-fallback-layer N] [--cpu-fallback-from-layer N] [--cpu-attn-layer N] [--cpu-attn-from-layer N] [--cpu-ffn-layer N] [--cpu-ffn-from-layer N] [--cpu-ffn-down-from-layer N] [--compare-attention-layer N] [--compare-attention-pos N] [--compare-gqa-layer N] [--compare-gqa-pos N] [--compare-qkv-layer N] [--compare-qkv-pos N] [--compare-ffn-down-layer N] [--compare-ffn-down-pos N] [--compare-ffn-state-layer N] [--compare-ffn-state-pos N] [--compare-logits] [--compare-hidden] [--compare-kv-cache] [--cpu-disable-prepared-qweights] [--metal-q4-prepared] [--metal-full-barriers] [--metal-disable-barriers] [--metal-disable-q4-q8] [--metal-cpu-rmsnorm] [--q4-q8-from-layer N] [--q4-q8-to-layer N] [--q4-q8-tail-native N] [--q4-q8-attn-only] [--q4-q8-ffn-only] [--disable-qkv-split] [--disable-gateup-split] [--disable-fused-gateup] [--split-residual-rmsnorm] [--flash] [--kv16]\n", argv[0]);
         fprintf(stderr, "Coherence test: WebGPU/Metal/CUDA vs CPU forward pass, SIMD vs scalar matvec\n");
         return 1;
     }
@@ -401,6 +401,7 @@ int main(int argc, char **argv) {
     int disable_fused_gateup = 0;
     int split_residual_rmsnorm = 0;
     int kv16 = 0;
+    int require_all_tokens = 0;
     const char *prompt = "Hello";
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--webgpu") == 0) {
@@ -411,6 +412,8 @@ int main(int argc, char **argv) {
             use_cuda = 1;
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
+        } else if (strcmp(argv[i], "--require-all-tokens") == 0) {
+            require_all_tokens = 1;
         } else if (strcmp(argv[i], "--cpu-fallback-layer") == 0 && i + 1 < argc) {
             cpu_fallback_layer = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cpu-fallback-from-layer") == 0 && i + 1 < argc) {
@@ -855,7 +858,7 @@ int main(int argc, char **argv) {
                 /* Compare: first N_MATCH_REQUIRED must match */
                 for (int i = 0; i < N_DECODE_STEPS; i++) {
                     int match = (cpu_tokens[i] == gpu_tokens[i]);
-                    int required = (i < N_MATCH_REQUIRED);
+                    int required = require_all_tokens || (i < N_MATCH_REQUIRED);
                     if (match) {
                         printf("  token[%d]: PASS (cpu=%d gpu=%d)\n",
                                i, cpu_tokens[i], gpu_tokens[i]);
@@ -980,7 +983,7 @@ int main(int argc, char **argv) {
 
                 for (int i = 0; i < N_DECODE_STEPS; i++) {
                     int match = (cpu_tokens[i] == gpu_tokens[i]);
-                    int required = (i < N_MATCH_REQUIRED);
+                    int required = require_all_tokens || (i < N_MATCH_REQUIRED);
                     if (match) {
                         printf("  token[%d]: PASS (cpu=%d metal=%d)\n",
                                i, cpu_tokens[i], gpu_tokens[i]);
@@ -1100,7 +1103,7 @@ int main(int argc, char **argv) {
 
                 for (int i = 0; i < N_DECODE_STEPS; i++) {
                     int match = (cpu_tokens[i] == gpu_tokens[i]);
-                    int required = (i < N_MATCH_REQUIRED);
+                    int required = require_all_tokens || (i < N_MATCH_REQUIRED);
                     if (match) {
                         printf("  token[%d]: PASS (cpu=%d cuda=%d)\n",
                                i, cpu_tokens[i], gpu_tokens[i]);
