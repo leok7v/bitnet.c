@@ -1017,14 +1017,18 @@ static __global__ void qkv_mixed_matvec_kernel(
         k_head = local / head_size;
         k_dim = local - k_head * head_size;
         k_rotate = k_dim < rope_dims;
-        if (k_pair_write && k_rotate && (k_dim & 1))
+        int half_rope = rope_dims / 2;
+        if (k_pair_write && k_rotate && k_dim >= half_rope)
             return;
     }
 
     float sum = cuda_dot_row(wdata, x, out_kind == 2 ? local : row,
                              cols, type);
     if (out_kind == 1 && k_rotate) {
-        int pair_dim = k_dim ^ 1;
+        int half_rope = rope_dims / 2;
+        int pair_dim = k_dim < half_rope
+            ? k_dim + half_rope
+            : k_dim - half_rope;
         int pair_row = q_rows + k_head * head_size + pair_dim;
         pair_sum = cuda_dot_row(qk_wdata, x, pair_row, cols, qk_type);
     }
@@ -1042,25 +1046,31 @@ static __global__ void qkv_mixed_matvec_kernel(
         if (key_cache && k_heads > 0 && head_size > 0 &&
             k_heads * head_size == k_rows) {
         if (k_rotate) {
-            int pair_dim = k_dim ^ 1;
-            float pair = pair_sum +
-                (k_bias ? k_bias[k_head * head_size + pair_dim] : 0.0f);
-            float angle = (float)pos * freq[k_dim / 2];
-            float s, c;
-            __sincosf(angle, &s, &c);
-            if (k_pair_write) {
-                cuda_kv_store(key_cache, key_offset + (size_t)local,
-                              v * c - pair * s, kv_f16);
-                cuda_kv_store(key_cache, key_offset + (size_t)(local + 1),
-                              v * s + pair * c, kv_f16);
-            } else {
-                float x0 = (k_dim & 1) ? pair : v;
-                float x1 = (k_dim & 1) ? v : pair;
-                cuda_kv_store(key_cache, key_offset + (size_t)local,
-                              (k_dim & 1) ? (x0 * s + x1 * c)
-                                          : (x0 * c - x1 * s),
-                              kv_f16);
-            }
+                int half_rope = rope_dims / 2;
+                int pair_dim = k_dim < half_rope
+                    ? k_dim + half_rope
+                    : k_dim - half_rope;
+                float pair = pair_sum +
+                    (k_bias ? k_bias[k_head * head_size + pair_dim] : 0.0f);
+                int freq_idx = k_dim < half_rope ? k_dim : pair_dim;
+                float angle = (float)pos * freq[freq_idx];
+                float s, c;
+                __sincosf(angle, &s, &c);
+                if (k_pair_write) {
+                    cuda_kv_store(key_cache, key_offset + (size_t)local,
+                                  v * c - pair * s, kv_f16);
+                    cuda_kv_store(key_cache,
+                                  key_offset + (size_t)(k_head * head_size +
+                                                        pair_dim),
+                                  v * s + pair * c, kv_f16);
+                } else {
+                    float x0 = k_dim < half_rope ? v : pair;
+                    float x1 = k_dim < half_rope ? pair : v;
+                    cuda_kv_store(key_cache, key_offset + (size_t)local,
+                                  k_dim < half_rope ? (x0 * c - x1 * s)
+                                                    : (x0 * s + x1 * c),
+                                  kv_f16);
+                }
         } else {
             cuda_kv_store(key_cache, key_offset + (size_t)local, v, kv_f16);
         }
@@ -1119,14 +1129,18 @@ static __global__ void qkv_mixed_matvec_runtime_kernel(
         k_head = local / head_size;
         k_dim = local - k_head * head_size;
         k_rotate = k_dim < rope_dims;
-        if (k_pair_write && k_rotate && (k_dim & 1))
+        int half_rope = rope_dims / 2;
+        if (k_pair_write && k_rotate && k_dim >= half_rope)
             return;
     }
 
     float sum = cuda_dot_row(wdata, x, out_kind == 2 ? local : row,
                              cols, type);
     if (out_kind == 1 && k_rotate) {
-        int pair_dim = k_dim ^ 1;
+        int half_rope = rope_dims / 2;
+        int pair_dim = k_dim < half_rope
+            ? k_dim + half_rope
+            : k_dim - half_rope;
         int pair_row = q_rows + k_head * head_size + pair_dim;
         pair_sum = cuda_dot_row(qk_wdata, x, pair_row, cols, qk_type);
     }
@@ -1144,23 +1158,29 @@ static __global__ void qkv_mixed_matvec_runtime_kernel(
         if (key_cache && k_heads > 0 && head_size > 0 &&
             k_heads * head_size == k_rows) {
             if (k_rotate) {
-                int pair_dim = k_dim ^ 1;
+                int half_rope = rope_dims / 2;
+                int pair_dim = k_dim < half_rope
+                    ? k_dim + half_rope
+                    : k_dim - half_rope;
                 float pair = pair_sum +
                     (k_bias ? k_bias[k_head * head_size + pair_dim] : 0.0f);
-                float angle = (float)pos * freq[k_dim / 2];
+                int freq_idx = k_dim < half_rope ? k_dim : pair_dim;
+                float angle = (float)pos * freq[freq_idx];
                 float s, c;
                 __sincosf(angle, &s, &c);
                 if (k_pair_write) {
                     cuda_kv_store(key_cache, key_offset + (size_t)local,
                                   v * c - pair * s, kv_f16);
-                    cuda_kv_store(key_cache, key_offset + (size_t)(local + 1),
+                    cuda_kv_store(key_cache,
+                                  key_offset + (size_t)(k_head * head_size +
+                                                        pair_dim),
                                   v * s + pair * c, kv_f16);
                 } else {
-                    float x0 = (k_dim & 1) ? pair : v;
-                    float x1 = (k_dim & 1) ? v : pair;
+                    float x0 = k_dim < half_rope ? v : pair;
+                    float x1 = k_dim < half_rope ? pair : v;
                     cuda_kv_store(key_cache, key_offset + (size_t)local,
-                                  (k_dim & 1) ? (x0 * s + x1 * c)
-                                              : (x0 * c - x1 * s),
+                                  k_dim < half_rope ? (x0 * c - x1 * s)
+                                                    : (x0 * s + x1 * c),
                                   kv_f16);
                 }
             } else {
@@ -1211,14 +1231,18 @@ static __global__ void kv_mixed_matvec_kernel(
         k_head = local / head_size;
         k_dim = local - k_head * head_size;
         k_rotate = k_dim < rope_dims;
-        if (k_pair_write && k_rotate && (k_dim & 1))
+        int half_rope = rope_dims / 2;
+        if (k_pair_write && k_rotate && k_dim >= half_rope)
             return;
     }
 
     int dot_row = out_kind == 1 ? q_offset + local : local;
     float sum = cuda_dot_row(wdata, x, dot_row, cols, type);
     if (out_kind == 1 && k_rotate) {
-        int pair_dim = k_dim ^ 1;
+        int half_rope = rope_dims / 2;
+        int pair_dim = k_dim < half_rope
+            ? k_dim + half_rope
+            : k_dim - half_rope;
         int pair_row = q_offset + k_head * head_size + pair_dim;
         pair_sum = cuda_dot_row(qk_wdata, x, pair_row, cols, qk_type);
     }
@@ -1233,23 +1257,29 @@ static __global__ void kv_mixed_matvec_kernel(
     if (out_kind == 1) {
         v += k_bias ? k_bias[local] : 0.0f;
         if (k_rotate) {
-            int pair_dim = k_dim ^ 1;
+            int half_rope = rope_dims / 2;
+            int pair_dim = k_dim < half_rope
+                ? k_dim + half_rope
+                : k_dim - half_rope;
             float pair = pair_sum +
                 (k_bias ? k_bias[k_head * head_size + pair_dim] : 0.0f);
-            float angle = (float)pos * freq[k_dim / 2];
+            int freq_idx = k_dim < half_rope ? k_dim : pair_dim;
+            float angle = (float)pos * freq[freq_idx];
             float s, c;
             __sincosf(angle, &s, &c);
             if (k_pair_write) {
                 cuda_kv_store(key_cache, key_offset + (size_t)local,
                               v * c - pair * s, kv_f16);
-                cuda_kv_store(key_cache, key_offset + (size_t)(local + 1),
+                cuda_kv_store(key_cache,
+                              key_offset + (size_t)(k_head * head_size +
+                                                    pair_dim),
                               v * s + pair * c, kv_f16);
             } else {
-                float x0 = (k_dim & 1) ? pair : v;
-                float x1 = (k_dim & 1) ? v : pair;
+                float x0 = k_dim < half_rope ? v : pair;
+                float x1 = k_dim < half_rope ? pair : v;
                 cuda_kv_store(key_cache, key_offset + (size_t)local,
-                              (k_dim & 1) ? (x0 * s + x1 * c)
-                                          : (x0 * c - x1 * s),
+                              k_dim < half_rope ? (x0 * c - x1 * s)
+                                                : (x0 * s + x1 * c),
                               kv_f16);
             }
         } else {
@@ -1495,18 +1525,20 @@ static __global__ void bias_rope_copy_kernel(float *x, float *dst,
             dst[dst_off + base + i] = v;
         }
     }
-    for (int i = tid * 2; i + 1 < rope_dims; i += blockDim.x * 2) {
-        float angle = (float)pos * freq[i / 2];
+    int half_rope = rope_dims / 2;
+    for (int i = tid; i < half_rope; i += blockDim.x) {
+        int j = i + half_rope;
+        float angle = (float)pos * freq[i];
         float s, c;
         __sincosf(angle, &s, &c);
         float x0 = x[base + i] + bias[base + i];
-        float x1 = x[base + i + 1] + bias[base + i + 1];
+        float x1 = x[base + j] + bias[base + j];
         float y0 = x0 * c - x1 * s;
         float y1 = x0 * s + x1 * c;
         x[base + i] = y0;
-        x[base + i + 1] = y1;
+        x[base + j] = y1;
         dst[dst_off + base + i] = y0;
-        dst[dst_off + base + i + 1] = y1;
+        dst[dst_off + base + j] = y1;
     }
 }
 
@@ -1547,20 +1579,22 @@ static __global__ void rope_kernel(float *q, float *k, const float *freq,
                                    int rope_dims, int n_kv_heads,
                                    uint32_t kv_cache_off) {
     int h = blockIdx.x;
-    int i = threadIdx.x * 2;
-    if (h >= n_heads || i + 1 >= rope_dims) return;
-    float angle = (float)pos * freq[i / 2];
+    int i = threadIdx.x;
+    int half_rope = rope_dims / 2;
+    if (h >= n_heads || i >= half_rope) return;
+    int j = i + half_rope;
+    float angle = (float)pos * freq[i];
     float s, c;
     __sincosf(angle, &s, &c);
     float *qh = q + (size_t)h * head_size;
-    float x0 = qh[i], x1 = qh[i + 1];
+    float x0 = qh[i], x1 = qh[j];
     qh[i] = x0 * c - x1 * s;
-    qh[i + 1] = x0 * s + x1 * c;
+    qh[j] = x0 * s + x1 * c;
     if (k && h < n_kv_heads) {
         float *kh = k + kv_cache_off + (size_t)h * head_size;
-        x0 = kh[i]; x1 = kh[i + 1];
+        x0 = kh[i]; x1 = kh[j];
         kh[i] = x0 * c - x1 * s;
-        kh[i + 1] = x0 * s + x1 * c;
+        kh[j] = x0 * s + x1 * c;
     }
 }
 
@@ -1717,23 +1751,23 @@ static __global__ void flash_attention_rope_q_kernel(
     float *scratch = shared + n_kv;
     float *qrot = scratch + blockDim.x;
 
+    int half_rope = rope_dims / 2;
     for (int i = tid; i < head_size; i += blockDim.x) {
-        if (i < rope_dims) {
-            if ((i & 1) == 0 && i + 1 < rope_dims) {
-                float angle = (float)pos * freq[i / 2];
-                float s, c;
-                __sincosf(angle, &s, &c);
-                float x0 = qh[i];
-                float x1 = qh[i + 1];
-                if (bias) {
-                    const float *bh = bias + (size_t)h * head_size;
-                    x0 += bh[i];
-                    x1 += bh[i + 1];
-                }
-                qrot[i] = x0 * c - x1 * s;
-                qrot[i + 1] = x0 * s + x1 * c;
+        if (i < half_rope) {
+            int j = i + half_rope;
+            float angle = (float)pos * freq[i];
+            float s, c;
+            __sincosf(angle, &s, &c);
+            float x0 = qh[i];
+            float x1 = qh[j];
+            if (bias) {
+                const float *bh = bias + (size_t)h * head_size;
+                x0 += bh[i];
+                x1 += bh[j];
             }
-        } else {
+            qrot[i] = x0 * c - x1 * s;
+            qrot[j] = x0 * s + x1 * c;
+        } else if (i >= rope_dims) {
             qrot[i] = qh[i] + (bias ? bias[(size_t)h * head_size + i]
                                     : 0.0f);
         }
@@ -1794,23 +1828,23 @@ static __global__ void flash_attention_rope_q_runtime_kernel(
     float *scratch = shared + n_kv;
     float *qrot = scratch + blockDim.x;
 
+    int half_rope = rope_dims / 2;
     for (int i = tid; i < head_size; i += blockDim.x) {
-        if (i < rope_dims) {
-            if ((i & 1) == 0 && i + 1 < rope_dims) {
-                float angle = (float)pos * freq[i / 2];
-                float s, c;
-                __sincosf(angle, &s, &c);
-                float x0 = qh[i];
-                float x1 = qh[i + 1];
-                if (bias) {
-                    const float *bh = bias + (size_t)h * head_size;
-                    x0 += bh[i];
-                    x1 += bh[i + 1];
-                }
-                qrot[i] = x0 * c - x1 * s;
-                qrot[i + 1] = x0 * s + x1 * c;
+        if (i < half_rope) {
+            int j = i + half_rope;
+            float angle = (float)pos * freq[i];
+            float s, c;
+            __sincosf(angle, &s, &c);
+            float x0 = qh[i];
+            float x1 = qh[j];
+            if (bias) {
+                const float *bh = bias + (size_t)h * head_size;
+                x0 += bh[i];
+                x1 += bh[j];
             }
-        } else {
+            qrot[i] = x0 * c - x1 * s;
+            qrot[j] = x0 * s + x1 * c;
+        } else if (i >= rope_dims) {
             qrot[i] = qh[i] + (bias ? bias[(size_t)h * head_size + i]
                                     : 0.0f);
         }
@@ -2819,7 +2853,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
         qkv_fuse_key_cache_flag =
             getenv("BN_CUDA_DISABLE_QKV_KCACHE_FUSE") == NULL;
         enable_qkv_kpair_opt_flag =
-            getenv("BN_CUDA_DISABLE_QKV_KPAIR_OPT") == NULL;
+            getenv("BN_CUDA_ENABLE_QKV_KPAIR_OPT") != NULL;
         disable_q5_gateup_warp_flag =
             getenv("BN_CUDA_DISABLE_Q5_GATEUP_WARP") != NULL;
         disable_q8_gateup_warp_flag =
