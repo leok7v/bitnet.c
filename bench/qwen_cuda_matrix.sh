@@ -71,26 +71,14 @@ run_case() {
         echo "RUN $name: $path"
         ran=$((ran + 1))
         bench_models="${bench_models}${bench_models:+ }$path"
-        strict_kquant_fallback=0
         if [ "$name" = "Qwen 2.5 dense" ] || [ "$name" = "Qwen 3 dense" ]; then
-            strict_kquant_fallback=1
-            echo "  using Q4_K/Q6_K CUDA matvec correctness fallback"
+            echo "  using default small dense Q4_K/Q6_K CUDA graph correctness fallback"
         fi
         if [ "$RUN_COHERENCE" = "1" ]; then
-            if [ "$strict_kquant_fallback" = "1" ]; then
-                BN_CUDA_DISABLE_Q4_K=1 BN_CUDA_DISABLE_Q6_K=1 \
-                    "$COHERENCE" "$path" --cuda --require-all-tokens || fail=1
-            else
-                "$COHERENCE" "$path" --cuda --require-all-tokens || fail=1
-            fi
+            "$COHERENCE" "$path" --cuda --require-all-tokens || fail=1
         fi
         if [ "$RUN_LLAMA_COMPARE" = "1" ]; then
-            if [ "$strict_kquant_fallback" = "1" ]; then
-                BN_CUDA_DISABLE_Q4_K=1 BN_CUDA_DISABLE_Q6_K=1 \
-                    "$COMPARE_LLAMA" "$path" --cuda --llama-cuda -n "$N_TOKENS" -t "$THREADS" --maxseq "$MAXSEQ" || fail=1
-            else
-                "$COMPARE_LLAMA" "$path" --cuda --llama-cuda -n "$N_TOKENS" -t "$THREADS" --maxseq "$MAXSEQ" || fail=1
-            fi
+            "$COMPARE_LLAMA" "$path" --cuda --llama-cuda -n "$N_TOKENS" -t "$THREADS" --maxseq "$MAXSEQ" || fail=1
         fi
     else
         echo "SKIP $name: set $env_name or BN_MODEL_ROOT=$ROOT"
@@ -102,10 +90,10 @@ run_case "Qwen 2.5 dense" "BN_MODEL_QWEN25" \
     "qwen2_5" \
     "Qwen2.5*.gguf" "qwen2.5*.gguf"
 run_case "Qwen 3 dense" "BN_MODEL_QWEN3_DENSE" \
-    "qwen3" \
+    "qwen3/4b" \
     "Qwen3-*B*.gguf" "qwen3-*b*.gguf"
 run_case "Qwen 3 sparse MoE" "BN_MODEL_QWEN3_MOE" \
-    "qwen3" \
+    "qwen3/30b_a3b" \
     "Qwen3-*A*B*.gguf" "qwen3-*a*b*.gguf" "Qwen3*MOE*00001-of-*.gguf" "qwen3*moe*00001-of-*.gguf"
 run_case "Qwen 3.5 dense" "BN_MODEL_QWEN35_DENSE" \
     "qwen3_5" \
