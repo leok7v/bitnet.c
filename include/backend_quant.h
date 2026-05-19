@@ -67,5 +67,12 @@ void bn_backend_quant_matmul_gpu_buf(float *out, const BnQWeight *W,
                                      void *W_buf, const float *X,
                                      int n_tokens, int8_t *x_q_buf,
                                      BnThreadPool *pool, BnGPUBackend *gpu);
+void bn_backend_quant_matmul_batch_gpu_buf(const BnMatvecTask *tasks,
+                                           const void *const *W_bufs,
+                                           int n_tasks, const float *X,
+                                           int n_tokens, int x_cols,
+                                           int8_t *x_q_buf,
+                                           BnThreadPool *pool,
+                                           BnGPUBackend *gpu);
 
 #endif // BN_BACKEND_QUANT_H

@@ -13,6 +13,50 @@ void bn_backend_quant_matmul_gpu_buf(float *out, const BnQWeight *W,
     bn_quant_matmul(out, W, X, n_tokens, x_q_buf, pool);
 }
 
+static void bn_backend_quant_matmul_batch_cpu(const BnMatvecTask *tasks,
+                                              int n_tasks,
+                                              const float *X,
+                                              int n_tokens,
+                                              int8_t *x_q_buf,
+                                              BnThreadPool *pool) {
+    for (int i = 0; i < n_tasks; i++)
+        bn_quant_matmul(tasks[i].out, tasks[i].W, X, n_tokens, x_q_buf,
+                        pool);
+}
+
+void bn_backend_quant_matmul_batch_gpu_buf(const BnMatvecTask *tasks,
+                                           const void *const *W_bufs,
+                                           int n_tasks, const float *X,
+                                           int n_tokens, int x_cols,
+                                           int8_t *x_q_buf,
+                                           BnThreadPool *pool,
+                                           BnGPUBackend *gpu) {
+    if (gpu && gpu->matmul_batch && W_bufs && n_tasks > 1 && n_tasks <= 16 &&
+        n_tokens > 1) {
+        BnGPUMatvecOp ops[16];
+        int all_gpu = 1;
+        for (int i = 0; i < n_tasks; i++) {
+            if (!W_bufs[i] || tasks[i].W->cols != x_cols) {
+                all_gpu = 0;
+                break;
+            }
+            ops[i] = (BnGPUMatvecOp){
+                .out = tasks[i].out,
+                .W_buf = (void *)W_bufs[i],
+                .rows = tasks[i].W->rows,
+                .cols = tasks[i].W->cols,
+                .type = tasks[i].W->type,
+            };
+        }
+        if (all_gpu &&
+            gpu->matmul_batch(gpu->ctx, ops, n_tasks, X, n_tokens,
+                              x_cols) == 0)
+            return;
+    }
+    bn_backend_quant_matmul_batch_cpu(tasks, n_tasks, X, n_tokens, x_q_buf,
+                                      pool);
+}
+
 void bn_backend_quant_matmul_gpu(float *out, const BnQWeight *W,
                                  const float *X, int n_tokens,
                                  int8_t *x_q_buf, BnThreadPool *pool,

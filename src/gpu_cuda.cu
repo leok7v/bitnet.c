@@ -2615,6 +2615,85 @@ static int cuda_matmul(void *vctx, float *out, void *W_buf, const float *X,
     return 0;
 }
 
+static int cuda_matmul_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
+                             const float *X, int n_tokens, int x_cols) {
+    BnCudaCtx *ctx = (BnCudaCtx *)vctx;
+    if (getenv("BN_CUDA_DISABLE_MATMUL_BATCH")) return -1;
+    if (!ctx || !ops || !X || n_ops <= 1 || n_ops > 16 ||
+        n_tokens <= 1 || x_cols <= 0)
+        return -1;
+
+    size_t total_values = 0;
+    for (int i = 0; i < n_ops; i++) {
+        BnCudaBuffer *w = (BnCudaBuffer *)ops[i].W_buf;
+        if (!ops[i].out || !w || !w->data || ops[i].cols != x_cols ||
+            ops[i].rows <= 0 || !cuda_type_supported(ops[i].type))
+            return -1;
+        total_values += (size_t)n_tokens * ops[i].rows;
+    }
+
+    size_t x_bytes = (size_t)n_tokens * x_cols * sizeof(float);
+    size_t out_bytes = total_values * sizeof(float);
+    if (cuda_ensure_scratch(ctx, x_bytes, out_bytes) != 0) return -1;
+
+    cudaError_t err = cudaMemcpy(ctx->d_x, X, x_bytes,
+                                 cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] matmul batch input upload failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    int threads = 256;
+    int warps = threads / 32;
+    size_t out_offset = 0;
+    for (int i = 0; i < n_ops; i++) {
+        BnCudaBuffer *w = (BnCudaBuffer *)ops[i].W_buf;
+        int rows = ops[i].rows;
+        int type = ops[i].type;
+        if (type == BN_GGUF_TENSOR_Q8_0 && (x_cols & 31) == 0) {
+            dim3 grid(((rows + 3) / 4 + warps - 1) / warps, n_tokens, 1);
+            q8_0_matmul4_warp_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ8_0 *)w->data, ctx->d_x,
+                rows, x_cols, n_tokens, out_offset);
+        } else if (type == BN_GGUF_TENSOR_Q5_0 && (x_cols & 31) == 0) {
+            dim3 grid(((rows + 3) / 4 + warps - 1) / warps, n_tokens, 1);
+            q5_0_matmul4_warp_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ5_0 *)w->data, ctx->d_x,
+                rows, x_cols, n_tokens, out_offset);
+        } else {
+            dim3 grid(rows, n_tokens, 1);
+            matvec_kernel<<<grid, threads, (size_t)threads * sizeof(float)>>>(
+                ctx->d_out, w->data, ctx->d_x, NULL, rows, x_cols, type,
+                out_offset);
+        }
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] matmul batch launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        out_offset += (size_t)n_tokens * rows;
+    }
+
+    if (cuda_ensure_host_out(ctx, out_bytes) != 0) return -1;
+    err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] matmul batch output readback failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    out_offset = 0;
+    for (int i = 0; i < n_ops; i++) {
+        size_t values = (size_t)n_tokens * ops[i].rows;
+        memcpy(ops[i].out, ctx->h_out + out_offset,
+               values * sizeof(float));
+        out_offset += values;
+    }
+    return 0;
+}
+
 static int cuda_matvec_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
                              const float *x, int x_cols) {
     BnCudaCtx *ctx = (BnCudaCtx *)vctx;
@@ -4170,6 +4249,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->buffer_destroy = cuda_buffer_destroy;
     gpu->matvec = cuda_matvec;
     gpu->matmul = cuda_matmul;
+    gpu->matmul_batch = cuda_matmul_batch;
     gpu->matvec_batch = cuda_matvec_batch;
     gpu->dense_ffn = cuda_dense_ffn;
     gpu->dense_ffn_batch = cuda_dense_ffn_batch;

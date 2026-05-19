@@ -73,6 +73,12 @@ struct BnGPUBackend {
     int (*matmul)(void *ctx, float *out, void *W_buf, const float *X,
                   int rows, int cols, int n_tokens, int type);
 
+    // Batched matmul: multiple W_i @ X projections sharing the same
+    // X[n_tokens, x_cols]. Outputs go to host pointers in each op.
+    // Optional (NULL = repeated matmul or CPU fallback).
+    int (*matmul_batch)(void *ctx, const BnGPUMatvecOp *ops, int n_ops,
+                        const float *X, int n_tokens, int x_cols);
+
     // Batched matvec: encode multiple dispatches in one GPU submission.
     // All ops share the same input x[x_cols]. Outputs go to separate host ptrs.
     // Optional (NULL = fall back to individual matvec calls).

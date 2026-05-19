@@ -68,6 +68,23 @@ static void prefill_quant_matmul_multi(const BnModel *m,
                                        x_q_buf, bn_model_pool(m));
         return;
     }
+    if (n > 1 && n <= 16 && bn_model_gpu(m)->matmul_batch) {
+        const BnBackendModel *backend = bn_model_backend(m);
+        BnMatvecTask tasks[16];
+        const void *bufs[16];
+        int all_bufs = backend != NULL;
+        for (int i = 0; i < n; i++) {
+            tasks[i] = (BnMatvecTask){ out[i], W[i], NULL, 0 };
+            bufs[i] = backend ? prefill_qweight_backend_buf(backend, W[i]) : NULL;
+            if (!bufs[i]) all_bufs = 0;
+        }
+        if (all_bufs) {
+            bn_backend_quant_matmul_batch_gpu_buf(
+                tasks, bufs, n, X, n_tokens, W[0]->cols, x_q_buf,
+                bn_model_pool(m), bn_model_gpu(m));
+            return;
+        }
+    }
     for (int i = 0; i < n; i++)
         prefill_quant_matmul_gpu(m, out[i], W[i], X, n_tokens, x_q_buf);
 }
