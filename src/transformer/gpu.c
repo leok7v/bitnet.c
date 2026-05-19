@@ -487,7 +487,7 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
          (getenv("BN_CUDA_ENABLE_LOGITS_CACHE") &&
           !bn_transformer_gpu_logits_needs_cpu_fallback(gpu, logit_res))) &&
         gpu->kind == BN_GPU_BACKEND_CUDA && !policy.has_moe &&
-        !policy.has_ssm &&
+        !policy.has_ssm && !getenv("BN_CUDA_DISABLE_DECODE_CACHE") &&
         cpu_fallback_layer < 0 && cpu_fallback_from_layer < 0 &&
         cpu_fallback_attn_layer < 0 && cpu_fallback_attn_from_layer < 0 &&
         cpu_fallback_ffn_layer < 0 && cpu_fallback_ffn_from_layer < 0 &&
