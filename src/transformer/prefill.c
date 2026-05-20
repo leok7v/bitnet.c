@@ -470,6 +470,51 @@ static void prefill_fill_rope(float *rope_cos_buf, float *rope_sin_buf,
     }
 }
 
+static int prefill_prepare_q_for_gpu_attention(BnBatchedAttnCtx *b) {
+    if (!b || b->q_gated || !b->Q_buf || !b->rope_cos || !b->rope_sin)
+        return -1;
+    if (b->pos0 != 0)
+        return -1;
+    int head_size = b->head_size;
+    int n_heads = b->n_heads;
+    int n_tokens = b->n_tokens;
+    int q_row_stride = b->q_row_stride > 0 ? b->q_row_stride : b->wq_rows;
+    int rope_stride = b->rope_stride > 0 ? b->rope_stride : b->rope_dims / 2;
+    if (head_size <= 0 || n_heads <= 0 || n_tokens <= 1 ||
+        q_row_stride < n_heads * head_size)
+        return -1;
+
+    for (int t = 0; t < n_tokens; t++) {
+        float *row = b->Q_buf + (size_t)t * q_row_stride;
+        if (b->q_bias) {
+            for (int i = 0; i < n_heads * head_size; i++)
+                row[i] += b->q_bias[i];
+        }
+        if (b->q_norm) {
+            int stride = b->qk_norm_per_head ? head_size : 0;
+            for (int h = 0; h < n_heads; h++)
+                prefill_rmsnorm(row + h * head_size, row + h * head_size,
+                                b->q_norm + h * stride, head_size,
+                                b->norm_eps);
+        }
+        bn_transformer_cpu_apply_rope_heads(
+            row, n_heads, head_size, b->rope_dims,
+            b->rope_cos + (size_t)t * rope_stride,
+            b->rope_sin + (size_t)t * rope_stride);
+        if (q_row_stride != n_heads * head_size)
+            memmove(b->Q_buf + (size_t)t * n_heads * head_size, row,
+                    (size_t)n_heads * (size_t)head_size * sizeof(float));
+    }
+    return 0;
+}
+
+static int prefill_gpu_attention_min_tokens(void) {
+    const char *env = getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS");
+    if (!env || !*env) return 64;
+    int n = atoi(env);
+    return n > 0 ? n : 64;
+}
+
 static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                int n_tokens, int pos0, float *all_logits,
                                int need_last_logits) {
@@ -738,7 +783,24 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                     .wo_cols = wo_cols_attn,
                 };
                 t_prof = prefill_profile_now(&prof);
-                bn_transformer_batched_attn_dispatch(m, &bctx);
+                BnGPUBackend *gpu = bn_model_gpu(m);
+                int used_gpu_attn = 0;
+                if (gpu && gpu->prefill_attention &&
+                    !getenv("BN_CUDA_DISABLE_PREFILL_ATTN") &&
+                    n_tokens >= prefill_gpu_attention_min_tokens() &&
+                    prefill_prepare_q_for_gpu_attention(&bctx) == 0) {
+                    if (gpu->prefill_attention(
+                            gpu->ctx, Q_buf, Q_buf, K_new, V_new, n_tokens,
+                            c->n_heads, layer_n_kv_heads, layer_head_size,
+                            layer_kv_mul, kv_dim,
+                            prefill_attention_scale(c, layer_head_size)) != 0) {
+                        sh_arena_free(pf_arena);
+                        return NULL;
+                    }
+                    used_gpu_attn = 1;
+                }
+                if (!used_gpu_attn)
+                    bn_transformer_batched_attn_dispatch(m, &bctx);
                 prefill_profile_add(&prof.attn_cpu_ms, t_prof);
             } else {
                 t_prof = prefill_profile_now(&prof);

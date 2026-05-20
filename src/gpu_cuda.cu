@@ -60,6 +60,8 @@ typedef struct {
     size_t d_argmax_bytes;
     int *d_penalty_tokens;
     size_t d_penalty_tokens_bytes;
+    float *d_prefill;
+    size_t d_prefill_bytes;
     float *act_bufs[BN_GPU_VALUE_COUNT];
     size_t act_sizes[BN_GPU_VALUE_COUNT];
 } BnCudaCtx;
@@ -2942,6 +2944,54 @@ static __global__ void flash_attention_kernel(float *out, const float *q,
     }
 }
 
+static __global__ void prefill_attention_kernel(
+    float *out, const float *q, const float *k, const float *v,
+    int n_tokens, int n_heads, int head_size, int kv_mul, int kv_dim,
+    float attention_scale) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int tid = threadIdx.x;
+    if (h >= n_heads || t >= n_tokens) return;
+    int kv_h = h / kv_mul;
+    const float *qh = q + ((size_t)t * n_heads + (size_t)h) * head_size;
+
+    extern __shared__ float shared[];
+    float *scores = shared;
+    float *scratch = shared + n_tokens;
+
+    for (int j = tid; j <= t; j += blockDim.x) {
+        const float *kh = k + (size_t)j * kv_dim + (size_t)kv_h * head_size;
+        float score = 0.0f;
+        for (int d = 0; d < head_size; d++)
+            score += qh[d] * kh[d];
+        scores[j] = score * attention_scale;
+    }
+    __syncthreads();
+
+    float local_max = -INFINITY;
+    for (int j = tid; j <= t; j += blockDim.x)
+        local_max = fmaxf(local_max, scores[j]);
+    float max_score = cuda_block_reduce_max_all(local_max, scratch);
+
+    float local_sum = 0.0f;
+    for (int j = tid; j <= t; j += blockDim.x) {
+        float p = __expf(scores[j] - max_score);
+        scores[j] = p;
+        local_sum += p;
+    }
+    float inv_sum = 1.0f / cuda_block_reduce_sum_all(local_sum, scratch);
+
+    for (int d = tid; d < head_size; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j <= t; j++) {
+            const float *vh =
+                v + (size_t)j * kv_dim + (size_t)kv_h * head_size;
+            acc += scores[j] * inv_sum * vh[d];
+        }
+        out[((size_t)t * n_heads + (size_t)h) * head_size + d] = acc;
+    }
+}
+
 static __global__ void flash_attention_rope_q_kernel(
     float *out, const float *q, const void *key_cache,
     const void *value_cache, const float *freq, const float *bias,
@@ -3409,6 +3459,23 @@ static int cuda_ensure_x_f16(BnCudaCtx *ctx, size_t values) {
         return -1;
     }
     ctx->d_x_f16_bytes = bytes;
+    return 0;
+}
+
+static int cuda_ensure_prefill(BnCudaCtx *ctx, size_t values) {
+    if (!ctx || values == 0) return -1;
+    size_t bytes = values * sizeof(float);
+    if (bytes <= ctx->d_prefill_bytes) return 0;
+    if (ctx->d_prefill) cudaFree(ctx->d_prefill);
+    ctx->d_prefill = NULL;
+    ctx->d_prefill_bytes = 0;
+    cudaError_t err = cudaMalloc(&ctx->d_prefill, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill scratch alloc failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    ctx->d_prefill_bytes = bytes;
     return 0;
 }
 
@@ -4552,6 +4619,72 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
     err = cudaMemcpy(out, ctx->d_out, out_bytes, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] dense ffn batch output readback failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+static int cuda_prefill_attention(void *vctx, float *out,
+                                  const float *Q, const float *K,
+                                  const float *V, int n_tokens,
+                                  int n_heads, int n_kv_heads,
+                                  int head_size, int kv_mul, int kv_dim,
+                                  float attention_scale) {
+    BnCudaCtx *ctx = (BnCudaCtx *)vctx;
+    if (getenv("BN_CUDA_DISABLE_PREFILL_ATTN"))
+        return -1;
+    if (!ctx || !out || !Q || !K || !V || n_tokens <= 1 ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_size <= 0 ||
+        kv_mul <= 0 || kv_dim <= 0 || n_heads / kv_mul != n_kv_heads)
+        return -1;
+    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64);
+    if (n_tokens < min_tokens)
+        return -1;
+    if (n_tokens > 2048)
+        return -1;
+
+    size_t q_values = (size_t)n_tokens * (size_t)n_heads * (size_t)head_size;
+    size_t kv_values = (size_t)n_tokens * (size_t)kv_dim;
+    size_t total_values = q_values + 2u * kv_values;
+    if (cuda_ensure_prefill(ctx, total_values) != 0)
+        return -1;
+    if (cuda_ensure_scratch(ctx, sizeof(float), q_values * sizeof(float)) != 0)
+        return -1;
+
+    float *d_q = ctx->d_prefill;
+    float *d_k = d_q + q_values;
+    float *d_v = d_k + kv_values;
+    cudaError_t err = cudaMemcpy(d_q, Q, q_values * sizeof(float),
+                                 cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(d_k, K, kv_values * sizeof(float),
+                         cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(d_v, V, kv_values * sizeof(float),
+                         cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill attention upload failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    int threads = 256;
+    size_t shared = (size_t)(n_tokens + threads) * sizeof(float);
+    prefill_attention_kernel<<<dim3(n_heads, n_tokens, 1), threads,
+                               shared>>>(
+        ctx->d_out, d_q, d_k, d_v, n_tokens, n_heads, head_size,
+        kv_mul, kv_dim, attention_scale);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill attention launch failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    err = cudaMemcpy(out, ctx->d_out, q_values * sizeof(float),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill attention readback failed: %s\n",
                 cudaGetErrorString(err));
         return -1;
     }
@@ -6194,6 +6327,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->matvec_batch = cuda_matvec_batch;
     gpu->dense_ffn = cuda_dense_ffn;
     gpu->dense_ffn_batch = cuda_dense_ffn_batch;
+    gpu->prefill_attention = cuda_prefill_attention;
     gpu->init_activations = cuda_init_activations;
     gpu->free_activations = cuda_free_activations;
     gpu->write_activation = cuda_write_activation;
@@ -6233,6 +6367,7 @@ void bn_gpu_cuda_destroy(BnGPUBackend *gpu) {
         if (ctx->d_x_f16) cudaFree(ctx->d_x_f16);
         if (ctx->d_argmax) cudaFree(ctx->d_argmax);
         if (ctx->d_penalty_tokens) cudaFree(ctx->d_penalty_tokens);
+        if (ctx->d_prefill) cudaFree(ctx->d_prefill);
         if (ctx->exec_graph) cudaGraphExecDestroy(ctx->exec_graph);
         if (ctx->exec_graph_def) cudaGraphDestroy(ctx->exec_graph_def);
         free(ctx->exec_nodes);

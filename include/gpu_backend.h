@@ -106,6 +106,19 @@ struct BnGPUBackend {
                            int gate_type, int up_type, int down_type,
                            int act_type);
 
+    // Batched causal attention for prompt processing:
+    // out[n_tokens, n_heads * head_size] =
+    // attention(Q[n_tokens, n_heads * head_size],
+    //           K/V[n_tokens, n_kv_heads * head_size]).
+    // Q and K must already include bias, norm, and RoPE. This prompt helper
+    // handles only the current prompt window, so callers should use it only
+    // when pos0 == 0 unless the backend documents broader cache support.
+    int (*prefill_attention)(void *ctx, float *out,
+                             const float *Q, const float *K, const float *V,
+                             int n_tokens, int n_heads, int n_kv_heads,
+                             int head_size, int kv_mul, int kv_dim,
+                             float attention_scale);
+
     // GPU-resident forward pass: execute a backend-private lowered command list
     // as a single submission. All intermediate buffers stay on GPU. Only
     // readback_buf is copied to out_host.
