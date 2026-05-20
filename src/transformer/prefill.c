@@ -541,7 +541,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             int q_gated = plan.q_gated;
             int wo_cols_attn = lw->attn.wo.cols;
 
-            if (!bn_model_gpu(m) && bn_model_tq_state(m) == NULL) {
+            if (bn_model_tq_state(m) == NULL) {
                 // Phase 1: prepare K/V (bias, norm, RoPE) and write to cache
                 t_prof = prefill_profile_now(&prof);
                 for (int t = 0; t < n_tokens; t++) {

@@ -9,6 +9,7 @@
 #include "transformer_backend_internal.h"
 #include "session.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -743,6 +744,30 @@ int bn_transformer_gpu_read_activation_buf_offset(const BnGPUBackend *gpu,
     if (!gpu || !gpu->read_activation || !out) return -1;
     return gpu->read_activation(gpu->ctx, buf_idx, out, size_bytes,
                                 offset_bytes);
+}
+
+int bn_transformer_gpu_upload_kv_cache(BnModel *m, BnSession *sess) {
+    if (!m || !sess) return -1;
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    if (!gpu || !gpu->write_activation) return -1;
+    BnConfig *c = &m->config;
+    BnRunState *s = &sess->state;
+    if (!s->key_cache || !s->value_cache) return -1;
+
+    int n_attn = (c->full_attn_interval > 0)
+        ? c->n_layers / c->full_attn_interval
+        : c->n_layers;
+    if (n_attn <= 0 || c->seq_len <= 0 || c->kv_dim <= 0) return -1;
+    size_t elem_size = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    size_t kv_bytes = (size_t)n_attn * (size_t)c->seq_len *
+                      (size_t)c->kv_dim * elem_size;
+    if (gpu->write_activation(gpu->ctx, BN_GPU_VALUE_KEY_CACHE,
+                              s->key_cache, kv_bytes, 0) != 0)
+        return -1;
+    if (gpu->write_activation(gpu->ctx, BN_GPU_VALUE_VALUE_CACHE,
+                              s->value_cache, kv_bytes, 0) != 0)
+        return -1;
+    return 0;
 }
 
 void bn_transformer_gpu_emit_context_dense_ffn(

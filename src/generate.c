@@ -2,6 +2,7 @@
 #include "model.h"
 #include "session.h"
 #include "transformer.h"
+#include "transformer_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,17 @@ static BnAllocator *resolve_alloc(BnAllocator *a) {
     if (a) return a;
     if (!init) { def = bn_allocator_default(); init = 1; }
     return &def;
+}
+
+static int use_gpu_batch_prefill(const BnModel *model) {
+    if (!model) return 0;
+    if (getenv("BN_GPU_DISABLE_PREFILL_MATMUL")) return 0;
+    if (getenv("BN_GPU_PREFILL_MATMUL")) return 1;
+    const BnConfig *c = &model->config;
+    return c->kv_tq_bits == 0 &&
+           c->n_experts <= 0 &&
+           c->full_attn_interval <= 0 &&
+           c->dim <= 2560;
 }
 
 // --- Stop string matching ---
@@ -303,13 +315,15 @@ float *bn_prefill(BnModel *model, BnSession *s, const int *tokens, int n_tokens,
                   int pos0, int no_prefill) {
     float *logits = NULL;
     int gpu_attached = bn_model_gpu(model) != NULL;
-    /* GPU decode reads backend-resident KV buffers. The batch prefill path only
-     * populates CPU session KV today, so keep GPU-attached generation on the
-     * token-by-token path unless the experimental backend prefill is requested.
+    /* GPU decode reads backend-resident KV buffers. For conservative small
+     * dense models, batch prefill is followed by a CPU->GPU KV upload.
      */
     if (!no_prefill && n_tokens > 1 &&
-        (!gpu_attached || getenv("BN_GPU_PREFILL_MATMUL"))) {
+        (!gpu_attached || use_gpu_batch_prefill(model))) {
         logits = bn_transformer_prefill(model, s, tokens, n_tokens, pos0);
+        if (logits && gpu_attached &&
+            bn_transformer_gpu_upload_kv_cache(model, s) != 0)
+            return NULL;
     } else {
         for (int i = 0; i < n_tokens; i++) {
             if (i + 1 == n_tokens) {
@@ -327,8 +341,12 @@ int bn_prefill_no_logits(BnModel *model, BnSession *s, const int *tokens,
                          int n_tokens, int pos0, int no_prefill) {
     int gpu_attached = bn_model_gpu(model) != NULL;
     if (!no_prefill && n_tokens > 1 &&
-        (!gpu_attached || getenv("BN_GPU_PREFILL_MATMUL"))) {
-        return bn_transformer_prefill_no_logits(model, s, tokens, n_tokens, pos0);
+        (!gpu_attached || use_gpu_batch_prefill(model))) {
+        int rc = bn_transformer_prefill_no_logits(model, s, tokens,
+                                                  n_tokens, pos0);
+        if (rc == 0 && gpu_attached)
+            rc = bn_transformer_gpu_upload_kv_cache(model, s);
+        return rc;
     }
     for (int i = 0; i < n_tokens; i++) {
         if (bn_transformer_forward_no_logits(model, s, tokens[i],

@@ -517,6 +517,17 @@ static int bench_sync_gpu_prompt(BnModel *m) {
     return 0;
 }
 
+static int bench_use_gpu_batch_prefill(const BnModel *m) {
+    if (!m || !bn_model_gpu(m)) return 0;
+    if (getenv("BN_GPU_DISABLE_PREFILL_MATMUL")) return 0;
+    if (getenv("BN_GPU_PREFILL_MATMUL")) return 1;
+    const BnConfig *c = &m->config;
+    return c->kv_tq_bits == 0 &&
+           c->n_experts <= 0 &&
+           c->full_attn_interval <= 0 &&
+           c->dim <= 2560;
+}
+
 static void bench_prefill(BnModel *m, int n_prompt, int n_iters) {
     if (n_prompt <= 1 || n_iters <= 0)
         return;
@@ -537,7 +548,7 @@ static void bench_prefill(BnModel *m, int n_prompt, int n_iters) {
         return;
     }
     int gpu_prompt_path = bn_model_gpu(m) != NULL &&
-                          getenv("BN_GPU_PREFILL_MATMUL") == NULL;
+                          !bench_use_gpu_batch_prefill(m);
 
     for (int i = 0; i < 2; i++) {
         if (gpu_prompt_path) {
