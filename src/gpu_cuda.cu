@@ -640,7 +640,7 @@ static __device__ __forceinline__ int cuda_q5k_hbits4(const uint8_t *qh,
 
 static __device__ __forceinline__ float cuda_vec_dot_q5k_q8_1(
     const BnBlockQ5K *blk, const BnCudaBlockQ8_1 *xq, int iqs) {
-    int v[2];
+    int qlow[2];
     int u[4];
     float d8[2];
 
@@ -648,6 +648,8 @@ static __device__ __forceinline__ float cuda_vec_dot_q5k_q8_1(
     const int q5_offset = 16 * bq8_offset + 4 * ((iqs / 2) % 4);
     const int h_offset = 4 * ((iqs / 2) % 4);
     const int *q5 = (const int *)(blk->qs + q5_offset);
+    qlow[0] = q5[0];
+    qlow[1] = q5[4];
 
     const uint16_t *scales = (const uint16_t *)blk->scales;
     uint16_t aux[2];
@@ -666,14 +668,6 @@ static __device__ __forceinline__ float cuda_vec_dot_q5k_q8_1(
 
 #pragma unroll
     for (int i = 0; i < 2; i++) {
-        int bit = bq8_offset + i;
-        int h0 = cuda_q5k_hbits4(blk->qh, h_offset, bit);
-        int h1 = cuda_q5k_hbits4(blk->qh, h_offset + 16, bit);
-        const int low0 = q5[4 * i + 0];
-        const int low1 = q5[4 * i + 4];
-        v[0] = h0 | (low0 & 0x0f0f0f0f);
-        v[1] = h1 | ((low1 >> 4) & 0x0f0f0f0f);
-
         const BnCudaBlockQ8_1 *xb = xq + bq8_offset + i;
         d8[i] = cuda_fp16_to_fp32(xb->d);
         const int *q8 = (const int *)xb->qs + ((iqs / 2) % 4);
@@ -685,8 +679,13 @@ static __device__ __forceinline__ float cuda_vec_dot_q5k_q8_1(
     float sum_m = 0.0f;
 #pragma unroll
     for (int i = 0; i < 2; i++) {
-        const int dot = cuda_dp4a_i32(v[1], u[2 * i + 1],
-                                      cuda_dp4a_i32(v[0], u[2 * i + 0], 0));
+        int bit = bq8_offset + i;
+        int v0 = cuda_q5k_hbits4(blk->qh, h_offset, bit) |
+                 ((qlow[0] >> (4 * i)) & 0x0f0f0f0f);
+        int v1 = cuda_q5k_hbits4(blk->qh, h_offset + 16, bit) |
+                 ((qlow[1] >> (4 * i)) & 0x0f0f0f0f);
+        const int dot = cuda_dp4a_i32(v1, u[2 * i + 1],
+                                      cuda_dp4a_i32(v0, u[2 * i + 0], 0));
         const int usum = cuda_dp4a_i32(0x01010101, u[2 * i + 1],
                                        cuda_dp4a_i32(0x01010101,
                                                      u[2 * i + 0], 0));
@@ -4257,6 +4256,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
     static int enable_q5_matvec4_flag = 0;
     static int enable_q5_warp_flag = 0;
     static int enable_q4k_dot_flag = 1;
+    static int enable_q5k_dot_flag = 1;
     static int enable_q6k_dot_flag = 1;
     static int force_q6k_dot_flag = 0;
     static int enable_q6k_warp_flag = 0;
@@ -4279,6 +4279,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             getenv("BN_CUDA_ENABLE_Q5_MATVEC4") != NULL;
         enable_q5_warp_flag = getenv("BN_CUDA_ENABLE_Q5_WARP") != NULL;
         enable_q4k_dot_flag = getenv("BN_CUDA_DISABLE_Q4K_DOT") == NULL;
+        enable_q5k_dot_flag = getenv("BN_CUDA_DISABLE_Q5K_DOT") == NULL;
         enable_q6k_dot_flag = getenv("BN_CUDA_DISABLE_Q6K_DOT") == NULL;
         force_q6k_dot_flag = getenv("BN_CUDA_ENABLE_Q6K_DOT") != NULL;
         enable_q6k_warp_flag = getenv("BN_CUDA_ENABLE_Q6K_WARP") != NULL;
@@ -4308,6 +4309,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
     const int enable_q5_matvec4 = enable_q5_matvec4_flag;
     const int enable_q5_warp = enable_q5_warp_flag;
     const int enable_q4k_dot = enable_q4k_dot_flag;
+    const int enable_q5k_dot = enable_q5k_dot_flag;
     const int enable_q6k_dot = enable_q6k_dot_flag;
     const int force_q6k_dot = force_q6k_dot_flag;
     const int enable_q6k_warp = enable_q6k_warp_flag;
@@ -4757,7 +4759,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     bias0, total_rows, cols, split0, split1,
                     (size_t)op->p[6], (size_t)op->p[7]);
             } else if (op->type == BN_GGUF_TENSOR_Q5_K &&
-                (cols % BN_QK_K) == 0 && split1 != 1) {
+                (cols % BN_QK_K) == 0 && split1 != 1 && enable_q5k_dot) {
                 if (cuda_ensure_q8_1(ctx, cols) != 0) return -1;
                 BnCudaBlockQ8_1 *xq =
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
