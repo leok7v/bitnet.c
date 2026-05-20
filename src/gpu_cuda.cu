@@ -2670,8 +2670,15 @@ static int cuda_write_activation(void *vctx, int buf_idx, const void *data,
     if (cuda_ctx_set_device(ctx) != 0) return -1;
     if (!ctx->act_bufs[buf_idx] || offset + size > ctx->act_sizes[buf_idx])
         return -1;
-    cudaError_t err = cudaMemcpy((char *)ctx->act_bufs[buf_idx] + offset,
-                                 data, size, cudaMemcpyHostToDevice);
+    cudaError_t err = cudaSuccess;
+    if (ctx->stream) {
+        err = cudaMemcpyAsync((char *)ctx->act_bufs[buf_idx] + offset,
+                              data, size, cudaMemcpyHostToDevice,
+                              ctx->stream);
+    } else {
+        err = cudaMemcpy((char *)ctx->act_bufs[buf_idx] + offset,
+                         data, size, cudaMemcpyHostToDevice);
+    }
     return err == cudaSuccess ? 0 : -1;
 }
 
@@ -2683,9 +2690,16 @@ static int cuda_read_activation(void *vctx, int buf_idx, void *out,
     if (cuda_ctx_set_device(ctx) != 0) return -1;
     if (!ctx->act_bufs[buf_idx] || offset + size > ctx->act_sizes[buf_idx])
         return -1;
-    cudaError_t err = cudaMemcpy(out,
-                                 (char *)ctx->act_bufs[buf_idx] + offset,
-                                 size, cudaMemcpyDeviceToHost);
+    cudaError_t err = cudaSuccess;
+    if (ctx->stream) {
+        err = cudaMemcpyAsync(out, (char *)ctx->act_bufs[buf_idx] + offset,
+                              size, cudaMemcpyDeviceToHost, ctx->stream);
+        if (err == cudaSuccess)
+            err = cudaStreamSynchronize(ctx->stream);
+    } else {
+        err = cudaMemcpy(out, (char *)ctx->act_bufs[buf_idx] + offset,
+                         size, cudaMemcpyDeviceToHost);
+    }
     return err == cudaSuccess ? 0 : -1;
 }
 
@@ -4463,13 +4477,6 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                         cudaGetErrorString(err));
                 return -1;
             }
-        }
-    } else if (graph_instance) {
-        cudaError_t err = cudaStreamSynchronize(ctx->exec_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[bn:gpu:cuda] graph sync failed: %s\n",
-                    cudaGetErrorString(err));
-            return -1;
         }
     }
     if (profile) {
