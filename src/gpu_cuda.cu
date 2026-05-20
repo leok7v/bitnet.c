@@ -3962,12 +3962,16 @@ static int cuda_matvec(void *vctx, float *out, void *W_buf, const float *x,
         return -1;
     }
     if (err == cudaSuccess) {
-        err = cudaMemcpy(out, ctx->d_out, out_bytes, cudaMemcpyDeviceToHost);
+        if (cuda_ensure_host_out(ctx, out_bytes) != 0)
+            return -1;
+        err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                         cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             fprintf(stderr, "[bn:gpu:cuda] matvec output readback failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
         }
+        memcpy(out, ctx->h_out, out_bytes);
     }
 
     return 0;
@@ -4046,12 +4050,16 @@ static int cuda_matmul(void *vctx, float *out, void *W_buf, const float *X,
         return -1;
     }
     if (err == cudaSuccess) {
-        err = cudaMemcpy(out, ctx->d_out, out_bytes, cudaMemcpyDeviceToHost);
+        if (cuda_ensure_host_out(ctx, out_bytes) != 0)
+            return -1;
+        err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                         cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             fprintf(stderr, "[bn:gpu:cuda] matmul output readback failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
         }
+        memcpy(out, ctx->h_out, out_bytes);
     }
     return 0;
 }
@@ -4417,12 +4425,16 @@ static int cuda_dense_ffn(void *vctx, float *out,
                 cudaGetErrorString(err));
         return -1;
     }
-    err = cudaMemcpy(out, ctx->d_out, out_bytes, cudaMemcpyDeviceToHost);
+    if (cuda_ensure_host_out(ctx, out_bytes) != 0)
+        return -1;
+    err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                     cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] dense ffn output readback failed: %s\n",
                 cudaGetErrorString(err));
         return -1;
     }
+    memcpy(out, ctx->h_out, out_bytes);
     return 0;
 }
 
@@ -4622,12 +4634,16 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
                 cudaGetErrorString(err));
         return -1;
     }
-    err = cudaMemcpy(out, ctx->d_out, out_bytes, cudaMemcpyDeviceToHost);
+    if (cuda_ensure_host_out(ctx, out_bytes) != 0)
+        return -1;
+    err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                     cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] dense ffn batch output readback failed: %s\n",
                 cudaGetErrorString(err));
         return -1;
     }
+    memcpy(out, ctx->h_out, out_bytes);
     return 0;
 }
 
