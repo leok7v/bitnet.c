@@ -2700,16 +2700,6 @@ static int cuda_matvec(void *vctx, float *out, void *W_buf, const float *x,
         q6k_matvec_warp_kernel<<<blocks, threads>>>(
             ctx->d_out, (const BnBlockQ6K *)w->data, ctx->d_x, NULL,
             rows, cols, 0);
-    } else if (type == BN_GGUF_TENSOR_Q4_K && (cols % BN_QK_K) == 0 &&
-               !getenv("BN_CUDA_DISABLE_Q4K_DOT")) {
-        if (cuda_ensure_q8_1(ctx, cols) != 0) return -1;
-        BnCudaBlockQ8_1 *xq = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
-        quantize_q8_1_kernel<<<(cols + 31) / 32, 32>>>(xq, ctx->d_x, cols);
-        int warps = threads / 32;
-        int blocks = (rows + warps - 1) / warps;
-        q4k_dot_matvec_kernel<<<blocks, threads>>>(
-            ctx->d_out, (const BnBlockQ4K *)w->data, xq, NULL,
-            rows, cols, 0);
     } else if (type == BN_GGUF_TENSOR_Q8_0 && rows >= 16384 &&
                (cols & 31) == 0) {
         int warps = threads / 32;
@@ -3293,6 +3283,39 @@ static int cuda_op_reads_buf(const BnGPUOp *op, int buf) {
     }
 }
 
+static int cuda_ops_look_like_decode_graph(const BnGPUOp *ops, int n_ops,
+                                           int readback_buf,
+                                           const float *out_host,
+                                           int out_len) {
+    if (!ops || n_ops < 32)
+        return 0;
+
+    int has_rope = 0;
+    int has_attention = 0;
+    int has_logits = 0;
+    for (int i = 0; i < n_ops; i++) {
+        const BnGPUOp *op = &ops[i];
+        if (op->op_code == BN_GPU_CODE_ROPE ||
+            op->op_code == BN_GPU_CODE_ROPE_QK)
+            has_rope = 1;
+        if (op->op_code == BN_GPU_CODE_FLASH_ATTN ||
+            op->op_code == BN_GPU_CODE_GQA_SCORES ||
+            op->op_code == BN_GPU_CODE_GQA_COMBINE)
+            has_attention = 1;
+        if (op->op_kind == BN_GPU_OP_LOGITS ||
+            (op->op_code == BN_GPU_CODE_MATVEC &&
+             op->buf_out == BN_GPU_VALUE_LOGITS))
+            has_logits = 1;
+    }
+
+    int wants_logits_readback =
+        readback_buf == BN_GPU_VALUE_LOGITS && out_host && out_len > 0;
+    int wants_gpu_resident =
+        readback_buf < 0 && !out_host && out_len <= 0;
+    return has_rope && has_attention &&
+           ((wants_logits_readback && has_logits) || wants_gpu_resident);
+}
+
 static int cuda_buf_unused_until_write(const BnGPUOp *ops, int n_ops,
                                        int start, int buf) {
     if (!ops || buf < 0) return 0;
@@ -3449,8 +3472,11 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
         return -1;
     }
     memset(skip_ops, 0, (size_t)n_ops);
-    int graph_exec = (enable_graph_exec_flag ||
-                      (readback_buf < 0 && !out_host && out_len <= 0)) &&
+    int default_graph_exec =
+        getenv("BN_CUDA_DISABLE_GRAPH_EXEC") == NULL &&
+        cuda_ops_look_like_decode_graph(ops, n_ops, readback_buf,
+                                        out_host, out_len);
+    int graph_exec = (enable_graph_exec_flag || default_graph_exec) &&
                      n_ops > 10 && !profile;
     int graph_building = 0;
     cudaGraphExec_t graph_instance = NULL;
