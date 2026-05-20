@@ -746,27 +746,61 @@ int bn_transformer_gpu_read_activation_buf_offset(const BnGPUBackend *gpu,
                                 offset_bytes);
 }
 
-int bn_transformer_gpu_upload_kv_cache(BnModel *m, BnSession *sess) {
+static int gpu_upload_kv_segment(BnGPUBackend *gpu, BnRunState *s,
+                                 size_t elem_size, int layer,
+                                 int seq_len, int kv_dim,
+                                 int start_pos, int n_rows) {
+    if (n_rows <= 0) return 0;
+    size_t row_elems = (size_t)kv_dim;
+    size_t layer_base = (size_t)layer * (size_t)seq_len * row_elems;
+    size_t row_base = layer_base + (size_t)start_pos * row_elems;
+    size_t bytes = (size_t)n_rows * row_elems * elem_size;
+    size_t offset = row_base * elem_size;
+    const char *key_src = (const char *)s->key_cache + offset;
+    const char *val_src = (const char *)s->value_cache + offset;
+    if (gpu->write_activation(gpu->ctx, BN_GPU_VALUE_KEY_CACHE,
+                              key_src, bytes, offset) != 0)
+        return -1;
+    if (gpu->write_activation(gpu->ctx, BN_GPU_VALUE_VALUE_CACHE,
+                              val_src, bytes, offset) != 0)
+        return -1;
+    return 0;
+}
+
+int bn_transformer_gpu_upload_kv_cache(BnModel *m, BnSession *sess,
+                                       int pos0, int n_tokens) {
     if (!m || !sess) return -1;
     BnGPUBackend *gpu = bn_model_gpu(m);
     if (!gpu || !gpu->write_activation) return -1;
     BnConfig *c = &m->config;
     BnRunState *s = &sess->state;
     if (!s->key_cache || !s->value_cache) return -1;
+    if (pos0 < 0 || n_tokens < 0) return -1;
+    if (n_tokens == 0) return 0;
 
     int n_attn = (c->full_attn_interval > 0)
         ? c->n_layers / c->full_attn_interval
         : c->n_layers;
     if (n_attn <= 0 || c->seq_len <= 0 || c->kv_dim <= 0) return -1;
     size_t elem_size = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
-    size_t kv_bytes = (size_t)n_attn * (size_t)c->seq_len *
-                      (size_t)c->kv_dim * elem_size;
-    if (gpu->write_activation(gpu->ctx, BN_GPU_VALUE_KEY_CACHE,
-                              s->key_cache, kv_bytes, 0) != 0)
-        return -1;
-    if (gpu->write_activation(gpu->ctx, BN_GPU_VALUE_VALUE_CACHE,
-                              s->value_cache, kv_bytes, 0) != 0)
-        return -1;
+    int first = pos0 % c->seq_len;
+    int rows_left = n_tokens > c->seq_len ? c->seq_len : n_tokens;
+    if (n_tokens > c->seq_len)
+        first = (pos0 + n_tokens - rows_left) % c->seq_len;
+
+    for (int layer = 0; layer < n_attn; layer++) {
+        int start = first;
+        int remaining = rows_left;
+        while (remaining > 0) {
+            int run = c->seq_len - start;
+            if (run > remaining) run = remaining;
+            if (gpu_upload_kv_segment(gpu, s, elem_size, layer, c->seq_len,
+                                      c->kv_dim, start, run) != 0)
+                return -1;
+            remaining -= run;
+            start = 0;
+        }
+    }
     return 0;
 }
 

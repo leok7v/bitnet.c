@@ -151,7 +151,7 @@ ifdef BN_ENABLE_CUDA
   CUDA_NVCCFLAGS := -arch=$(CUDA_ARCH)
   CUDA_SRCS := src/gpu_cuda.cu
   CUDA_OBJS := src/gpu_cuda.o
-  CUDA_LDFLAGS := -L$(dir $(NVCC))../lib64 -lcudart -lstdc++
+  CUDA_LDFLAGS := -L$(dir $(NVCC))../lib64 -lcudart -lcublas -lstdc++
   LINK := $(CC)
 else
   CUDA_CFLAGS :=

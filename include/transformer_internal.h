@@ -16,6 +16,7 @@ float *bn_transformer_gpu_forward_no_logits(BnModel *m,
                                             BnSession *sess,
                                             int token,
                                             int pos);
-int bn_transformer_gpu_upload_kv_cache(BnModel *m, BnSession *sess);
+int bn_transformer_gpu_upload_kv_cache(BnModel *m, BnSession *sess,
+                                       int pos0, int n_tokens);
 
 #endif // BN_TRANSFORMER_INTERNAL_H

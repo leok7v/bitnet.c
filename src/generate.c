@@ -322,7 +322,8 @@ float *bn_prefill(BnModel *model, BnSession *s, const int *tokens, int n_tokens,
         (!gpu_attached || use_gpu_batch_prefill(model))) {
         logits = bn_transformer_prefill(model, s, tokens, n_tokens, pos0);
         if (logits && gpu_attached &&
-            bn_transformer_gpu_upload_kv_cache(model, s) != 0)
+            bn_transformer_gpu_upload_kv_cache(model, s, pos0,
+                                               n_tokens) != 0)
             return NULL;
     } else {
         for (int i = 0; i < n_tokens; i++) {
@@ -345,7 +346,8 @@ int bn_prefill_no_logits(BnModel *model, BnSession *s, const int *tokens,
         int rc = bn_transformer_prefill_no_logits(model, s, tokens,
                                                   n_tokens, pos0);
         if (rc == 0 && gpu_attached)
-            rc = bn_transformer_gpu_upload_kv_cache(model, s);
+            rc = bn_transformer_gpu_upload_kv_cache(model, s, pos0,
+                                                    n_tokens);
         return rc;
     }
     for (int i = 0; i < n_tokens; i++) {
