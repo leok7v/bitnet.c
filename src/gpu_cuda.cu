@@ -379,6 +379,46 @@ static __global__ void quantize_q8_1_kernel(BnCudaBlockQ8_1 *out,
     }
 }
 
+static __device__ __forceinline__ int cuda_dot_i8x32_dp4a(const int8_t *a,
+                                                          const int8_t *b) {
+    int acc = 0;
+    for (int i = 0; i < 32; i += 4) {
+        int av;
+        int bv;
+        memcpy(&av, a + i, sizeof(av));
+        memcpy(&bv, b + i, sizeof(bv));
+        acc = cuda_dp4a_i32(av, bv, acc);
+    }
+    return acc;
+}
+
+static __global__ void q8_0_matvec_preq_warp8_kernel(
+    float *out,
+    const BnBlockQ8_0 *blocks,
+    const BnCudaBlockQ8_1 *xq,
+    int rows,
+    int cols,
+    size_t out_offset) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= rows) return;
+
+    int n_bpr = cols / 32;
+    const BnBlockQ8_0 *row_blocks = blocks + (size_t)row * n_bpr;
+    float sum = 0.0f;
+    for (int b = lane; b < n_bpr; b += 32) {
+        const BnBlockQ8_0 *blk = &row_blocks[b];
+        int dot = cuda_dot_i8x32_dp4a(blk->qs, xq[b].qs);
+        sum += cuda_fp16_to_fp32(blk->d) *
+               cuda_fp16_to_fp32(xq[b].d) * (float)dot;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        out[out_offset + (size_t)row] = sum;
+}
+
 static __device__ __forceinline__ float cuda_vec_dot_q4k_q8_1(
     const BnBlockQ4K *blk, const BnCudaBlockQ8_1 *xq, int iqs) {
     int v[2];
@@ -3658,6 +3698,21 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     q4_threads, 0,
                     out, (const BnBlockQ4K *)w->data, xq, bias,
                     op->rows, op->cols, out_offset);
+            } else if (getenv("BN_CUDA_ENABLE_Q8_PREQ") &&
+                       op->type == BN_GGUF_TENSOR_Q8_0 &&
+                       (op->cols & 31) == 0 && !bias) {
+                if (cuda_ensure_q8_1(ctx, op->cols) != 0) return -1;
+                BnCudaBlockQ8_1 *xq =
+                    (BnCudaBlockQ8_1 *)ctx->d_q8_1;
+                BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
+                    (op->cols + 31) / 32, 32, 0, xq, in, op->cols);
+                int q8_threads = 256;
+                int blocks = (op->rows + (q8_threads / 32) - 1) /
+                             (q8_threads / 32);
+                BN_CUDA_LAUNCH(ctx, q8_0_matvec_preq_warp8_kernel,
+                    blocks, q8_threads, 0,
+                    out, (const BnBlockQ8_0 *)w->data, xq, op->rows,
+                    op->cols, out_offset);
             } else if (!disable_q8_warp && op->type == BN_GGUF_TENSOR_Q8_0 &&
                        op->rows >= 16384 && (op->cols & 31) == 0 && !bias) {
                 int q8_threads = 256;
