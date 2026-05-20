@@ -4505,6 +4505,20 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
         q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
             ctx->d_out, (const BnBlockQ4K *)gate->data, xq,
             hidden_dim * 2, dim, n_tokens, 0);
+    } else if (stacked_gateup && gate_type == BN_GGUF_TENSOR_Q5_0 &&
+               (dim & 31) == 0) {
+        dim3 grid((((hidden_dim * 2) + 3) / 4 + warps - 1) / warps,
+                  n_tokens, 1);
+        q5_0_matmul4_warp_kernel<<<grid, threads, 0>>>(
+            ctx->d_out, (const BnBlockQ5_0 *)gate->data, ctx->d_x,
+            hidden_dim * 2, dim, n_tokens, 0);
+    } else if (stacked_gateup && gate_type == BN_GGUF_TENSOR_Q8_0 &&
+               (dim & 31) == 0) {
+        dim3 grid((((hidden_dim * 2) + 3) / 4 + warps - 1) / warps,
+                  n_tokens, 1);
+        q8_0_matmul4_warp_kernel<<<grid, threads, 0>>>(
+            ctx->d_out, (const BnBlockQ8_0 *)gate->data, ctx->d_x,
+            hidden_dim * 2, dim, n_tokens, 0);
     } else if (!stacked_gateup &&
         (gate->f16_data || gate->f32_data) &&
         (up->f16_data || up->f32_data) &&

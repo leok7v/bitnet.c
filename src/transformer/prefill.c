@@ -236,15 +236,15 @@ static int prefill_dense_ffn_gpu_batch(const BnModel *m,
         !lw->ffn.ffn_down.data)
         return -1;
 
-    void *gate_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_gate);
-    void *up_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_up);
-    if (!gate_buf || !up_buf) {
-        void *gateup_buf = bn_backend_model_handle(
-            backend, layer, BN_BACKEND_HANDLE_GATEUP_STACKED);
-        if (gateup_buf && lw->ffn.ffn_gate.type == lw->ffn.ffn_up.type) {
-            gate_buf = gateup_buf;
-            up_buf = NULL;
-        }
+    void *gateup_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_GATEUP_STACKED);
+    void *gate_buf = NULL;
+    void *up_buf = NULL;
+    if (gateup_buf && lw->ffn.ffn_gate.type == lw->ffn.ffn_up.type) {
+        gate_buf = gateup_buf;
+    } else {
+        gate_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_gate);
+        up_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_up);
     }
     void *down_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_down);
     if (!down_buf)
