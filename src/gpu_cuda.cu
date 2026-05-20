@@ -1274,6 +1274,35 @@ static __global__ void q6k_matvec_warp_kernel(float *out,
     }
 }
 
+static __global__ void q6k_matmul_warp_kernel(float *out,
+                                              const BnBlockQ6K *blocks,
+                                              const float *x,
+                                              int rows, int cols,
+                                              int n_tokens,
+                                              size_t out_offset) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int token = blockIdx.y;
+    if (row >= rows || token >= n_tokens) return;
+
+    int n_bpr = cols / BN_QK_K;
+    const float *x_token = x + (size_t)token * cols;
+    const BnBlockQ6K *row_blocks = blocks + (size_t)row * n_bpr;
+    float sum = 0.0f;
+    for (int b = 0; b < n_bpr; b++) {
+        const BnBlockQ6K *blk = &row_blocks[b];
+        for (int i = lane; i < BN_QK_K; i += 32)
+            sum += cuda_q6k_value(blk, i) *
+                   x_token[(size_t)b * BN_QK_K + i];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        out[out_offset + (size_t)token * rows + row] = sum;
+}
+
 static __global__ void matvec_split_kernel(float *out0, float *out1,
                                            float *out2, const void *wdata,
                                            const float *x,
@@ -3194,6 +3223,13 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
         dim3 grid(((dim + 3) / 4 + warps - 1) / warps, n_tokens, 1);
         q5_0_matmul4_warp_kernel<<<grid, threads, 0>>>(
             ctx->d_out, (const BnBlockQ5_0 *)down->data, ctx->d_x,
+            dim, hidden_dim, n_tokens, 0);
+    } else if (down_type == BN_GGUF_TENSOR_Q6_K &&
+               (hidden_dim % BN_QK_K) == 0 &&
+               getenv("BN_CUDA_ENABLE_Q6K_BATCH_WARP")) {
+        dim3 grid((dim + warps - 1) / warps, n_tokens, 1);
+        q6k_matmul_warp_kernel<<<grid, threads, 0>>>(
+            ctx->d_out, (const BnBlockQ6K *)down->data, ctx->d_x,
             dim, hidden_dim, n_tokens, 0);
     } else {
         dim3 grid(dim, n_tokens, 1);
