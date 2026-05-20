@@ -107,12 +107,21 @@ int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampl
     if (!logits) return -2;
     const char *top_env = getenv("BN_TOP_LOGITS");
     int top_logits = top_env ? atoi(top_env) : 0;
+    int have_gpu_next = 0;
+    int gpu_next = -1;
 
     for (int i = 0; i < max_tokens; i++) {
-        if (top_logits > 0)
+        if (!have_gpu_next && top_logits > 0)
             dump_top_logits(logits, model->config.vocab_size, top_logits,
                             "generate", i);
-        int next = bn_sampler_sample(sampler, logits);
+        int next;
+        if (have_gpu_next) {
+            next = gpu_next;
+            have_gpu_next = 0;
+            gpu_next = -1;
+        } else {
+            next = bn_sampler_sample(sampler, logits);
+        }
 
         if (next == tok->eot_id || next == tok->eos_id ||
             next == tok->im_end_id)
@@ -169,9 +178,24 @@ int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampl
         if (i + 1 == max_tokens)
             break;
 
-        logits = bn_transformer_forward(model, s, next, *pos);
-        (*pos)++;
-        if (!logits) return -2;
+        int can_gpu_greedy =
+            top_logits <= 0 && sampler->temperature == 0.0f &&
+            sampler->repeat_penalty >= 1.0f;
+        if (can_gpu_greedy &&
+            bn_transformer_gpu_forward_argmax(
+                model, s, next, *pos,
+                sampler->recent_tokens, sampler->recent_len,
+                sampler->repeat_penalty, &gpu_next) == 0) {
+            if (getenv("BN_GPU_DEBUG_ARGMAX"))
+                fprintf(stderr, "[bn:gpu:argmax] step=%d token=%d next=%d\n",
+                        i, next, gpu_next);
+            have_gpu_next = 1;
+            (*pos)++;
+        } else {
+            logits = bn_transformer_forward(model, s, next, *pos);
+            (*pos)++;
+            if (!logits) return -2;
+        }
     }
 
     return gen_count;

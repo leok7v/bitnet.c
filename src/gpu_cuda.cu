@@ -56,6 +56,10 @@ typedef struct {
     size_t d_q8_k_bytes;
     void *d_x_f16;
     size_t d_x_f16_bytes;
+    void *d_argmax;
+    size_t d_argmax_bytes;
+    int *d_penalty_tokens;
+    size_t d_penalty_tokens_bytes;
     float *act_bufs[BN_GPU_VALUE_COUNT];
     size_t act_sizes[BN_GPU_VALUE_COUNT];
 } BnCudaCtx;
@@ -80,6 +84,13 @@ typedef struct {
     int cols;
     int type;
 } BnCudaDeviceOp;
+
+typedef struct {
+    float value;
+    int index;
+} BnCudaArgmaxPair;
+
+static float *cuda_act(BnCudaCtx *ctx, int idx);
 
 static int cuda_ensure_graph_nodes(BnCudaCtx *ctx, int need) {
     if (!ctx || need <= ctx->exec_nodes_cap) return ctx ? 0 : -1;
@@ -2436,6 +2447,69 @@ static __global__ void activation_kernel(float *x, int n, int kind) {
     }
 }
 
+static __device__ BnCudaArgmaxPair argmax_better(BnCudaArgmaxPair a,
+                                                 BnCudaArgmaxPair b) {
+    if (b.value > a.value || (b.value == a.value && b.index < a.index))
+        return b;
+    return a;
+}
+
+static __global__ void argmax_penalty_stage1_kernel(
+        BnCudaArgmaxPair *partials, const float *x, int n,
+        const int *penalty_tokens, int n_penalty_tokens,
+        float repeat_penalty) {
+    extern __shared__ BnCudaArgmaxPair sdata[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    BnCudaArgmaxPair best;
+    best.value = -INFINITY;
+    best.index = 0;
+    if (idx < n) {
+        float v = x[idx];
+        if (repeat_penalty != 1.0f && penalty_tokens &&
+            n_penalty_tokens > 0) {
+            for (int i = 0; i < n_penalty_tokens; i++) {
+                if (penalty_tokens[i] == idx) {
+                    v = v > 0.0f ? v / repeat_penalty : v * repeat_penalty;
+                    break;
+                }
+            }
+        }
+        best.value = v;
+        best.index = idx;
+    }
+    sdata[tid] = best;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            sdata[tid] = argmax_better(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    if (tid == 0)
+        partials[blockIdx.x] = sdata[0];
+}
+
+static __global__ void argmax_stage2_kernel(int *out,
+                                            const BnCudaArgmaxPair *partials,
+                                            int n_partials) {
+    extern __shared__ BnCudaArgmaxPair sdata[];
+    int tid = threadIdx.x;
+    BnCudaArgmaxPair best;
+    best.value = -INFINITY;
+    best.index = 0;
+    for (int i = tid; i < n_partials; i += blockDim.x)
+        best = argmax_better(best, partials[i]);
+    sdata[tid] = best;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            sdata[tid] = argmax_better(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    if (tid == 0)
+        *out = sdata[0].index;
+}
+
 static __global__ void ssm_conv_silu_kernel(
     float *qkv, float *conv_state, const float *conv1d_w,
     int qkv_dim, int kern, size_t conv_off) {
@@ -3273,6 +3347,44 @@ static int cuda_ensure_x_f16(BnCudaCtx *ctx, size_t values) {
     return 0;
 }
 
+static int cuda_ensure_argmax(BnCudaCtx *ctx, int n, int n_penalty_tokens) {
+    if (!ctx || n <= 0) return -1;
+    if (cuda_ctx_set_device(ctx) != 0) return -1;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    size_t bytes = (size_t)blocks * sizeof(BnCudaArgmaxPair) + sizeof(int);
+    if (bytes > ctx->d_argmax_bytes) {
+        if (ctx->d_argmax) cudaFree(ctx->d_argmax);
+        ctx->d_argmax = NULL;
+        ctx->d_argmax_bytes = 0;
+        cudaError_t err = cudaMalloc(&ctx->d_argmax, bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] argmax scratch alloc failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        ctx->d_argmax_bytes = bytes;
+    }
+    if (n_penalty_tokens > 0) {
+        size_t penalty_bytes = (size_t)n_penalty_tokens * sizeof(int);
+        if (penalty_bytes > ctx->d_penalty_tokens_bytes) {
+            if (ctx->d_penalty_tokens) cudaFree(ctx->d_penalty_tokens);
+            ctx->d_penalty_tokens = NULL;
+            ctx->d_penalty_tokens_bytes = 0;
+            cudaError_t err = cudaMalloc(&ctx->d_penalty_tokens,
+                                         penalty_bytes);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "[bn:gpu:cuda] penalty token scratch alloc failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
+            ctx->d_penalty_tokens_bytes = penalty_bytes;
+        }
+    }
+    return 0;
+}
+
 static int cuda_ensure_host_out(BnCudaCtx *ctx, size_t bytes) {
     if (!ctx) return -1;
     if (bytes <= ctx->h_out_bytes) return 0;
@@ -3887,6 +3999,62 @@ static int cuda_matmul_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
         memcpy(ops[i].out, ctx->h_out + out_offset,
                values * sizeof(float));
         out_offset += values;
+    }
+    return 0;
+}
+
+static int cuda_argmax_activation(void *vctx, int buf_idx, int n,
+                                  const int *penalty_tokens,
+                                  int n_penalty_tokens,
+                                  float repeat_penalty, int *out_token) {
+    BnCudaCtx *ctx = (BnCudaCtx *)vctx;
+    if (!ctx || !out_token || buf_idx < 0 || buf_idx >= BN_GPU_VALUE_COUNT ||
+        n <= 0)
+        return -1;
+    float *x = cuda_act(ctx, buf_idx);
+    if (!x) return -1;
+    if (n_penalty_tokens < 0) n_penalty_tokens = 0;
+    if (repeat_penalty == 1.0f) n_penalty_tokens = 0;
+    if (n_penalty_tokens > 0 && !penalty_tokens) return -1;
+    if (cuda_ensure_argmax(ctx, n, n_penalty_tokens) != 0) return -1;
+    cudaStream_t stream = ctx->exec_stream ? ctx->exec_stream : ctx->stream;
+    if (n_penalty_tokens > 0) {
+        cudaError_t copy_err = cudaMemcpyAsync(
+            ctx->d_penalty_tokens, penalty_tokens,
+            (size_t)n_penalty_tokens * sizeof(int),
+            cudaMemcpyHostToDevice, stream);
+        if (copy_err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] penalty token copy failed: %s\n",
+                    cudaGetErrorString(copy_err));
+            return -1;
+        }
+    }
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    BnCudaArgmaxPair *partials = (BnCudaArgmaxPair *)ctx->d_argmax;
+    int *d_result = (int *)(partials + blocks);
+    argmax_penalty_stage1_kernel<<<blocks, threads,
+        (size_t)threads * sizeof(BnCudaArgmaxPair), stream>>>(
+        partials, x, n,
+        n_penalty_tokens > 0 ? ctx->d_penalty_tokens : NULL,
+        n_penalty_tokens, repeat_penalty);
+    argmax_stage2_kernel<<<1, threads,
+        (size_t)threads * sizeof(BnCudaArgmaxPair), stream>>>(
+        d_result, partials, blocks);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] argmax launch failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    err = cudaMemcpyAsync(out_token, d_result, sizeof(int),
+                          cudaMemcpyDeviceToHost, stream);
+    if (err == cudaSuccess)
+        err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] argmax readback failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
     }
     return 0;
 }
@@ -5852,6 +6020,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->free_activations = cuda_free_activations;
     gpu->write_activation = cuda_write_activation;
     gpu->read_activation = cuda_read_activation;
+    gpu->argmax_activation = cuda_argmax_activation;
     gpu->execute = cuda_execute;
     gpu->ctx = ctx;
     gpu->kind = BN_GPU_BACKEND_CUDA;
@@ -5884,6 +6053,8 @@ void bn_gpu_cuda_destroy(BnGPUBackend *gpu) {
         if (ctx->d_q8_1) cudaFree(ctx->d_q8_1);
         if (ctx->d_q8_k) cudaFree(ctx->d_q8_k);
         if (ctx->d_x_f16) cudaFree(ctx->d_x_f16);
+        if (ctx->d_argmax) cudaFree(ctx->d_argmax);
+        if (ctx->d_penalty_tokens) cudaFree(ctx->d_penalty_tokens);
         if (ctx->exec_graph) cudaGraphExecDestroy(ctx->exec_graph);
         if (ctx->exec_graph_def) cudaGraphDestroy(ctx->exec_graph_def);
         free(ctx->exec_nodes);

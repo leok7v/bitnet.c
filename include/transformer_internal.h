@@ -16,6 +16,14 @@ float *bn_transformer_gpu_forward_no_logits(BnModel *m,
                                             BnSession *sess,
                                             int token,
                                             int pos);
+int bn_transformer_gpu_forward_argmax(BnModel *m,
+                                      BnSession *sess,
+                                      int token,
+                                      int pos,
+                                      const int *penalty_tokens,
+                                      int n_penalty_tokens,
+                                      float repeat_penalty,
+                                      int *out_token);
 int bn_transformer_gpu_upload_kv_cache(BnModel *m, BnSession *sess,
                                        int pos0, int n_tokens);
 

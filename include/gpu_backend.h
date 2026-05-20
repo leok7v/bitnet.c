@@ -133,6 +133,12 @@ struct BnGPUBackend {
     int (*read_activation)(void *ctx, int buf_idx, void *out,
                            size_t size, size_t offset);
 
+    // Return argmax over a GPU-resident float buffer, optionally applying the
+    // same repeat penalty used by greedy CPU sampling. Optional.
+    int (*argmax_activation)(void *ctx, int buf_idx, int n,
+                             const int *penalty_tokens, int n_penalty_tokens,
+                             float repeat_penalty, int *out_token);
+
     void *ctx;  // opaque backend context
 
     // Capability flags (set by backend, checked by transformer)

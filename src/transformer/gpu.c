@@ -294,7 +294,11 @@ static int gpu_dense_ffn_resources_missing(
 // Returns s->logits on success, NULL to fall back to CPU.
 static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                                               int token, int pos,
-                                              int need_logits) {
+                                              int need_logits,
+                                              int *argmax_token,
+                                              const int *penalty_tokens,
+                                              int n_penalty_tokens,
+                                              float repeat_penalty) {
     /* no-op */
     BnConfig *c = &m->config;
     BnWeights *w = &m->weights;
@@ -303,6 +307,9 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
     const BnBackendModel *backend = bn_model_backend(m);
     BnTransformerGPUEmitContext emit;
     bn_transformer_gpu_emit_context_init(&emit, NULL, 0);
+    int emit_logits = need_logits || argmax_token != NULL;
+    if (argmax_token && (!gpu || !gpu->argmax_activation))
+        return NULL;
 
     BnTransformerGPUForwardPolicy policy;
     const char *reject_reason = NULL;
@@ -483,7 +490,7 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         return bn_transformer_gpu_reject_forward(
             &emit, "gpu graph allocation failed");
     int cacheable_decode =
-        (!need_logits ||
+        (!emit_logits || argmax_token ||
          (getenv("BN_CUDA_ENABLE_LOGITS_CACHE") &&
           !bn_transformer_gpu_logits_needs_cpu_fallback(gpu, logit_res))) &&
         gpu->kind == BN_GPU_BACKEND_CUDA && !policy.has_moe &&
@@ -500,6 +507,11 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
     int cached_n = cacheable_decode
         ? bn_backend_session_gpu_cached_op_count(sess->backend)
         : 0;
+    if (argmax_token && cached_n > 0 &&
+        !bn_backend_session_gpu_cached_has_logits(sess->backend)) {
+        bn_backend_session_clear_gpu_cached_ops(sess->backend);
+        cached_n = 0;
+    }
     if (cached_n > 0 && cached_n <= command_cap) {
         if (gpu_patch_cached_decode_ops((BnGPUOp *)command_buffer, cached_n,
                                         c, pos) == 0 &&
@@ -508,6 +520,15 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 need_logits ? BN_GPU_VALUE_LOGITS : -1,
                 need_logits ? s->logits : NULL,
                 need_logits ? c->vocab_size : 0) == 0) {
+            if (argmax_token &&
+                gpu->argmax_activation(
+                    gpu->ctx, BN_GPU_VALUE_LOGITS, c->vocab_size,
+                    penalty_tokens, n_penalty_tokens, repeat_penalty,
+                    argmax_token) != 0) {
+                bn_backend_session_clear_gpu_cached_ops(sess->backend);
+                bn_transformer_gpu_emit_context_free(&emit);
+                return NULL;
+            }
             bn_transformer_gpu_emit_context_free(&emit);
             return need_logits ? s->logits : s->x;
         }
@@ -635,7 +656,7 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 &emit, c, lw, &plan, &qkv_res, pos, q_dim,
                 head_size, n_heads, kv_dim, rope_dims, kv_cache_off, u_eps,
                 use_q4_q8_attn);
-            if (!need_logits && l + 1 == c->n_layers) {
+            if (!emit_logits && l + 1 == c->n_layers) {
                 continue;
             }
             if (compare_qkv_layer == l &&
@@ -777,9 +798,12 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
     }
 
     // ---- Logits matvec: xb -> logits (xb is already normalized) ----
-    if (need_logits) {
+    if (emit_logits) {
         if (getenv("BN_GPU_CPU_LOGITS") ||
             bn_transformer_gpu_logits_needs_cpu_fallback(gpu, logit_res)) {
+            if (argmax_token)
+                return bn_transformer_gpu_reject_forward(
+                    &emit, "gpu argmax requires gpu logits");
             if (bn_transformer_gpu_fallback_logits(
                     &emit, gpu, m, sess, logit_res, dim) != 0)
                 return bn_transformer_gpu_reject_forward(
@@ -812,7 +836,52 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         return bn_transformer_gpu_reject_forward(
             &emit, "gpu final execute failed");
     if (cacheable_decode && final_n > 0)
-        bn_backend_session_set_gpu_cached_op_count(sess->backend, final_n);
+        bn_backend_session_set_gpu_cached_op_count(sess->backend, final_n,
+                                                   emit_logits);
+    if (argmax_token) {
+        if (gpu->argmax_activation(
+                gpu->ctx, BN_GPU_VALUE_LOGITS, c->vocab_size,
+                penalty_tokens, n_penalty_tokens, repeat_penalty,
+                argmax_token) != 0)
+            return bn_transformer_gpu_reject_forward(
+                &emit, "gpu argmax failed");
+        if (getenv("BN_GPU_DEBUG_ARGMAX_COMPARE") &&
+            gpu->read_activation && c->vocab_size > 0) {
+            float *dbg_logits =
+                (float *)malloc((size_t)c->vocab_size * sizeof(float));
+            if (dbg_logits &&
+                gpu->read_activation(gpu->ctx, BN_GPU_VALUE_LOGITS,
+                                     dbg_logits,
+                                     (size_t)c->vocab_size * sizeof(float),
+                                     0) == 0) {
+                int cpu_argmax = 0;
+                float cpu_best = -INFINITY;
+                for (int i = 0; i < c->vocab_size; i++) {
+                    float v = dbg_logits[i];
+                    if (repeat_penalty != 1.0f && penalty_tokens &&
+                        n_penalty_tokens > 0) {
+                        for (int j = 0; j < n_penalty_tokens; j++) {
+                            if (penalty_tokens[j] == i) {
+                                v = v > 0.0f ? v / repeat_penalty
+                                             : v * repeat_penalty;
+                                break;
+                            }
+                        }
+                    }
+                    if (v > cpu_best) {
+                        cpu_best = v;
+                        cpu_argmax = i;
+                    }
+                }
+                fprintf(stderr,
+                        "[bn:gpu:argmax:cmp] cuda=%d cpu=%d cpu_logit=%.6g\n",
+                        *argmax_token, cpu_argmax, cpu_best);
+            }
+            free(dbg_logits);
+        }
+        bn_transformer_gpu_emit_context_free(&emit);
+        return s->x;
+    }
     if (!need_logits) {
         bn_transformer_gpu_emit_context_free(&emit);
         return s->x;
@@ -882,10 +951,25 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
 
 float *bn_transformer_gpu_forward(BnModel *m, BnSession *sess,
                                   int token, int pos) {
-    return bn_transformer_gpu_forward_impl(m, sess, token, pos, 1);
+    return bn_transformer_gpu_forward_impl(m, sess, token, pos, 1,
+                                           NULL, NULL, 0, 1.0f);
 }
 
 float *bn_transformer_gpu_forward_no_logits(BnModel *m, BnSession *sess,
                                             int token, int pos) {
-    return bn_transformer_gpu_forward_impl(m, sess, token, pos, 0);
+    return bn_transformer_gpu_forward_impl(m, sess, token, pos, 0,
+                                           NULL, NULL, 0, 1.0f);
+}
+
+int bn_transformer_gpu_forward_argmax(BnModel *m, BnSession *sess,
+                                      int token, int pos,
+                                      const int *penalty_tokens,
+                                      int n_penalty_tokens,
+                                      float repeat_penalty,
+                                      int *out_token) {
+    if (!out_token) return -1;
+    float *state = bn_transformer_gpu_forward_impl(
+        m, sess, token, pos, 0, out_token, penalty_tokens,
+        n_penalty_tokens, repeat_penalty);
+    return state ? 0 : -1;
 }
