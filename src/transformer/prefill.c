@@ -54,6 +54,13 @@ static inline void *prefill_qweight_backend_buf(const BnBackendModel *backend,
     return bn_backend_model_qweight_buf(backend, w);
 }
 
+static inline void *prefill_backend_role_or_qweight(
+        const BnBackendModel *backend, int layer, BnBackendHandleRole role,
+        const BnQWeight *w) {
+    void *buf = backend ? bn_backend_model_handle(backend, layer, role) : NULL;
+    return buf ? buf : prefill_qweight_backend_buf(backend, w);
+}
+
 static void prefill_quant_matmul_gpu(const BnModel *m,
                                      float *out,
                                      const BnQWeight *W,
@@ -791,8 +798,9 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                     n_tokens >= prefill_gpu_attention_min_tokens() &&
                     prefill_prepare_q_for_gpu_attention(&bctx) == 0) {
                     const BnBackendModel *backend = bn_model_backend(m);
-                    void *wo_buf = backend ? bn_backend_model_handle(
-                        backend, l, BN_BACKEND_HANDLE_WO_PREFILL) : NULL;
+                    void *wo_buf = prefill_backend_role_or_qweight(
+                        backend, l, BN_BACKEND_HANDLE_WO_PREFILL,
+                        &lw->attn.wo);
                     if (gpu->prefill_attention_wo && wo_buf &&
                         c->dim < 2048 &&
                         !lw->norm.attn_sub_norm &&
@@ -910,8 +918,9 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                         lw->norm.attn_sub_norm, wo_cols, c->norm_eps);
                 if (!used_fused_attn_wo) {
                     const BnBackendModel *backend = bn_model_backend(m);
-                    void *wo_buf = backend ? bn_backend_model_handle(
-                        backend, l, BN_BACKEND_HANDLE_WO_PREFILL) : NULL;
+                    void *wo_buf = prefill_backend_role_or_qweight(
+                        backend, l, BN_BACKEND_HANDLE_WO_PREFILL,
+                        &lw->attn.wo);
                     if (prefill_quant_matmul_gpu_buf(
                             m, Xb2, &lw->attn.wo, wo_buf, Q_buf,
                             n_tokens) != 0)
