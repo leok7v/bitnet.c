@@ -73,6 +73,19 @@ static void prefill_quant_matmul_gpu(const BnModel *m,
                                     bn_model_gpu(m));
 }
 
+static int prefill_quant_matmul_gpu_buf(const BnModel *m,
+                                        float *out,
+                                        const BnQWeight *W,
+                                        void *buf,
+                                        const float *X,
+                                        int n_tokens) {
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    if (!gpu || !gpu->matmul || !out || !W || !buf || !X)
+        return -1;
+    return gpu->matmul(gpu->ctx, out, buf, X, W->rows, W->cols,
+                       n_tokens, W->type);
+}
+
 static void prefill_quant_matmul_multi(const BnModel *m,
                                        float **out,
                                        const BnQWeight **W,
@@ -115,6 +128,41 @@ static void prefill_quant_matmul_multi(const BnModel *m,
         prefill_quant_matmul_gpu(m, out[i], W[i], X, n_tokens, x_q_buf);
 }
 
+static int prefill_qk_stacked_gpu(const BnModel *m,
+                                  const BnLayerWeights *lw,
+                                  float *q_tmp,
+                                  float *k_out,
+                                  const float *X,
+                                  int n_tokens,
+                                  int q_stride,
+                                  int dim,
+                                  int layer) {
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    const BnBackendModel *backend = bn_model_backend(m);
+    if (!gpu || !gpu->matmul || !backend || !lw || !q_tmp || !k_out || !X)
+        return -1;
+    if (lw->attn.wq.type != lw->attn.wk.type ||
+        lw->attn.wq.cols != dim || lw->attn.wk.cols != dim ||
+        q_stride < lw->attn.wq.rows + lw->attn.wk.rows)
+        return -1;
+    void *qk_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_QK_STACKED);
+    if (!qk_buf) return -1;
+    int rows = lw->attn.wq.rows + lw->attn.wk.rows;
+    if (gpu->matmul(gpu->ctx, q_tmp, qk_buf, X, rows, dim, n_tokens,
+                    lw->attn.wq.type) != 0)
+        return -1;
+    for (int t = n_tokens - 1; t >= 0; t--) {
+        float *src = q_tmp + (size_t)t * rows;
+        memcpy(k_out + (size_t)t * lw->attn.wk.rows,
+               src + lw->attn.wq.rows,
+               (size_t)lw->attn.wk.rows * sizeof(float));
+        memmove(q_tmp + (size_t)t * q_stride, src,
+                (size_t)lw->attn.wq.rows * sizeof(float));
+    }
+    return 0;
+}
+
 static int prefill_dense_ffn_gpu_batch(const BnModel *m,
                                        float *out,
                                        const BnLayerWeights *lw,
@@ -122,7 +170,8 @@ static int prefill_dense_ffn_gpu_batch(const BnModel *m,
                                        int n_tokens,
                                        int dim,
                                        int hidden_dim,
-                                       int act_type) {
+                                       int act_type,
+                                       int layer) {
     BnGPUBackend *gpu = bn_model_gpu(m);
     const BnBackendModel *backend = bn_model_backend(m);
     if (!gpu || !gpu->dense_ffn_batch || !backend ||
@@ -132,8 +181,19 @@ static int prefill_dense_ffn_gpu_batch(const BnModel *m,
 
     void *gate_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_gate);
     void *up_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_up);
+    if (!gate_buf || !up_buf) {
+        void *gateup_buf = bn_backend_model_handle(
+            backend, layer, BN_BACKEND_HANDLE_GATEUP_STACKED);
+        if (gateup_buf && lw->ffn.ffn_gate.type == lw->ffn.ffn_up.type) {
+            gate_buf = gateup_buf;
+            up_buf = NULL;
+        }
+    }
     void *down_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_down);
-    if (!gate_buf || !up_buf || !down_buf)
+    if (!down_buf)
+        down_buf = bn_backend_model_handle(
+            backend, layer, BN_BACKEND_HANDLE_FFN_DOWN_PREFILL);
+    if (!gate_buf || !down_buf)
         return -1;
 
     return gpu->dense_ffn_batch(
@@ -526,13 +586,26 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             } else
 #endif
             {
-                float *qkv_out[3] = { Q_buf, K_new, V_new };
-                const BnQWeight *qkv_w[3] = {
-                    &lw->attn.wq, &lw->attn.wk, &lw->attn.wv
-                };
                 t_prof = prefill_profile_now(&prof);
-                prefill_quant_matmul_multi(m, qkv_out, qkv_w, 3, Xb,
-                                           n_tokens, s->x_q);
+                if (prefill_qk_stacked_gpu(m, lw, Q_buf, K_new, Xb,
+                                           n_tokens, q_buf_stride, dim,
+                                           l) == 0) {
+                    const BnBackendModel *backend = bn_model_backend(m);
+                    void *wv_buf = backend ? bn_backend_model_handle(
+                        backend, l, BN_BACKEND_HANDLE_WV_PREFILL) : NULL;
+                    if (prefill_quant_matmul_gpu_buf(
+                            m, V_new, &lw->attn.wv, wv_buf, Xb,
+                            n_tokens) != 0)
+                        prefill_quant_matmul_gpu(m, V_new, &lw->attn.wv,
+                                                 Xb, n_tokens, s->x_q);
+                } else {
+                    float *qkv_out[3] = { Q_buf, K_new, V_new };
+                    const BnQWeight *qkv_w[3] = {
+                        &lw->attn.wq, &lw->attn.wk, &lw->attn.wv
+                    };
+                    prefill_quant_matmul_multi(m, qkv_out, qkv_w, 3, Xb,
+                                               n_tokens, s->x_q);
+                }
                 prefill_profile_add(&prof.qkv_ms, t_prof);
             }
 
@@ -690,7 +763,16 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                         prefill_rmsnorm(Q_buf + (size_t)t * wo_cols,
                                         Q_buf + (size_t)t * wo_cols,
                                         lw->norm.attn_sub_norm, wo_cols, c->norm_eps);
-                prefill_quant_matmul_gpu(m, Xb2, &lw->attn.wo, Q_buf, n_tokens, s->x_q);
+                {
+                    const BnBackendModel *backend = bn_model_backend(m);
+                    void *wo_buf = backend ? bn_backend_model_handle(
+                        backend, l, BN_BACKEND_HANDLE_WO_PREFILL) : NULL;
+                    if (prefill_quant_matmul_gpu_buf(
+                            m, Xb2, &lw->attn.wo, wo_buf, Q_buf,
+                            n_tokens) != 0)
+                        prefill_quant_matmul_gpu(m, Xb2, &lw->attn.wo,
+                                                 Q_buf, n_tokens, s->x_q);
+                }
                 if ((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) && lw->norm.attn_post_norm)
                     for (int t = 0; t < n_tokens; t++)
                         prefill_rmsnorm(Xb2 + (size_t)t * dim,
@@ -807,7 +889,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                   lw->norm.ffn_post_norm) &&
                 prefill_dense_ffn_gpu_batch(m, Xb, lw, Xb, n_tokens,
                                             dim, hidden_dim,
-                                            c->act_type) == 0) {
+                                            c->act_type, l) == 0) {
                 used_gpu_batch_ffn = 1;
             } else if (c->has_ffn_gate) {
 #ifdef __AVX2__

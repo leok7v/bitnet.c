@@ -60,16 +60,33 @@ static int upload_qweight_owned(BnModel *model, BnBackendModel *backend,
     return 0;
 }
 
-static void *upload_f32_buf(BnGPUBackend *gpu, const float *data, int n_elems) {
-    if (!data || n_elems <= 0) return NULL;
-    return gpu->buffer_create(gpu->ctx, data, (size_t)n_elems * sizeof(float),
-                              -1, n_elems, 1);
-}
-
 static int register_gpu_handle(BnModel *model, int layer,
                                BnBackendHandleRole role, void *handle) {
     if (!handle) return 0;
     return bn_backend_model_register_handle(bn_model_backend(model), layer, role, handle);
+}
+
+static int register_prefill_qweight_handle(BnModel *model,
+                                           BnGPUBackend *gpu,
+                                           int layer,
+                                           BnBackendHandleRole role,
+                                           BnQWeight *w) {
+    if (!should_skip_cuda_small_kquant(model, gpu, w))
+        return 0;
+    void *handle = upload_qweight(gpu, w);
+    if (!w->data) return 0;
+    if (!handle) return -1;
+    if (register_gpu_handle(model, layer, role, handle) != 0) {
+        gpu->buffer_destroy(gpu->ctx, handle);
+        return -1;
+    }
+    return 0;
+}
+
+static void *upload_f32_buf(BnGPUBackend *gpu, const float *data, int n_elems) {
+    if (!data || n_elems <= 0) return NULL;
+    return gpu->buffer_create(gpu->ctx, data, (size_t)n_elems * sizeof(float),
+                              -1, n_elems, 1);
 }
 
 int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
@@ -212,6 +229,19 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
         if (register_gpu_handle(model, l, BN_BACKEND_HANDLE_GATEUP_STACKED,
                                 gateup_stacked_gpu) != 0) {
             if (gateup_stacked_gpu) gpu->buffer_destroy(gpu->ctx, gateup_stacked_gpu);
+            bn_model_release_gpu(model);
+            return -1;
+        }
+
+        if (register_prefill_qweight_handle(
+                model, gpu, l, BN_BACKEND_HANDLE_WV_PREFILL,
+                &lw->attn.wv) != 0 ||
+            register_prefill_qweight_handle(
+                model, gpu, l, BN_BACKEND_HANDLE_WO_PREFILL,
+                &lw->attn.wo) != 0 ||
+            register_prefill_qweight_handle(
+                model, gpu, l, BN_BACKEND_HANDLE_FFN_DOWN_PREFILL,
+                &lw->ffn.ffn_down) != 0) {
             bn_model_release_gpu(model);
             return -1;
         }

@@ -231,6 +231,7 @@ static __device__ uint16_t cuda_fp32_to_fp16_bits(float f) {
     return __half_as_ushort(__float2half_rn(f));
 }
 
+static __device__ float cuda_q4k_value(const BnBlockQ4K *blk, int i);
 static __device__ float cuda_q6k_value(const BnBlockQ6K *blk, int i);
 
 static __global__ void f32_to_f16_kernel(__half *out, const float *in,
@@ -271,6 +272,20 @@ static __global__ void dequant_q5_0_to_f16_kernel(
         ? (int)((qs & 15) | (((qh >> j) & 1u) << 4)) - 16
         : (int)((qs >> 4) | (((qh >> j) & 1u) << 4)) - 16;
     float v = cuda_fp16_to_fp32(blk->d) * (float)q;
+    out[i] = __float2half_rn(v);
+}
+
+static __global__ void dequant_q4k_to_f16_kernel(
+    __half *out, const BnBlockQ4K *blocks, int rows, int cols) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * (size_t)cols;
+    if (i >= n) return;
+    int row = (int)(i / (size_t)cols);
+    int col = (int)(i - (size_t)row * (size_t)cols);
+    int n_bpr = cols / BN_QK_K;
+    const BnBlockQ4K *blk = &blocks[(size_t)row * n_bpr +
+                                    col / BN_QK_K];
+    float v = cuda_q4k_value(blk, col & (BN_QK_K - 1));
     out[i] = __float2half_rn(v);
 }
 
@@ -2472,6 +2487,25 @@ static __global__ void ffn_activation_batch_kernel(float *out,
     }
 }
 
+static __global__ void ffn_activation_batch_stacked_kernel(
+    float *out, const float *gate_up, int hidden_dim, int n_tokens,
+    int act_type) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_dim * n_tokens;
+    if (i >= total) return;
+    int token = i / hidden_dim;
+    int h = i - token * hidden_dim;
+    size_t src = (size_t)token * (size_t)hidden_dim * 2u + (size_t)h;
+    float gate = gate_up[src];
+    float up = gate_up[src + (size_t)hidden_dim];
+    if (act_type == 0) {
+        float silu = gate / (1.0f + __expf(-gate));
+        out[(size_t)token * hidden_dim + h] = silu * up;
+    } else {
+        out[(size_t)token * hidden_dim + h] = gate * up;
+    }
+}
+
 static int cuda_type_supported(int type) {
     static int init = 0;
     static int disable_matvec = 0;
@@ -2790,6 +2824,7 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
         return 0;
     if (buf->type != BN_GGUF_TENSOR_Q8_0 &&
         buf->type != BN_GGUF_TENSOR_Q5_0 &&
+        buf->type != BN_GGUF_TENSOR_Q4_K &&
         buf->type != BN_GGUF_TENSOR_Q6_K)
         return 0;
     if (getenv("BN_CUDA_DISABLE_CUBLAS_MATMUL"))
@@ -2807,6 +2842,11 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
         : &buf->f16_data;
     cudaError_t err = cudaMalloc(cache_ptr, bytes);
     if (err != cudaSuccess) {
+        if (getenv("BN_CUDA_DEBUG_CUBLAS_CACHE"))
+            fprintf(stderr,
+                    "[bn:gpu:cuda] cublas cache alloc skipped type=%d rows=%d cols=%d bytes=%zu: %s\n",
+                    buf->type, buf->rows, buf->cols, bytes,
+                    cudaGetErrorString(err));
         *cache_ptr = NULL;
         return 0;
     }
@@ -2820,6 +2860,10 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
         dequant_q5_0_to_f16_kernel<<<blocks, threads>>>(
             (__half *)buf->f16_data, (const BnBlockQ5_0 *)buf->data,
             buf->rows, buf->cols);
+    } else if (buf->type == BN_GGUF_TENSOR_Q4_K) {
+        dequant_q4k_to_f16_kernel<<<blocks, threads>>>(
+            (__half *)buf->f16_data, (const BnBlockQ4K *)buf->data,
+            buf->rows, buf->cols);
     } else {
         dequant_q6k_to_f32_kernel<<<blocks, threads>>>(
             (float *)buf->f32_data, (const BnBlockQ6K *)buf->data,
@@ -2827,10 +2871,20 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
     }
     err = cudaGetLastError();
     if (err != cudaSuccess) {
+        if (getenv("BN_CUDA_DEBUG_CUBLAS_CACHE"))
+            fprintf(stderr,
+                    "[bn:gpu:cuda] cublas cache dequant skipped type=%d rows=%d cols=%d: %s\n",
+                    buf->type, buf->rows, buf->cols,
+                    cudaGetErrorString(err));
         cudaFree(*cache_ptr);
         *cache_ptr = NULL;
         return 0;
     }
+    if (getenv("BN_CUDA_DEBUG_CUBLAS_CACHE"))
+        fprintf(stderr,
+                "[bn:gpu:cuda] cublas cache ready type=%d rows=%d cols=%d bytes=%zu precision=%s\n",
+                buf->type, buf->rows, buf->cols, bytes,
+                buf->type == BN_GGUF_TENSOR_Q6_K ? "f32" : "f16");
     if (buf->type == BN_GGUF_TENSOR_Q6_K)
         buf->f32_size = bytes;
     else
@@ -3362,17 +3416,24 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
     BnCudaBuffer *gate = (BnCudaBuffer *)gate_buf;
     BnCudaBuffer *up = (BnCudaBuffer *)up_buf;
     BnCudaBuffer *down = (BnCudaBuffer *)down_buf;
+    int stacked_gateup = up == NULL;
     if (getenv("BN_CUDA_DISABLE_DENSE_FFN_BATCH"))
         return -1;
-    if (!ctx || !out || !gate || !up || !down || !X ||
-        !gate->data || !up->data || !down->data ||
+    if (!ctx || !out || !gate || !down || !X ||
+        !gate->data || !down->data ||
         n_tokens <= 1 || dim <= 0 || hidden_dim <= 0 || act_type != 0)
         return -1;
-    if (gate->rows != hidden_dim || up->rows != hidden_dim ||
-        gate->cols != dim || up->cols != dim ||
+    if ((!stacked_gateup &&
+         (up == NULL || !up->data || up->rows != hidden_dim ||
+          up->cols != dim || gate->rows != hidden_dim)) ||
+        (stacked_gateup &&
+         (gate->rows != hidden_dim * 2 || gate->cols != dim ||
+          gate_type != up_type)) ||
+        gate->cols != dim ||
         down->rows != dim || down->cols != hidden_dim)
         return -1;
-    if (!cuda_type_supported(gate_type) || !cuda_type_supported(up_type) ||
+    if (!cuda_type_supported(gate_type) ||
+        (!stacked_gateup && !cuda_type_supported(up_type)) ||
         !cuda_type_supported(down_type))
         return -1;
 
@@ -3394,7 +3455,12 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
 
     int threads = 256;
     int warps = threads / 32;
-    if ((gate->f16_data || gate->f32_data) &&
+    if (stacked_gateup && (gate->f16_data || gate->f32_data) &&
+        cuda_cublas_matmul_f16(ctx, ctx->d_out, gate, ctx->d_x,
+                               hidden_dim * 2, dim, n_tokens) == 0) {
+        err = cudaSuccess;
+    } else if (!stacked_gateup &&
+        (gate->f16_data || gate->f32_data) &&
         (up->f16_data || up->f32_data) &&
         cuda_cublas_matmul_f16(ctx, ctx->d_out, gate, ctx->d_x,
                                hidden_dim, dim, n_tokens) == 0 &&
@@ -3402,7 +3468,7 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
                                up, ctx->d_x, hidden_dim, dim,
                                n_tokens) == 0) {
         err = cudaSuccess;
-    } else if (gate_type == BN_GGUF_TENSOR_Q5_0 &&
+    } else if (!stacked_gateup && gate_type == BN_GGUF_TENSOR_Q5_0 &&
         up_type == BN_GGUF_TENSOR_Q5_0 &&
         (dim & 31) == 0) {
         dim3 grid(((hidden_dim + 3) / 4 + warps - 1) / warps,
@@ -3413,7 +3479,7 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
         q5_0_matmul4_warp_kernel<<<grid, threads, 0>>>(
             ctx->d_out, (const BnBlockQ5_0 *)up->data, ctx->d_x,
             hidden_dim, dim, n_tokens, (size_t)n_tokens * hidden_dim);
-    } else if (gate_type == BN_GGUF_TENSOR_Q8_0 &&
+    } else if (!stacked_gateup && gate_type == BN_GGUF_TENSOR_Q8_0 &&
                up_type == BN_GGUF_TENSOR_Q8_0 && (dim & 31) == 0) {
         dim3 grid(((hidden_dim + 3) / 4 + warps - 1) / warps,
                   n_tokens, 1);
@@ -3424,6 +3490,8 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
             ctx->d_out, (const BnBlockQ8_0 *)up->data, ctx->d_x,
             hidden_dim, dim, n_tokens, (size_t)n_tokens * hidden_dim);
     } else {
+        if (stacked_gateup)
+            return -1;
         dim3 grid(hidden_dim, n_tokens, 1);
         matvec_kernel<<<grid, threads, (size_t)threads * sizeof(float)>>>(
             ctx->d_out, gate->data, ctx->d_x, NULL, hidden_dim, dim,
@@ -3442,8 +3510,13 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
 
     int act_total = n_tokens * hidden_dim;
     int act_blocks = (act_total + threads - 1) / threads;
-    ffn_activation_batch_kernel<<<act_blocks, threads>>>(
-        ctx->d_x, ctx->d_out, hidden_dim, n_tokens, act_type);
+    if (stacked_gateup) {
+        ffn_activation_batch_stacked_kernel<<<act_blocks, threads>>>(
+            ctx->d_x, ctx->d_out, hidden_dim, n_tokens, act_type);
+    } else {
+        ffn_activation_batch_kernel<<<act_blocks, threads>>>(
+            ctx->d_x, ctx->d_out, hidden_dim, n_tokens, act_type);
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] dense ffn batch activation failed: %s\n",

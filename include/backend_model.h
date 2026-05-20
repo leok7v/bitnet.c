@@ -31,6 +31,9 @@ typedef enum {
     BN_BACKEND_HANDLE_SSM_A_LOG = 18,
     BN_BACKEND_HANDLE_SSM_NORM = 19,
     BN_BACKEND_HANDLE_QK_STACKED = 20,
+    BN_BACKEND_HANDLE_WV_PREFILL = 21,
+    BN_BACKEND_HANDLE_WO_PREFILL = 22,
+    BN_BACKEND_HANDLE_FFN_DOWN_PREFILL = 23,
 } BnBackendHandleRole;
 
 BnBackendModel *bn_backend_model_create(void);
