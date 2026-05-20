@@ -96,9 +96,16 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
     BnConfig *c = &model->config;
     int n_layers = c->n_layers;
 
-    if (upload_qweight_owned(model, backend, gpu, &w->output_weight) != 0) {
-        bn_model_release_gpu(model);
-        return -1;
+    if (w->output_weight.data) {
+        void *output_weight_gpu = upload_qweight(gpu, &w->output_weight);
+        if (!output_weight_gpu ||
+            bn_backend_model_register_qweight(backend, &w->output_weight,
+                                              output_weight_gpu) != 0) {
+            if (output_weight_gpu)
+                gpu->buffer_destroy(gpu->ctx, output_weight_gpu);
+            bn_model_release_gpu(model);
+            return -1;
+        }
     }
 
     if (!w->output_weight.data && w->token_embedding) {
