@@ -855,6 +855,37 @@ static __global__ void q4k_dot_fused_gateup_silu_kernel(
         out[row] = (gate / (1.0f + __expf(-gate))) * up;
 }
 
+static __global__ void q5k_dot_fused_gateup_silu_kernel(
+    float *out, const BnBlockQ5K *blocks, const BnCudaBlockQ8_1 *xq,
+    int gate_rows, int up_rows, int cols) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    if (row >= gate_rows || row >= up_rows) return;
+
+    int n_bpr = cols / BN_QK_K;
+    int kbx = lane / 16;
+    int iqs = 2 * (lane & 15);
+    float gate = 0.0f;
+    float up = 0.0f;
+    const BnBlockQ5K *gate_blocks = blocks + (size_t)row * n_bpr;
+    const BnBlockQ5K *up_blocks =
+        blocks + (size_t)(gate_rows + row) * n_bpr;
+    for (int b = kbx; b < n_bpr; b += 2) {
+        const BnCudaBlockQ8_1 *xqb = xq + (size_t)b * 8;
+        gate += cuda_vec_dot_q5k_q8_1(&gate_blocks[b], xqb, iqs);
+        up += cuda_vec_dot_q5k_q8_1(&up_blocks[b], xqb, iqs);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate += __shfl_down_sync(0xffffffffu, gate, offset);
+        up += __shfl_down_sync(0xffffffffu, up, offset);
+    }
+    if (lane == 0)
+        out[row] = (gate / (1.0f + __expf(-gate))) * up;
+}
+
 static __device__ float cuda_dot_row(const void *wdata, const float *x,
                                      int row, int cols, int type) {
     int tid = threadIdx.x;
@@ -4829,6 +4860,20 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 BN_CUDA_LAUNCH(ctx, q4k_dot_fused_gateup_silu_kernel,
                     blocks, q4_gateup_threads, 0,
                     out, (const BnBlockQ4K *)w->data, xq, gate_rows,
+                    up_rows, cols);
+            } else if (op->type == BN_GGUF_TENSOR_Q5_K &&
+                       (cols % BN_QK_K) == 0 && enable_q5k_dot) {
+                if (cuda_ensure_q8_1(ctx, cols) != 0) return -1;
+                BnCudaBlockQ8_1 *xq =
+                    (BnCudaBlockQ8_1 *)ctx->d_q8_1;
+                BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
+                    (cols + 31) / 32, 32, 0, xq, in, cols);
+                int q5_gateup_threads = 256;
+                int warps = q5_gateup_threads / 32;
+                int blocks = (gate_rows + warps - 1) / warps;
+                BN_CUDA_LAUNCH(ctx, q5k_dot_fused_gateup_silu_kernel,
+                    blocks, q5_gateup_threads, 0,
+                    out, (const BnBlockQ5K *)w->data, xq, gate_rows,
                     up_rows, cols);
             } else {
                 BN_CUDA_LAUNCH_STATIC(ctx, fused_gateup_silu_kernel, gate_rows,

@@ -20,6 +20,9 @@ static uint32_t gpu_fused_gateup_silu_cap(const BnGPUBackend *gpu,
     if (cap == 0 && gpu && gpu->kind == BN_GPU_BACKEND_CUDA &&
         tensor_type == BN_GGUF_TENSOR_Q4_K) {
         cap = BN_GPU_CAP_Q4_FUSED_GATEUP_SILU;
+    } else if (cap == 0 && gpu && gpu->kind == BN_GPU_BACKEND_CUDA &&
+               tensor_type == BN_GGUF_TENSOR_Q5_K) {
+        cap = BN_GPU_CAP_Q5_FUSED_GATEUP_SILU;
     }
     return cap;
 }
