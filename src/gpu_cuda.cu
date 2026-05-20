@@ -4775,8 +4775,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             } else if (op->type == BN_GGUF_TENSOR_Q6_K &&
                        (op->cols % BN_QK_K) == 0 &&
                        (force_q6k_dot ||
-                        (enable_q6k_dot && op->rows >= 2048 &&
-                         op->cols >= 2048))) {
+                        (enable_q6k_dot && op->cols >= 2048))) {
                 if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0) return -1;
                 BnBlockQ8K *xq = (BnBlockQ8K *)ctx->d_q8_k;
                 BN_CUDA_LAUNCH(ctx, quantize_q8k_batch_kernel,
