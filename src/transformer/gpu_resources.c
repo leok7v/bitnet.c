@@ -169,10 +169,13 @@ BnTransformerGPUSSMResources bn_transformer_gpu_resolve_ssm_resources(
 BnTransformerGPUMoESharedResources
 bn_transformer_gpu_resolve_moe_shared_resources(
     const BnBackendModel *backend,
-    const BnLayerWeights *lw) {
+    const BnLayerWeights *lw,
+    int layer) {
     return (BnTransformerGPUMoESharedResources){
         .shared_gate = qweight_backend_buf(backend, &lw->shared.shared_gate),
         .shared_up = qweight_backend_buf(backend, &lw->shared.shared_up),
         .shared_down = qweight_backend_buf(backend, &lw->shared.shared_down),
+        .shared_expert_gate = backend_handle_or(
+            backend, layer, BN_BACKEND_HANDLE_SHARED_EXPERT_GATE),
     };
 }

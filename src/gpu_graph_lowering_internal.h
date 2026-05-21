@@ -74,6 +74,8 @@ static inline int bn_gpu_ir_utility_op_code(BnGPUIRUtilityKind kind) {
     switch (kind) {
         case BN_GPU_IR_UTILITY_BIAS_ADD: return BN_GPU_CODE_BIAS_ADD;
         case BN_GPU_IR_UTILITY_WEIGHTED_ADD: return BN_GPU_CODE_WEIGHTED_ADD;
+        case BN_GPU_IR_UTILITY_WEIGHTED_ADD_SIGMOID:
+            return BN_GPU_CODE_WEIGHTED_ADD_SIGMOID;
         case BN_GPU_IR_UTILITY_RESIDUAL_RMSNORM:
             return BN_GPU_CODE_RESIDUAL_RMSNORM;
         case BN_GPU_IR_UTILITY_PER_HEAD_RMSNORM:

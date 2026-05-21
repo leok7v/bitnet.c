@@ -736,7 +736,8 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 return bn_transformer_gpu_reject_forward(
                     &emit, "gpu moe resource resolution failed");
             BnTransformerGPUMoESharedResources moe_shared =
-                bn_transformer_gpu_resolve_moe_shared_resources(backend, lw);
+                bn_transformer_gpu_resolve_moe_shared_resources(
+                    backend, lw, l);
             bn_transformer_gpu_emit_context_moe(
                 &emit, &moe_res, &moe_shared, lw, dim, u_eps, next_norm);
             if (moe_temporaries.n_buffers > 0) {

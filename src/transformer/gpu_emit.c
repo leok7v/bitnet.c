@@ -1479,13 +1479,24 @@ void bn_transformer_gpu_emit_context_moe(BnTransformerGPUEmitContext *ctx,
             lw->shared.shared_down.cols, 0);
         uint32_t u_one;
         { float one = 1.0f; memcpy(&u_one, &one, 4); }
-        uint32_t weighted_add_params[8] = {
-            (uint32_t)dim, u_one, moe->n_experts == 0 ? 1u : 0u,
-            0, 0, 0, 0, 0
-        };
-        emit_context_utility(ctx, BN_GPU_IR_UTILITY_WEIGHTED_ADD,
-                             BN_GPU_VALUE_MOE_OUT, BN_GPU_VALUE_XB2, -1, 0,
-                             NULL, weighted_add_params);
+        if (lw->shared.shared_expert_gate && shared->shared_expert_gate) {
+            uint32_t weighted_add_params[8] = {
+                (uint32_t)dim, u_one, moe->n_experts == 0 ? 1u : 0u,
+                (uint32_t)dim, 0, 0, 0, 0
+            };
+            emit_context_utility(
+                ctx, BN_GPU_IR_UTILITY_WEIGHTED_ADD_SIGMOID,
+                BN_GPU_VALUE_MOE_OUT, BN_GPU_VALUE_XB2, -1, 0,
+                shared->shared_expert_gate, weighted_add_params);
+        } else {
+            uint32_t weighted_add_params[8] = {
+                (uint32_t)dim, u_one, moe->n_experts == 0 ? 1u : 0u,
+                0, 0, 0, 0, 0
+            };
+            emit_context_utility(ctx, BN_GPU_IR_UTILITY_WEIGHTED_ADD,
+                                 BN_GPU_VALUE_MOE_OUT, BN_GPU_VALUE_XB2, -1, 0,
+                                 NULL, weighted_add_params);
+        }
     }
 
     bn_transformer_gpu_emit_context_residual_add(

@@ -117,12 +117,22 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
 
         void *attn_norm_gpu = upload_f32_buf(gpu, lw->norm.attn_norm, c->dim);
         void *ffn_norm_gpu  = upload_f32_buf(gpu, lw->norm.ffn_norm, c->dim);
+        void *shared_expert_gate_gpu = lw->shared.shared_expert_gate
+            ? gpu->buffer_create(
+                gpu->ctx, lw->shared.shared_expert_gate,
+                (size_t)c->dim * sizeof(float), BN_GGUF_TENSOR_F32,
+                1, c->dim)
+            : NULL;
         if (register_gpu_handle(model, l, BN_BACKEND_HANDLE_ATTN_NORM,
                                 attn_norm_gpu) != 0 ||
             register_gpu_handle(model, l, BN_BACKEND_HANDLE_FFN_NORM,
-                                ffn_norm_gpu) != 0) {
+                                ffn_norm_gpu) != 0 ||
+            register_gpu_handle(model, l, BN_BACKEND_HANDLE_SHARED_EXPERT_GATE,
+                                shared_expert_gate_gpu) != 0) {
             if (attn_norm_gpu) gpu->buffer_destroy(gpu->ctx, attn_norm_gpu);
             if (ffn_norm_gpu) gpu->buffer_destroy(gpu->ctx, ffn_norm_gpu);
+            if (shared_expert_gate_gpu)
+                gpu->buffer_destroy(gpu->ctx, shared_expert_gate_gpu);
             bn_model_release_gpu(model);
             return -1;
         }

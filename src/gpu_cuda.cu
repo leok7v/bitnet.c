@@ -3148,6 +3148,20 @@ static __global__ void weighted_add_kernel(float *x, const float *r,
     }
 }
 
+static __global__ void weighted_add_sigmoid_kernel(
+    float *x, const float *r, const float *gate, const float *gate_in,
+    int n, int dim, int reset) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float dot = 0.0f;
+        for (int d = 0; d < dim; d++)
+            dot += gate_in[d] * gate[d];
+        float weight = 1.0f / (1.0f + __expf(-dot));
+        float v = weight * r[i];
+        x[i] = reset ? v : x[i] + v;
+    }
+}
+
 static __global__ void activation_gate_kernel(float *x, const float *aux,
                                               int n, int kind, int param1) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -7095,6 +7109,7 @@ static const char *cuda_op_name(int code) {
     case BN_GPU_CODE_BIAS_ADD: return "bias_add";
     case BN_GPU_CODE_RESIDUAL_ADD: return "residual_add";
     case BN_GPU_CODE_WEIGHTED_ADD: return "weighted_add";
+    case BN_GPU_CODE_WEIGHTED_ADD_SIGMOID: return "weighted_add_sigmoid";
     case BN_GPU_CODE_SILU_GATE: return "silu_gate";
     case BN_GPU_CODE_RELU2_GATE: return "relu2_gate";
     case BN_GPU_CODE_SIGMOID_GATE: return "sigmoid_gate";
@@ -8279,6 +8294,22 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             BN_CUDA_LAUNCH(ctx, weighted_add_kernel,
                 (n + threads - 1) / threads, threads, 0,
                 in, aux, cuda_u32_to_f32(op->p[1]), n, (int)op->p[2]);
+            break;
+        }
+        case BN_GPU_CODE_WEIGHTED_ADD_SIGMOID: {
+            float *in = cuda_act(ctx, op->buf_in);
+            float *aux = cuda_act(ctx, op->buf_aux);
+            float *gate_in = cuda_act(ctx, BN_GPU_VALUE_XB);
+            BnCudaBuffer *gate = (BnCudaBuffer *)op->W_buf;
+            int n = (int)op->p[0];
+            int dim = (int)op->p[3];
+            if (!in || !aux || !gate_in || !gate || !gate->data ||
+                n <= 0 || dim <= 0)
+                return -1;
+            BN_CUDA_LAUNCH(ctx, weighted_add_sigmoid_kernel,
+                (n + threads - 1) / threads, threads, 0,
+                in, aux, (const float *)gate->data, gate_in, n, dim,
+                (int)op->p[2]);
             break;
         }
         case BN_GPU_CODE_SILU_GATE:

@@ -34,6 +34,7 @@ typedef enum {
     BN_BACKEND_HANDLE_WV_PREFILL = 21,
     BN_BACKEND_HANDLE_WO_PREFILL = 22,
     BN_BACKEND_HANDLE_FFN_DOWN_PREFILL = 23,
+    BN_BACKEND_HANDLE_SHARED_EXPERT_GATE = 24,
 } BnBackendHandleRole;
 
 BnBackendModel *bn_backend_model_create(void);
