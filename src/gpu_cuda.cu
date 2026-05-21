@@ -3154,6 +3154,103 @@ static __global__ void prefill_attention_kernel(
     }
 }
 
+static __global__ void prefill_causal_softmax_kernel(float *scores,
+                                                     int n_tokens) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int tid = threadIdx.x;
+    if (t >= n_tokens) return;
+    float *col = scores + (size_t)h * n_tokens * n_tokens +
+                 (size_t)t * n_tokens;
+
+    extern __shared__ float scratch[];
+    float local_max = -INFINITY;
+    for (int j = tid; j <= t; j += blockDim.x)
+        local_max = fmaxf(local_max, col[j]);
+    float max_score = cuda_block_reduce_max_all(local_max, scratch);
+
+    float local_sum = 0.0f;
+    for (int j = tid; j < n_tokens; j += blockDim.x) {
+        float p = 0.0f;
+        if (j <= t) {
+            p = __expf(col[j] - max_score);
+            local_sum += p;
+        }
+        col[j] = p;
+    }
+    float inv_sum = 1.0f / cuda_block_reduce_sum_all(local_sum, scratch);
+    for (int j = tid; j <= t; j += blockDim.x)
+        col[j] *= inv_sum;
+}
+
+static int cuda_prefill_attention_gemm(BnCudaCtx *ctx, float *d_out,
+                                       const float *d_q, const float *d_k,
+                                       const float *d_v, float *d_scores,
+                                       int n_tokens, int n_heads,
+                                       int n_kv_heads, int head_size,
+                                       int kv_mul, int kv_dim,
+                                       float attention_scale) {
+    if (!ctx || !ctx->cublas || !d_out || !d_q || !d_k || !d_v ||
+        !d_scores || n_tokens <= 1 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_size <= 0 || kv_mul <= 0 || kv_dim <= 0 ||
+        n_heads / kv_mul != n_kv_heads)
+        return -1;
+
+    const float alpha = attention_scale;
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    int q_ld = n_heads * head_size;
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = h / kv_mul;
+        const float *q_h = d_q + (size_t)h * head_size;
+        const float *k_h = d_k + (size_t)kv_h * head_size;
+        float *scores_h = d_scores + (size_t)h * n_tokens * n_tokens;
+        cublasStatus_t st = cublasSgemm(
+            ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            n_tokens, n_tokens, head_size,
+            &alpha, k_h, kv_dim, q_h, q_ld,
+            &zero, scores_h, n_tokens);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                    "[bn:gpu:cuda] prefill attention score gemm failed: status %d\n",
+                    (int)st);
+            return -1;
+        }
+    }
+
+    int threads = 256;
+    prefill_causal_softmax_kernel<<<dim3(n_heads, n_tokens, 1), threads,
+                                    (size_t)threads * sizeof(float)>>>(
+        d_scores, n_tokens);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill softmax launch failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = h / kv_mul;
+        const float *v_h = d_v + (size_t)kv_h * head_size;
+        const float *scores_h = d_scores + (size_t)h * n_tokens * n_tokens;
+        float *out_h = d_out + (size_t)h * head_size;
+        cublasStatus_t st = cublasSgemm(
+            ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            head_size, n_tokens, n_tokens,
+            &one, v_h, kv_dim, scores_h, n_tokens,
+            &zero, out_h, q_ld);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                    "[bn:gpu:cuda] prefill attention value gemm failed: status %d\n",
+                    (int)st);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 static __global__ void flash_attention_rope_q_kernel(
     float *out, const float *q, const void *key_cache,
     const void *value_cache, const float *freq, const float *bias,
@@ -4976,7 +5073,17 @@ static int cuda_prefill_attention_wo(void *vctx, float *out, void *wo_buf,
     size_t q_values = (size_t)n_tokens * (size_t)n_heads *
                       (size_t)head_size;
     size_t kv_values = (size_t)n_tokens * (size_t)kv_dim;
-    size_t total_values = q_values + 2u * kv_values;
+    int gemm_min_tokens =
+        cuda_env_int("BN_CUDA_PREFILL_GEMM_ATTN_MIN_TOKENS", 256);
+    int use_gemm_attention =
+        !getenv("BN_CUDA_DISABLE_PREFILL_GEMM_ATTN") &&
+        (getenv("BN_CUDA_ENABLE_PREFILL_GEMM_ATTN") ||
+         n_tokens >= gemm_min_tokens) &&
+        n_tokens <= 512;
+    size_t score_values = use_gemm_attention
+        ? (size_t)n_heads * (size_t)n_tokens * (size_t)n_tokens
+        : 0;
+    size_t total_values = q_values + 2u * kv_values + score_values;
     size_t out_values = (size_t)n_tokens * (size_t)wo_rows;
     if (cuda_ensure_prefill(ctx, total_values) != 0)
         return -1;
@@ -4987,6 +5094,7 @@ static int cuda_prefill_attention_wo(void *vctx, float *out, void *wo_buf,
     float *d_q = ctx->d_prefill;
     float *d_k = d_q + q_values;
     float *d_v = d_k + kv_values;
+    float *d_scores = d_v + kv_values;
     cudaError_t err = cudaMemcpy(d_q, Q, q_values * sizeof(float),
                                  cudaMemcpyHostToDevice);
     if (err == cudaSuccess)
@@ -5003,16 +5111,24 @@ static int cuda_prefill_attention_wo(void *vctx, float *out, void *wo_buf,
 
     int threads = 256;
     int warps = threads / 32;
-    size_t shared = (size_t)(n_tokens + threads) * sizeof(float);
-    prefill_attention_kernel<<<dim3(n_heads, n_tokens, 1), threads,
-                               shared>>>(
-        ctx->d_x, d_q, d_k, d_v, n_tokens, n_heads, head_size,
-        kv_mul, kv_dim, attention_scale);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[bn:gpu:cuda] prefill attention+wo attention failed: %s\n",
-                cudaGetErrorString(err));
-        return -1;
+    if (use_gemm_attention) {
+        if (cuda_prefill_attention_gemm(
+                ctx, ctx->d_x, d_q, d_k, d_v, d_scores, n_tokens,
+                n_heads, n_kv_heads, head_size, kv_mul, kv_dim,
+                attention_scale) != 0)
+            return -1;
+    } else {
+        size_t shared = (size_t)(n_tokens + threads) * sizeof(float);
+        prefill_attention_kernel<<<dim3(n_heads, n_tokens, 1), threads,
+                                   shared>>>(
+            ctx->d_x, d_q, d_k, d_v, n_tokens, n_heads, head_size,
+            kv_mul, kv_dim, attention_scale);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill attention+wo attention failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
     }
 
     if ((wo->f16_data || wo->f32_data) &&
