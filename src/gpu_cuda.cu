@@ -995,6 +995,57 @@ static __global__ void q4k_dot_matmul_kernel(float *out,
         out[out_offset + (size_t)token * rows + row] = sum;
 }
 
+static __global__ void q4k_dot_matmul4_token_kernel(
+        float *out, const BnBlockQ4K *blocks, const BnCudaBlockQ8_1 *xq,
+        int rows, int cols, int n_tokens, size_t out_offset) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int token0 = blockIdx.y * 4;
+    if (row >= rows || token0 >= n_tokens) return;
+
+    int n_bpr = cols / BN_QK_K;
+    int x_blocks = (cols + 31) / 32;
+    int kbx = lane / 16;
+    int iqs = 2 * (lane & 15);
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    const BnBlockQ4K *row_blocks = blocks + (size_t)row * n_bpr;
+    const BnCudaBlockQ8_1 *xq0 = xq + (size_t)token0 * x_blocks;
+    const BnCudaBlockQ8_1 *xq1 = xq0 + x_blocks;
+    const BnCudaBlockQ8_1 *xq2 = xq1 + x_blocks;
+    const BnCudaBlockQ8_1 *xq3 = xq2 + x_blocks;
+    int have1 = token0 + 1 < n_tokens;
+    int have2 = token0 + 2 < n_tokens;
+    int have3 = token0 + 3 < n_tokens;
+    for (int b = kbx; b < n_bpr; b += 2) {
+        const BnBlockQ4K *blk = &row_blocks[b];
+        sum0 += cuda_vec_dot_q4k_q8_1(blk, xq0 + (size_t)b * 8, iqs);
+        if (have1)
+            sum1 += cuda_vec_dot_q4k_q8_1(blk, xq1 + (size_t)b * 8, iqs);
+        if (have2)
+            sum2 += cuda_vec_dot_q4k_q8_1(blk, xq2 + (size_t)b * 8, iqs);
+        if (have3)
+            sum3 += cuda_vec_dot_q4k_q8_1(blk, xq3 + (size_t)b * 8, iqs);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+        sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
+        sum3 += __shfl_down_sync(0xffffffffu, sum3, offset);
+    }
+    if (lane == 0) {
+        out[out_offset + (size_t)token0 * rows + row] = sum0;
+        if (have1) out[out_offset + (size_t)(token0 + 1) * rows + row] = sum1;
+        if (have2) out[out_offset + (size_t)(token0 + 2) * rows + row] = sum2;
+        if (have3) out[out_offset + (size_t)(token0 + 3) * rows + row] = sum3;
+    }
+}
+
 static __global__ void q4k_dot_matvec_split_kernel(
     float *out0, float *out1, float *out2, const BnBlockQ4K *blocks,
     const BnCudaBlockQ8_1 *xq, const float *bias0, int total_rows, int cols,
@@ -4808,10 +4859,18 @@ static int cuda_matmul_device_out(BnCudaCtx *ctx, float *d_dst,
         dim3 qgrid(x_blocks, n_tokens, 1);
         quantize_q8_1_batch_kernel<<<qgrid, 32, 0>>>(
             xq, d_x, cols, n_tokens);
-        dim3 grid((rows + warps - 1) / warps, n_tokens, 1);
-        q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
-            d_dst, (const BnBlockQ4K *)w->data, xq, rows, cols,
-            n_tokens, 0);
+        if (n_tokens >= 4) {
+            dim3 grid((rows + warps - 1) / warps,
+                      (n_tokens + 3) / 4, 1);
+            q4k_dot_matmul4_token_kernel<<<grid, threads, 0>>>(
+                d_dst, (const BnBlockQ4K *)w->data, xq, rows, cols,
+                n_tokens, 0);
+        } else {
+            dim3 grid((rows + warps - 1) / warps, n_tokens, 1);
+            q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
+                d_dst, (const BnBlockQ4K *)w->data, xq, rows, cols,
+                n_tokens, 0);
+        }
     } else if (type == BN_GGUF_TENSOR_Q6_K && (cols % BN_QK_K) == 0 &&
                !getenv("BN_CUDA_DISABLE_Q6K_DOT")) {
         int x_blocks = cols / BN_QK_K;
@@ -4977,10 +5036,18 @@ static int cuda_matmul(void *vctx, float *out, void *W_buf, const float *X,
         dim3 qgrid(x_blocks, n_tokens, 1);
         quantize_q8_1_batch_kernel<<<qgrid, 32, 0>>>(
             xq, ctx->d_x, cols, n_tokens);
-        dim3 grid((rows + warps - 1) / warps, n_tokens, 1);
-        q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
-            ctx->d_out, (const BnBlockQ4K *)w->data, xq, rows, cols,
-            n_tokens, 0);
+        if (n_tokens >= 4) {
+            dim3 grid((rows + warps - 1) / warps,
+                      (n_tokens + 3) / 4, 1);
+            q4k_dot_matmul4_token_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)w->data, xq, rows, cols,
+                n_tokens, 0);
+        } else {
+            dim3 grid((rows + warps - 1) / warps, n_tokens, 1);
+            q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)w->data, xq, rows, cols,
+                n_tokens, 0);
+        }
     } else if (type == BN_GGUF_TENSOR_Q6_K && (cols % BN_QK_K) == 0 &&
                getenv("BN_CUDA_ENABLE_Q6K_DOT")) {
         int x_blocks = cols / BN_QK_K;
@@ -5124,11 +5191,20 @@ static int cuda_matmul_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
                     xq, ctx->d_x, x_cols, n_tokens);
                 q8_1_ready = 1;
             }
-            dim3 grid((rows + warps - 1) / warps, n_tokens, 1);
-            q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
-                ctx->d_out, (const BnBlockQ4K *)w->data,
-                (const BnCudaBlockQ8_1 *)ctx->d_q8_1, rows, x_cols,
-                n_tokens, out_offset);
+            if (n_tokens >= 4) {
+                dim3 grid((rows + warps - 1) / warps,
+                          (n_tokens + 3) / 4, 1);
+                q4k_dot_matmul4_token_kernel<<<grid, threads, 0>>>(
+                    ctx->d_out, (const BnBlockQ4K *)w->data,
+                    (const BnCudaBlockQ8_1 *)ctx->d_q8_1, rows, x_cols,
+                    n_tokens, out_offset);
+            } else {
+                dim3 grid((rows + warps - 1) / warps, n_tokens, 1);
+                q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
+                    ctx->d_out, (const BnBlockQ4K *)w->data,
+                    (const BnCudaBlockQ8_1 *)ctx->d_q8_1, rows, x_cols,
+                    n_tokens, out_offset);
+            }
         } else if (type == BN_GGUF_TENSOR_Q6_K &&
                    (x_cols % BN_QK_K) == 0 &&
                    !getenv("BN_CUDA_DISABLE_Q6K_DOT")) {
@@ -5535,11 +5611,19 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
         dim3 qgrid(x_blocks, n_tokens, 1);
         quantize_q8_1_batch_kernel<<<qgrid, 32, 0>>>(
             xq, gate_input, dim, n_tokens);
-        dim3 grid((hidden_dim * 2 + warps - 1) / warps,
-                  n_tokens, 1);
-        q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
-            ctx->d_out, (const BnBlockQ4K *)gate->data, xq,
-            hidden_dim * 2, dim, n_tokens, 0);
+        if (n_tokens >= 4) {
+            dim3 grid((hidden_dim * 2 + warps - 1) / warps,
+                      (n_tokens + 3) / 4, 1);
+            q4k_dot_matmul4_token_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)gate->data, xq,
+                hidden_dim * 2, dim, n_tokens, 0);
+        } else {
+            dim3 grid((hidden_dim * 2 + warps - 1) / warps,
+                      n_tokens, 1);
+            q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)gate->data, xq,
+                hidden_dim * 2, dim, n_tokens, 0);
+        }
     } else if (stacked_gateup && gate_type == BN_GGUF_TENSOR_Q5_0 &&
                (dim & 31) == 0) {
         dim3 grid((((hidden_dim * 2) + 3) / 4 + warps - 1) / warps,
@@ -5593,13 +5677,24 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
         dim3 qgrid(x_blocks, n_tokens, 1);
         quantize_q8_1_batch_kernel<<<qgrid, 32, 0>>>(
             xq, gate_input, dim, n_tokens);
-        dim3 grid((hidden_dim + warps - 1) / warps, n_tokens, 1);
-        q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
-            ctx->d_out, (const BnBlockQ4K *)gate->data, xq, hidden_dim,
-            dim, n_tokens, 0);
-        q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
-            ctx->d_out, (const BnBlockQ4K *)up->data, xq, hidden_dim,
-            dim, n_tokens, (size_t)n_tokens * hidden_dim);
+        if (n_tokens >= 4) {
+            dim3 grid((hidden_dim + warps - 1) / warps,
+                      (n_tokens + 3) / 4, 1);
+            q4k_dot_matmul4_token_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)gate->data, xq, hidden_dim,
+                dim, n_tokens, 0);
+            q4k_dot_matmul4_token_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)up->data, xq, hidden_dim,
+                dim, n_tokens, (size_t)n_tokens * hidden_dim);
+        } else {
+            dim3 grid((hidden_dim + warps - 1) / warps, n_tokens, 1);
+            q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)gate->data, xq, hidden_dim,
+                dim, n_tokens, 0);
+            q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)up->data, xq, hidden_dim,
+                dim, n_tokens, (size_t)n_tokens * hidden_dim);
+        }
     } else {
         if (stacked_gateup)
             return -1;
@@ -5910,10 +6005,18 @@ static int cuda_prefill_attention_wo(void *vctx, float *out, void *wo_buf,
         BnCudaBlockQ8_1 *xq = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
         quantize_q8_1_batch_kernel<<<dim3(x_blocks, n_tokens, 1), 32, 0>>>(
             xq, ctx->d_x, wo_cols, n_tokens);
-        dim3 grid((wo_rows + warps - 1) / warps, n_tokens, 1);
-        q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
-            ctx->d_out, (const BnBlockQ4K *)wo->data, xq, wo_rows,
-            wo_cols, n_tokens, 0);
+        if (n_tokens >= 4) {
+            dim3 grid((wo_rows + warps - 1) / warps,
+                      (n_tokens + 3) / 4, 1);
+            q4k_dot_matmul4_token_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)wo->data, xq, wo_rows,
+                wo_cols, n_tokens, 0);
+        } else {
+            dim3 grid((wo_rows + warps - 1) / warps, n_tokens, 1);
+            q4k_dot_matmul_kernel<<<grid, threads, 0>>>(
+                ctx->d_out, (const BnBlockQ4K *)wo->data, xq, wo_rows,
+                wo_cols, n_tokens, 0);
+        }
     } else if (wo_type == BN_GGUF_TENSOR_Q6_K && (wo_cols % BN_QK_K) == 0 &&
                !getenv("BN_CUDA_DISABLE_Q6K_DOT")) {
         int x_blocks = wo_cols / BN_QK_K;
