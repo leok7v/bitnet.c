@@ -2630,6 +2630,45 @@ static __global__ void rmsnorm_batch_kernel(float *out, const float *x,
         ot[i] = xt[i] * scale * weight[i];
 }
 
+static __global__ void rmsnorm_batch_copy_kernel(float *out, float *copy_out,
+                                                 const float *x,
+                                                 const float *weight, int n,
+                                                 int n_tokens, float eps) {
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    if (t >= n_tokens || n <= 0) return;
+    const float *xt = x + (size_t)t * n;
+    float *ot = out + (size_t)t * n;
+    float *ct = copy_out + (size_t)t * n;
+
+    float ss = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = xt[i];
+        ct[i] = v;
+        ss += v * v;
+    }
+
+    extern __shared__ float scratch[];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        ss += __shfl_down_sync(0xffffffffu, ss, offset);
+    if (lane == 0) scratch[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) >> 5;
+        float total = lane < n_warps ? scratch[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        if (lane == 0) scratch[0] = total;
+    }
+    __syncthreads();
+
+    float scale = rsqrtf(scratch[0] / (float)n + eps);
+    for (int i = tid; i < n; i += blockDim.x)
+        ot[i] = xt[i] * scale * weight[i];
+}
+
 static __global__ void per_head_rmsnorm_kernel(float *x,
                                                const float *weight,
                                                int n_heads,
@@ -6290,20 +6329,12 @@ static int cuda_prefill_dense_layer(
     float *d_ffn_act = d_ffn_norm + dim_values;
     float *d_gateup = d_ffn_act + hidden_values;
 
-    err = cudaMemcpy(d_orig, ctx->d_out, dim_values * sizeof(float),
-                     cudaMemcpyDeviceToDevice);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer residual copy failed: %s\n",
-                cudaGetErrorString(err));
-        return -1;
-    }
-
     int threads = 256;
     int warps = threads / 32;
-    rmsnorm_batch_kernel<<<n_tokens, threads,
-                           (size_t)warps * sizeof(float)>>>(
-        d_attn_norm, ctx->d_out, (const float *)attn_norm->data, dim,
-        n_tokens, norm_eps);
+    rmsnorm_batch_copy_kernel<<<n_tokens, threads,
+                                (size_t)warps * sizeof(float)>>>(
+        d_attn_norm, d_orig, ctx->d_out, (const float *)attn_norm->data,
+        dim, n_tokens, norm_eps);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] prefill dense layer attn norm failed: %s\n",
