@@ -117,6 +117,16 @@ struct BnGPUBackend {
                                 int gate_type, int up_type, int down_type,
                                 int act_type, float norm_eps);
 
+    // Same as dense_ffn_batch_norm, returning X + FFN(norm(X)).
+    int (*dense_ffn_batch_norm_resid)(void *ctx, float *out,
+                                      void *gate_buf, void *up_buf,
+                                      void *down_buf, void *norm_buf,
+                                      const float *X, int n_tokens,
+                                      int dim, int hidden_dim,
+                                      int gate_type, int up_type,
+                                      int down_type, int act_type,
+                                      float norm_eps);
+
     // Batched causal attention for prompt processing:
     // out[n_tokens, n_heads * head_size] =
     // attention(Q[n_tokens, n_heads * head_size],
@@ -160,6 +170,23 @@ struct BnGPUBackend {
     // Same as prefill_qkv_attention_wo, with input RMSNorm fused into the
     // backend before QK/WV projection.
     int (*prefill_qkv_attention_wo_norm)(
+                                    void *ctx, float *out,
+                                    void *qk_buf, void *wv_buf, void *wo_buf,
+                                    void *attn_norm_buf,
+                                    void *q_norm_buf, void *k_norm_buf,
+                                    const float *X, float *K_out,
+                                    float *V_out, int n_tokens, int dim,
+                                    int n_heads, int n_kv_heads,
+                                    int head_size, int kv_mul, int kv_dim,
+                                    int qk_rows, int qk_type,
+                                    int wv_rows, int wv_type,
+                                    int wo_rows, int wo_cols, int wo_type,
+                                    int qk_norm_per_head, float norm_eps,
+                                    int pos0, int rope_dims,
+                                    float attention_scale);
+
+    // Same as prefill_qkv_attention_wo_norm, returning X + Attention(norm(X)).
+    int (*prefill_qkv_attention_wo_norm_resid)(
                                     void *ctx, float *out,
                                     void *qk_buf, void *wv_buf, void *wo_buf,
                                     void *attn_norm_buf,

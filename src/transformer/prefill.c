@@ -237,7 +237,8 @@ static int prefill_dense_ffn_gpu_batch(const BnModel *m,
                                        int act_type,
                                        int layer,
                                        void *norm_buf,
-                                       float norm_eps) {
+                                       float norm_eps,
+                                       int add_residual) {
     BnGPUBackend *gpu = bn_model_gpu(m);
     const BnBackendModel *backend = bn_model_backend(m);
     if (!gpu || !gpu->dense_ffn_batch || !backend ||
@@ -262,6 +263,13 @@ static int prefill_dense_ffn_gpu_batch(const BnModel *m,
     if (!gate_buf || !down_buf)
         return -1;
 
+    if (norm_buf && add_residual && gpu->dense_ffn_batch_norm_resid) {
+        return gpu->dense_ffn_batch_norm_resid(
+            gpu->ctx, out, gate_buf, up_buf, down_buf, norm_buf, X,
+            n_tokens, dim, hidden_dim, lw->ffn.ffn_gate.type,
+            lw->ffn.ffn_up.type, lw->ffn.ffn_down.type, act_type,
+            norm_eps);
+    }
     if (norm_buf && gpu->dense_ffn_batch_norm) {
         return gpu->dense_ffn_batch_norm(
             gpu->ctx, out, gate_buf, up_buf, down_buf, norm_buf, X,
@@ -687,12 +695,14 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             int wo_cols_attn = lw->attn.wo.cols;
             int used_fused_attn_wo = 0;
             int used_raw_prefill_attn_wo = 0;
+            int used_attn_residual = 0;
             BnGPUBackend *gpu = bn_model_gpu(m);
             const BnBackendModel *backend = bn_model_backend(m);
             void *attn_norm_buf = backend ? bn_backend_model_handle(
                 backend, l, BN_BACKEND_HANDLE_ATTN_NORM) : NULL;
             int can_fuse_attn_input_norm =
-                gpu && gpu->prefill_qkv_attention_wo_norm && attn_norm_buf &&
+                gpu && gpu->prefill_qkv_attention_wo_norm_resid &&
+                attn_norm_buf &&
                 n_tokens >= prefill_gpu_attention_min_tokens() &&
                 bn_model_tq_state(m) == NULL &&
                 !q_gated && pos0 == 0 &&
@@ -734,8 +744,8 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                 t_prof = prefill_profile_now(&prof);
                 int qkv_fused_rc = -1;
                 if (qk_buf && wv_buf && wo_buf && can_fuse_attn_input_norm) {
-                    qkv_fused_rc = gpu->prefill_qkv_attention_wo_norm(
-                        gpu->ctx, Xb2, qk_buf, wv_buf, wo_buf,
+                    qkv_fused_rc = gpu->prefill_qkv_attention_wo_norm_resid(
+                        gpu->ctx, act, qk_buf, wv_buf, wo_buf,
                         attn_norm_buf, q_norm_buf, k_norm_buf, act, K_new,
                         V_new, n_tokens, dim, c->n_heads,
                         layer_n_kv_heads, layer_head_size, layer_kv_mul,
@@ -746,6 +756,8 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                         c->qk_norm_per_head, c->norm_eps, pos0,
                         layer_rope_dims,
                         prefill_attention_scale(c, layer_head_size));
+                    if (qkv_fused_rc == 0)
+                        used_attn_residual = 1;
                     if (qkv_fused_rc != 0) {
                         t_prof = prefill_profile_now(&prof);
                         for (int t = 0; t < n_tokens; t++)
@@ -1055,9 +1067,10 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             }
 
             t_prof = prefill_profile_now(&prof);
-            for (int t = 0; t < n_tokens; t++)
-                for (int d = 0; d < dim; d++)
-                    act[(size_t)t * dim + d] += Xb2[(size_t)t * dim + d];
+            if (!used_attn_residual)
+                for (int t = 0; t < n_tokens; t++)
+                    for (int d = 0; d < dim; d++)
+                        act[(size_t)t * dim + d] += Xb2[(size_t)t * dim + d];
             prefill_profile_add(&prof.residual_ms, t_prof);
 
         } else if (!is_attn) {
@@ -1150,6 +1163,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             }
         } else if (lw->ffn.ffn_up.data) {
             int used_gpu_batch_ffn = 0;
+            int used_ffn_residual = 0;
             t_prof = prefill_profile_now(&prof);
             BnGPUBackend *gpu_ffn = bn_model_gpu(m);
             const BnBackendModel *backend_ffn = bn_model_backend(m);
@@ -1160,12 +1174,14 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                 !((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
                   lw->norm.ffn_post_norm) &&
                 n_tokens >= prefill_gpu_attention_min_tokens() &&
-                gpu_ffn && gpu_ffn->dense_ffn_batch_norm && ffn_norm_buf &&
-                prefill_dense_ffn_gpu_batch(m, Xb, lw, act, n_tokens,
+                gpu_ffn && gpu_ffn->dense_ffn_batch_norm_resid &&
+                ffn_norm_buf &&
+                prefill_dense_ffn_gpu_batch(m, act, lw, act, n_tokens,
                                             dim, hidden_dim,
                                             c->act_type, l, ffn_norm_buf,
-                                            c->norm_eps) == 0) {
+                                            c->norm_eps, 1) == 0) {
                 used_gpu_batch_ffn = 1;
+                used_ffn_residual = 1;
             }
             if (!used_gpu_batch_ffn) {
                 prefill_profile_add(&prof.ffn_ms, t_prof);
@@ -1182,7 +1198,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                     prefill_dense_ffn_gpu_batch(m, Xb, lw, Xb, n_tokens,
                                                 dim, hidden_dim,
                                                 c->act_type, l, NULL,
-                                                0.0f) == 0) {
+                                                0.0f, 0) == 0) {
                     used_gpu_batch_ffn = 1;
                 } else if (c->has_ffn_gate) {
 #ifdef __AVX2__
@@ -1242,6 +1258,9 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                         c->norm_eps);
             }
             prefill_profile_add(&prof.ffn_ms, t_prof);
+
+            if (used_ffn_residual)
+                continue;
 
             t_prof = prefill_profile_now(&prof);
             for (int t = 0; t < n_tokens; t++)

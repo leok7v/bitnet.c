@@ -5044,7 +5044,8 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
                                      int n_tokens, int dim, int hidden_dim,
                                      int gate_type, int up_type,
                                      int down_type, int act_type,
-                                     float norm_eps) {
+                                     float norm_eps,
+                                     int add_residual) {
     BnCudaCtx *ctx = (BnCudaCtx *)vctx;
     BnCudaBuffer *gate = (BnCudaBuffer *)gate_buf;
     BnCudaBuffer *up = (BnCudaBuffer *)up_buf;
@@ -5067,6 +5068,8 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
         down->rows != dim || down->cols != hidden_dim)
         return -1;
     if (norm && (!norm->data || norm->rows * norm->cols < dim))
+        return -1;
+    if (add_residual && !norm)
         return -1;
     if (!cuda_type_supported(gate_type) ||
         (!stacked_gateup && !cuda_type_supported(up_type)) ||
@@ -5092,12 +5095,28 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
     int threads = 256;
     int warps = threads / 32;
     const float *gate_input = ctx->d_x;
+    float *residual_input = ctx->d_x;
     if (norm) {
-        if (cuda_ensure_prefill(ctx, (size_t)n_tokens * (size_t)dim) != 0)
+        size_t residual_values = add_residual
+            ? (size_t)n_tokens * (size_t)dim : 0u;
+        size_t norm_values = (size_t)n_tokens * (size_t)dim;
+        if (cuda_ensure_prefill(ctx, residual_values + norm_values) != 0)
             return -1;
+        float *d_residual = ctx->d_prefill;
+        float *d_norm = d_residual + residual_values;
+        if (add_residual) {
+            err = cudaMemcpy(d_residual, ctx->d_x, input_bytes,
+                             cudaMemcpyDeviceToDevice);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[bn:gpu:cuda] dense ffn residual copy failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
+            residual_input = d_residual;
+        }
         rmsnorm_batch_kernel<<<n_tokens, threads,
                                (size_t)warps * sizeof(float)>>>(
-            ctx->d_prefill, ctx->d_x, (const float *)norm->data, dim,
+            d_norm, ctx->d_x, (const float *)norm->data, dim,
             n_tokens, norm_eps);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -5105,7 +5124,7 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
                     cudaGetErrorString(err));
             return -1;
         }
-        gate_input = ctx->d_prefill;
+        gate_input = d_norm;
     }
     if (stacked_gateup && (gate->f16_data || gate->f32_data) &&
         cuda_cublas_matmul_f16(ctx, ctx->d_out, gate, gate_input,
@@ -5268,6 +5287,18 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
                 cudaGetErrorString(err));
         return -1;
     }
+    if (add_residual) {
+        int total = n_tokens * dim;
+        int blocks = (total + threads - 1) / threads;
+        residual_add_kernel<<<blocks, threads>>>(ctx->d_out, residual_input,
+                                                 total);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] dense ffn residual failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+    }
     if (cuda_ensure_host_out(ctx, out_bytes) != 0)
         return -1;
     err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
@@ -5289,7 +5320,7 @@ static int cuda_dense_ffn_batch(void *vctx, float *out,
                                 int act_type) {
     return cuda_dense_ffn_batch_impl(
         vctx, out, gate_buf, up_buf, down_buf, NULL, X, n_tokens, dim,
-        hidden_dim, gate_type, up_type, down_type, act_type, 0.0f);
+        hidden_dim, gate_type, up_type, down_type, act_type, 0.0f, 0);
 }
 
 static int cuda_dense_ffn_batch_norm(void *vctx, float *out,
@@ -5302,7 +5333,21 @@ static int cuda_dense_ffn_batch_norm(void *vctx, float *out,
                                      float norm_eps) {
     return cuda_dense_ffn_batch_impl(
         vctx, out, gate_buf, up_buf, down_buf, norm_buf, X, n_tokens, dim,
-        hidden_dim, gate_type, up_type, down_type, act_type, norm_eps);
+        hidden_dim, gate_type, up_type, down_type, act_type, norm_eps, 0);
+}
+
+static int cuda_dense_ffn_batch_norm_resid(void *vctx, float *out,
+                                           void *gate_buf, void *up_buf,
+                                           void *down_buf, void *norm_buf,
+                                           const float *X,
+                                           int n_tokens, int dim,
+                                           int hidden_dim,
+                                           int gate_type, int up_type,
+                                           int down_type, int act_type,
+                                           float norm_eps) {
+    return cuda_dense_ffn_batch_impl(
+        vctx, out, gate_buf, up_buf, down_buf, norm_buf, X, n_tokens, dim,
+        hidden_dim, gate_type, up_type, down_type, act_type, norm_eps, 1);
 }
 
 static int cuda_prefill_attention(void *vctx, float *out,
@@ -5527,7 +5572,8 @@ static int cuda_prefill_qkv_attention_wo_impl(
         int qk_rows, int qk_type, int wv_rows, int wv_type, int wo_rows,
         int wo_cols, int wo_type, int qk_norm_per_head, float norm_eps,
         int pos0, int rope_dims,
-        float attention_scale) {
+        float attention_scale,
+        int add_residual) {
     BnCudaCtx *ctx = (BnCudaCtx *)vctx;
     BnCudaBuffer *qk = (BnCudaBuffer *)qk_buf;
     BnCudaBuffer *wv = (BnCudaBuffer *)wv_buf;
@@ -5568,9 +5614,13 @@ static int cuda_prefill_qkv_attention_wo_impl(
         return -1;
     size_t score_values =
         (size_t)n_heads * (size_t)n_tokens * (size_t)n_tokens;
+    if (add_residual && !attn_norm)
+        return -1;
+    size_t residual_values = add_residual
+        ? (size_t)n_tokens * (size_t)dim : 0u;
     size_t norm_values = attn_norm ? (size_t)n_tokens * (size_t)dim : 0u;
-    size_t total_values = norm_values + q_values + 2u * kv_values +
-                          qk_values + score_values;
+    size_t total_values = residual_values + norm_values + q_values +
+                          2u * kv_values + qk_values + score_values;
     size_t out_values = (size_t)n_tokens * (size_t)wo_rows;
     if (cuda_ensure_scratch(ctx, (size_t)n_tokens * (size_t)dim * sizeof(float),
                             out_values * sizeof(float)) != 0)
@@ -5587,7 +5637,8 @@ static int cuda_prefill_qkv_attention_wo_impl(
         return -1;
     }
 
-    float *d_norm = ctx->d_prefill;
+    float *d_residual = ctx->d_prefill;
+    float *d_norm = d_residual + residual_values;
     float *d_q = d_norm + norm_values;
     float *d_k = d_q + q_values;
     float *d_v = d_k + kv_values;
@@ -5597,6 +5648,17 @@ static int cuda_prefill_qkv_attention_wo_impl(
     if (attn_norm) {
         int threads = 256;
         int warps = threads / 32;
+        if (add_residual) {
+            cudaError_t copy_err = cudaMemcpy(
+                d_residual, ctx->d_x,
+                (size_t)n_tokens * (size_t)dim * sizeof(float),
+                cudaMemcpyDeviceToDevice);
+            if (copy_err != cudaSuccess) {
+                fprintf(stderr, "[bn:gpu:cuda] prefill residual copy failed: %s\n",
+                        cudaGetErrorString(copy_err));
+                return -1;
+            }
+        }
         rmsnorm_batch_kernel<<<n_tokens, threads,
                                (size_t)warps * sizeof(float)>>>(
             d_norm, ctx->d_x, (const float *)attn_norm->data, dim,
@@ -5652,6 +5714,19 @@ static int cuda_prefill_qkv_attention_wo_impl(
     if (cuda_matmul_device_out(ctx, ctx->d_out, wo, ctx->d_x, wo_rows,
                                wo_cols, n_tokens, wo_type) != 0)
         return -1;
+    if (add_residual) {
+        int threads = 256;
+        int total = n_tokens * dim;
+        int blocks = (total + threads - 1) / threads;
+        residual_add_kernel<<<blocks, threads>>>(ctx->d_out, d_residual,
+                                                 total);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill residual failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+    }
 
     size_t kv_bytes = kv_values * sizeof(float);
     err = cudaMemcpy(K_out, d_k, kv_bytes, cudaMemcpyDeviceToHost);
@@ -5690,7 +5765,7 @@ static int cuda_prefill_qkv_attention_wo(
         X, K_out, V_out, n_tokens, dim, n_heads, n_kv_heads, head_size,
         kv_mul, kv_dim, qk_rows, qk_type, wv_rows, wv_type, wo_rows,
         wo_cols, wo_type, qk_norm_per_head, norm_eps, pos0, rope_dims,
-        attention_scale);
+        attention_scale, 0);
 }
 
 static int cuda_prefill_qkv_attention_wo_norm(
@@ -5706,7 +5781,23 @@ static int cuda_prefill_qkv_attention_wo_norm(
         k_norm_buf, X, K_out, V_out, n_tokens, dim, n_heads, n_kv_heads,
         head_size, kv_mul, kv_dim, qk_rows, qk_type, wv_rows, wv_type,
         wo_rows, wo_cols, wo_type, qk_norm_per_head, norm_eps, pos0,
-        rope_dims, attention_scale);
+        rope_dims, attention_scale, 0);
+}
+
+static int cuda_prefill_qkv_attention_wo_norm_resid(
+        void *vctx, float *out, void *qk_buf, void *wv_buf, void *wo_buf,
+        void *attn_norm_buf, void *q_norm_buf, void *k_norm_buf,
+        const float *X, float *K_out, float *V_out, int n_tokens, int dim,
+        int n_heads, int n_kv_heads, int head_size, int kv_mul, int kv_dim,
+        int qk_rows, int qk_type, int wv_rows, int wv_type, int wo_rows,
+        int wo_cols, int wo_type, int qk_norm_per_head, float norm_eps,
+        int pos0, int rope_dims, float attention_scale) {
+    return cuda_prefill_qkv_attention_wo_impl(
+        vctx, out, qk_buf, wv_buf, wo_buf, attn_norm_buf, q_norm_buf,
+        k_norm_buf, X, K_out, V_out, n_tokens, dim, n_heads, n_kv_heads,
+        head_size, kv_mul, kv_dim, qk_rows, qk_type, wv_rows, wv_type,
+        wo_rows, wo_cols, wo_type, qk_norm_per_head, norm_eps, pos0,
+        rope_dims, attention_scale, 1);
 }
 
 static float cuda_u32_to_f32(uint32_t bits) {
@@ -7414,10 +7505,13 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->dense_ffn = cuda_dense_ffn;
     gpu->dense_ffn_batch = cuda_dense_ffn_batch;
     gpu->dense_ffn_batch_norm = cuda_dense_ffn_batch_norm;
+    gpu->dense_ffn_batch_norm_resid = cuda_dense_ffn_batch_norm_resid;
     gpu->prefill_attention = cuda_prefill_attention;
     gpu->prefill_attention_wo = cuda_prefill_attention_wo;
     gpu->prefill_qkv_attention_wo = cuda_prefill_qkv_attention_wo;
     gpu->prefill_qkv_attention_wo_norm = cuda_prefill_qkv_attention_wo_norm;
+    gpu->prefill_qkv_attention_wo_norm_resid =
+        cuda_prefill_qkv_attention_wo_norm_resid;
     gpu->init_activations = cuda_init_activations;
     gpu->free_activations = cuda_free_activations;
     gpu->write_activation = cuda_write_activation;
