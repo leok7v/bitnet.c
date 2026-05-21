@@ -3764,6 +3764,115 @@ static __global__ void flash_attention_rope_q_runtime_kernel(
     }
 }
 
+static __global__ void qk_norm_rope_flash_runtime_kernel(
+    float *out, const float *q, void *key_cache, const void *value_cache,
+    const float *freq, const float *q_weight, const float *k_weight,
+    int n_heads, int n_kv_heads, int head_size, int kv_mul, int kv_dim,
+    int seq_len, uint32_t loff, float inv_sqrt_hs, float eps,
+    int per_head_weight, int rope_dims, int kv_f16,
+    const BnCudaRuntimeParams *runtime) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    if (h >= n_heads || head_size <= 0) return;
+    int n_kv = runtime ? runtime->n_kv : 1;
+    int pos = runtime ? runtime->pos : 0;
+    int cache_pos = runtime ? runtime->cache_pos : 0;
+    int kvh = h / kv_mul;
+    if (kvh >= n_kv_heads) return;
+
+    const float *qh = q + (size_t)h * head_size;
+    size_t k_base = (size_t)loff + (size_t)cache_pos * kv_dim +
+                    (size_t)kvh * head_size;
+
+    extern __shared__ float shared[];
+    float *scores = shared;
+    float *scratch = scores + seq_len;
+    float *qrot = scratch + blockDim.x;
+    float *kcur = qrot + head_size;
+
+    float ssq = 0.0f;
+    float ssk = 0.0f;
+    for (int i = tid; i < head_size; i += blockDim.x) {
+        float qv = qh[i];
+        float kv = cuda_kv_load(key_cache, k_base + (size_t)i, kv_f16);
+        ssq += qv * qv;
+        ssk += kv * kv;
+    }
+    float q_scale = rsqrtf(cuda_block_reduce_sum_all(ssq, scratch) /
+                           (float)head_size + eps);
+    float k_scale = rsqrtf(cuda_block_reduce_sum_all(ssk, scratch) /
+                           (float)head_size + eps);
+
+    const float *qw = q_weight +
+        (per_head_weight ? (size_t)h * head_size : 0);
+    const float *kw = k_weight +
+        (per_head_weight ? (size_t)kvh * head_size : 0);
+    int half_rope = rope_dims / 2;
+    for (int i = tid; i < head_size; i += blockDim.x) {
+        float qv = qh[i] * q_scale * qw[i];
+        float kv = cuda_kv_load(key_cache, k_base + (size_t)i, kv_f16) *
+                   k_scale * kw[i];
+        qrot[i] = qv;
+        kcur[i] = kv;
+    }
+    __syncthreads();
+    for (int i = tid; i < half_rope; i += blockDim.x) {
+        int j = i + half_rope;
+        float angle = (float)pos * freq[i];
+        float s, c;
+        __sincosf(angle, &s, &c);
+        float q0 = qrot[i], q1 = qrot[j];
+        float k0 = kcur[i], k1 = kcur[j];
+        qrot[i] = q0 * c - q1 * s;
+        qrot[j] = q0 * s + q1 * c;
+        kcur[i] = k0 * c - k1 * s;
+        kcur[j] = k0 * s + k1 * c;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < head_size; i += blockDim.x)
+        cuda_kv_store(key_cache, k_base + (size_t)i, kcur[i], kv_f16);
+    __syncthreads();
+
+    for (int t = tid; t < n_kv; t += blockDim.x) {
+        size_t koff = (size_t)loff + (size_t)t * kv_dim +
+                      (size_t)kvh * head_size;
+        float score = 0.0f;
+        for (int i = 0; i < head_size; i++) {
+            float kval = (t == cache_pos)
+                ? kcur[i]
+                : cuda_kv_load(key_cache, koff + (size_t)i, kv_f16);
+            score += qrot[i] * kval;
+        }
+        scores[t] = score * inv_sqrt_hs;
+    }
+    __syncthreads();
+
+    float local_max = -INFINITY;
+    for (int t = tid; t < n_kv; t += blockDim.x)
+        local_max = fmaxf(local_max, scores[t]);
+    float max_score = cuda_block_reduce_max_all(local_max, scratch);
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < n_kv; t += blockDim.x) {
+        float p = __expf(scores[t] - max_score);
+        scores[t] = p;
+        local_sum += p;
+    }
+    float inv_sum = 1.0f / cuda_block_reduce_sum_all(local_sum, scratch);
+
+    for (int i = tid; i < head_size; i += blockDim.x) {
+        float sum = 0.0f;
+        for (int t = 0; t < n_kv; t++) {
+            size_t voff = (size_t)loff + (size_t)t * kv_dim +
+                          (size_t)kvh * head_size;
+            sum += scores[t] * inv_sum *
+                   cuda_kv_load(value_cache, voff + (size_t)i, kv_f16);
+        }
+        out[(size_t)h * head_size + i] = sum;
+    }
+}
+
 static __global__ void matvec_batch_kernel(float *out,
                                            const BnCudaDeviceOp *ops,
                                            int n_ops,
@@ -7286,7 +7395,53 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             if (!w || !w->data || !in || n_heads <= 0 || head_size <= 0)
                 return -1;
             const BnGPUOp *after_next = (i + 2 < n_ops) ? &ops[i + 2] : NULL;
-            if (next && after_next &&
+            const BnGPUOp *flash = (i + 3 < n_ops) ? &ops[i + 3] : NULL;
+            if (graph_exec && next && after_next && flash &&
+                getenv("BN_CUDA_DISABLE_QK_NORM_ROPE_FLASH_FUSE") == NULL &&
+                op->buf_in == BN_GPU_VALUE_Q &&
+                next->op_code == BN_GPU_CODE_PER_HEAD_RMSNORM &&
+                next->buf_in == BN_GPU_VALUE_KEY_CACHE &&
+                after_next->op_code == BN_GPU_CODE_ROPE_QK &&
+                after_next->buf_in == BN_GPU_VALUE_Q &&
+                after_next->buf_aux == BN_GPU_VALUE_KEY_CACHE &&
+                flash->op_code == BN_GPU_CODE_FLASH_ATTN &&
+                flash->buf_in == BN_GPU_VALUE_Q &&
+                (int)next->p[0] == head_size &&
+                (int)next->p[1] == (int)op->p[1] &&
+                (int)next->p[2] == (int)op->p[2] &&
+                (int)after_next->p[0] == n_heads &&
+                (int)after_next->p[1] == head_size &&
+                (int)after_next->p[3] > 0 &&
+                (int)after_next->p[4] == next->rows &&
+                (size_t)after_next->p[5] == (size_t)next->p[3] &&
+                (int)flash->p[0] == n_heads &&
+                (int)flash->p[1] == head_size &&
+                (int)flash->p[3] > 0 &&
+                (int)flash->p[4] > 0 &&
+                (int)flash->p[5] > 0) {
+                BnCudaBuffer *kw = (BnCudaBuffer *)next->W_buf;
+                float *out = cuda_act(ctx, flash->buf_out);
+                float *key = cuda_act(ctx, BN_GPU_VALUE_KEY_CACHE);
+                void *value = cuda_act(ctx, BN_GPU_VALUE_VALUE_CACHE);
+                float *freq = cuda_act(ctx, BN_GPU_VALUE_ROPE_FREQ);
+                if (!kw || !kw->data || !out || !key || !value || !freq ||
+                    !ctx->d_runtime)
+                    return -1;
+                size_t shared = (size_t)((int)flash->p[5] + threads +
+                                         2 * head_size) * sizeof(float);
+                BN_CUDA_LAUNCH_STATIC(
+                    ctx, qk_norm_rope_flash_runtime_kernel,
+                    n_heads, threads, shared,
+                    out, in, key, value, freq,
+                    (const float *)w->data, (const float *)kw->data,
+                    n_heads, next->rows, head_size, (int)flash->p[3],
+                    (int)flash->p[4], (int)flash->p[5], flash->p[6],
+                    cuda_u32_to_f32(flash->p[7]),
+                    cuda_u32_to_f32(op->p[1]), (int)op->p[2],
+                    (int)after_next->p[3], ctx->kv_f16,
+                    (const BnCudaRuntimeParams *)ctx->d_runtime);
+                i += 3;
+            } else if (next && after_next &&
                 getenv("BN_CUDA_DISABLE_QK_NORM_ROPE_FUSE") == NULL &&
                 op->buf_in == BN_GPU_VALUE_Q &&
                 next->op_code == BN_GPU_CODE_PER_HEAD_RMSNORM &&
