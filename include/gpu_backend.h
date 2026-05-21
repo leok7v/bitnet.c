@@ -204,7 +204,9 @@ struct BnGPUBackend {
 
     // Full dense transformer layer prefill fast path:
     // X + Attention(norm(X)) + FFN(norm(...)), with K/V rows copied back for
-    // the existing CPU-owned session KV cache. Optional CUDA-oriented hook.
+    // the existing CPU-owned session KV cache unless K_out/V_out are NULL. If
+    // K_out/V_out are NULL, CUDA may write directly to backend KV activation
+    // buffers at kv_cache_off using kv_cache_stride rows. Optional hook.
     // CUDA may accept X == NULL to reuse the previous device-resident output,
     // and out == NULL to leave the new output resident for the next layer.
     int (*prefill_dense_layer)(
@@ -225,6 +227,8 @@ struct BnGPUBackend {
                                     int down_type, int act_type,
                                     int qk_norm_per_head, float norm_eps,
                                     int pos0, int rope_dims,
+                                    uint32_t kv_cache_off,
+                                    int kv_cache_stride,
                                     float attention_scale);
 
     // GPU-resident forward pass: execute a backend-private lowered command list

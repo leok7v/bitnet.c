@@ -219,6 +219,69 @@ static int cuda_env_int(const char *name, int fallback) {
     return atoi(env);
 }
 
+enum {
+    BN_CUDA_DENSE_PROF_INPUT_NORM,
+    BN_CUDA_DENSE_PROF_QK,
+    BN_CUDA_DENSE_PROF_WV,
+    BN_CUDA_DENSE_PROF_QK_ROPE,
+    BN_CUDA_DENSE_PROF_ATTN,
+    BN_CUDA_DENSE_PROF_WO_RESID,
+    BN_CUDA_DENSE_PROF_FFN_NORM,
+    BN_CUDA_DENSE_PROF_GATEUP,
+    BN_CUDA_DENSE_PROF_ACT,
+    BN_CUDA_DENSE_PROF_DOWN_RESID,
+    BN_CUDA_DENSE_PROF_KV_READBACK,
+    BN_CUDA_DENSE_PROF_OUT_READBACK,
+    BN_CUDA_DENSE_PROF_MAX
+};
+
+static const char *cuda_dense_profile_name(int code) {
+    switch (code) {
+    case BN_CUDA_DENSE_PROF_INPUT_NORM: return "input_norm";
+    case BN_CUDA_DENSE_PROF_QK: return "qk";
+    case BN_CUDA_DENSE_PROF_WV: return "wv";
+    case BN_CUDA_DENSE_PROF_QK_ROPE: return "qk_rope";
+    case BN_CUDA_DENSE_PROF_ATTN: return "attn";
+    case BN_CUDA_DENSE_PROF_WO_RESID: return "wo_resid";
+    case BN_CUDA_DENSE_PROF_FFN_NORM: return "ffn_norm";
+    case BN_CUDA_DENSE_PROF_GATEUP: return "gateup";
+    case BN_CUDA_DENSE_PROF_ACT: return "act";
+    case BN_CUDA_DENSE_PROF_DOWN_RESID: return "down_resid";
+    case BN_CUDA_DENSE_PROF_KV_READBACK: return "kv_store";
+    case BN_CUDA_DENSE_PROF_OUT_READBACK: return "out_readback";
+    default: return "unknown";
+    }
+}
+
+static void cuda_dense_profile_add(double *totals, int code, double ms) {
+    if (code >= 0 && code < BN_CUDA_DENSE_PROF_MAX)
+        totals[code] += ms;
+}
+
+static void cuda_dense_profile_maybe_print(double *totals,
+                                           unsigned long long *layers,
+                                           int n_tokens, int dim) {
+    (*layers)++;
+    int every = cuda_env_int("BN_CUDA_PREFILL_DENSE_PROFILE_EVERY", 0);
+    if (every <= 0) every = 36;
+    if ((*layers % (unsigned long long)every) != 0)
+        return;
+    double sum = 0.0;
+    for (int i = 0; i < BN_CUDA_DENSE_PROF_MAX; i++)
+        sum += totals[i];
+    fprintf(stderr,
+            "[bn:gpu:cuda:dense-prefill] layers=%llu window=%d tokens=%d dim=%d total=%.3fms\n",
+            *layers, every, n_tokens, dim, sum);
+    for (int i = 0; i < BN_CUDA_DENSE_PROF_MAX; i++) {
+        if (totals[i] <= 0.0) continue;
+        fprintf(stderr,
+                "[bn:gpu:cuda:dense-prefill]   %-12s %.3fms %.1f%%\n",
+                cuda_dense_profile_name(i), totals[i],
+                sum > 0.0 ? (totals[i] * 100.0 / sum) : 0.0);
+        totals[i] = 0.0;
+    }
+}
+
 static __device__ float cuda_fp16_to_fp32(uint16_t h) {
     uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
     uint32_t exp = ((uint32_t)h >> 10) & 0x1fu;
@@ -3180,6 +3243,21 @@ static __global__ void rope_kernel(float *q, float *k, const float *freq,
     }
 }
 
+static __global__ void prefill_write_kv_cache_kernel(
+        float *key_cache, float *value_cache, const float *k, const float *v,
+        int n_tokens, int kv_dim, int kv_cache_stride,
+        uint32_t kv_cache_off) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_tokens * kv_dim;
+    if (idx >= total) return;
+    int t = idx / kv_dim;
+    int d = idx - t * kv_dim;
+    size_t dst = (size_t)kv_cache_off + (size_t)t * kv_cache_stride +
+                 (size_t)d;
+    key_cache[dst] = k[idx];
+    value_cache[dst] = v[idx];
+}
+
 static __global__ void gqa_scores_kernel(float *att, const float *q,
                                          const void *key_cache,
                                          int n_heads, int head_size,
@@ -5905,7 +5983,8 @@ static int cuda_prefill_dense_layer(
         int kv_mul, int kv_dim, int qk_rows, int qk_type, int wv_rows,
         int wv_type, int wo_rows, int wo_cols, int wo_type, int gate_type,
         int up_type, int down_type, int act_type, int qk_norm_per_head,
-        float norm_eps, int pos0, int rope_dims, float attention_scale) {
+        float norm_eps, int pos0, int rope_dims, uint32_t kv_cache_off,
+        int kv_cache_stride, float attention_scale) {
     BnCudaCtx *ctx = (BnCudaCtx *)vctx;
     BnCudaBuffer *qk = (BnCudaBuffer *)qk_buf;
     BnCudaBuffer *wv = (BnCudaBuffer *)wv_buf;
@@ -5923,15 +6002,21 @@ static int cuda_prefill_dense_layer(
     if (!ctx || !qk || !qk->data || !wv || !wv->data ||
         !wo || !wo->data || !gate || !gate->data || !down || !down->data ||
         !attn_norm || !attn_norm->data || !ffn_norm || !ffn_norm->data ||
-        !K_out || !V_out || n_tokens <= 1 || dim <= 0 ||
+        n_tokens <= 1 || dim <= 0 ||
         hidden_dim <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
         head_size <= 0 || kv_mul <= 0 || kv_dim <= 0 ||
+        kv_cache_stride < kv_dim ||
         n_heads / kv_mul != n_kv_heads || act_type != 0 ||
         qk_rows != n_heads * head_size + kv_dim || wv_rows != kv_dim ||
         wo_cols != n_heads * head_size || wo->rows != wo_rows ||
         wo->cols != wo_cols || down->rows != dim ||
         down->cols != hidden_dim || pos0 != 0 || rope_dims <= 0 ||
         !ctx->act_bufs[BN_GPU_VALUE_ROPE_FREQ])
+        return -1;
+    if ((!K_out || !V_out) &&
+        (K_out || V_out ||
+         !ctx->act_bufs[BN_GPU_VALUE_KEY_CACHE] ||
+         !ctx->act_bufs[BN_GPU_VALUE_VALUE_CACHE]))
         return -1;
     if ((!stacked_gateup &&
          (!up || !up->data || gate->rows != hidden_dim ||
@@ -5954,6 +6039,26 @@ static int cuda_prefill_dense_layer(
         return -1;
     if (getenv("BN_CUDA_DISABLE_PREFILL_GEMM_ATTN"))
         return -1;
+
+    const int dense_profile = getenv("BN_CUDA_PREFILL_DENSE_PROFILE") != NULL;
+    static double dense_profile_totals[BN_CUDA_DENSE_PROF_MAX] = {0.0};
+    static unsigned long long dense_profile_layers = 0;
+    double dense_profile_t0 = dense_profile ? cuda_wall_ms() : 0.0;
+#define BN_CUDA_DENSE_PROFILE_STEP(code_) do {                         \
+        if (dense_profile) {                                           \
+            cudaError_t profile_err__ = cudaDeviceSynchronize();       \
+            double profile_now__ = cuda_wall_ms();                     \
+            if (profile_err__ != cudaSuccess) {                        \
+                fprintf(stderr,                                        \
+                        "[bn:gpu:cuda] dense prefill profile sync failed: %s\n", \
+                        cudaGetErrorString(profile_err__));            \
+                return -1;                                             \
+            }                                                          \
+            cuda_dense_profile_add(dense_profile_totals, (code_),      \
+                                   profile_now__ - dense_profile_t0);  \
+            dense_profile_t0 = profile_now__;                          \
+        }                                                              \
+    } while (0)
 
     int q_dim = n_heads * head_size;
     size_t dim_values = (size_t)n_tokens * (size_t)dim;
@@ -6018,11 +6123,15 @@ static int cuda_prefill_dense_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_INPUT_NORM);
     if (cuda_matmul_device_out(ctx, d_qk, qk, d_attn_norm, qk_rows, dim,
-                               n_tokens, qk_type) != 0 ||
-        cuda_matmul_device_out(ctx, d_v, wv, d_attn_norm, wv_rows, dim,
+                               n_tokens, qk_type) != 0)
+        return -1;
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_QK);
+    if (cuda_matmul_device_out(ctx, d_v, wv, d_attn_norm, wv_rows, dim,
                                n_tokens, wv_type) != 0)
         return -1;
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_WV);
 
     int total_qk = n_tokens * (q_dim + kv_dim);
     int blocks = (total_qk + threads - 1) / threads;
@@ -6050,12 +6159,14 @@ static int cuda_prefill_dense_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_QK_ROPE);
 
     if (cuda_prefill_attention_gemm(ctx, ctx->d_x, d_q, d_k, d_v, d_scores,
                                     n_tokens, n_heads, n_kv_heads,
                                     head_size, kv_mul, kv_dim,
                                     attention_scale) != 0)
         return -1;
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_ATTN);
     if (cuda_matmul_device_out(ctx, ctx->d_out, wo, ctx->d_x, wo_rows,
                                wo_cols, n_tokens, wo_type) != 0)
         return -1;
@@ -6068,6 +6179,7 @@ static int cuda_prefill_dense_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_WO_RESID);
     err = cudaMemcpy(d_ffn_residual, ctx->d_out, dim_values * sizeof(float),
                      cudaMemcpyDeviceToDevice);
     if (err != cudaSuccess) {
@@ -6086,6 +6198,7 @@ static int cuda_prefill_dense_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_FFN_NORM);
     if (stacked_gateup) {
         if (cuda_matmul_device_out(ctx, d_gateup, gate, d_ffn_norm,
                                    hidden_dim * 2, dim, n_tokens,
@@ -6100,6 +6213,7 @@ static int cuda_prefill_dense_layer(
                                    up_type) != 0)
             return -1;
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_GATEUP);
 
     int act_total = n_tokens * hidden_dim;
     blocks = (act_total + threads - 1) / threads;
@@ -6116,6 +6230,7 @@ static int cuda_prefill_dense_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_ACT);
     if (cuda_matmul_device_out(ctx, ctx->d_out, down, d_ffn_act, dim,
                                hidden_dim, n_tokens, down_type) != 0)
         return -1;
@@ -6128,16 +6243,33 @@ static int cuda_prefill_dense_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_DOWN_RESID);
 
     size_t kv_bytes = kv_values * sizeof(float);
-    err = cudaMemcpy(K_out, d_k, kv_bytes, cudaMemcpyDeviceToHost);
-    if (err == cudaSuccess)
-        err = cudaMemcpy(V_out, d_v, kv_bytes, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer kv readback failed: %s\n",
-                cudaGetErrorString(err));
-        return -1;
+    if (K_out && V_out) {
+        err = cudaMemcpy(K_out, d_k, kv_bytes, cudaMemcpyDeviceToHost);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(V_out, d_v, kv_bytes, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill dense layer kv readback failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+    } else {
+        int kv_total = n_tokens * kv_dim;
+        int kv_blocks = (kv_total + threads - 1) / threads;
+        prefill_write_kv_cache_kernel<<<kv_blocks, threads>>>(
+            cuda_act(ctx, BN_GPU_VALUE_KEY_CACHE),
+            cuda_act(ctx, BN_GPU_VALUE_VALUE_CACHE), d_k, d_v, n_tokens,
+            kv_dim, kv_cache_stride, kv_cache_off);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill dense layer kv write failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
     }
+    BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_KV_READBACK);
     if (out) {
         size_t out_bytes = dim_values * sizeof(float);
         if (cuda_ensure_host_out(ctx, out_bytes) != 0)
@@ -6150,7 +6282,12 @@ static int cuda_prefill_dense_layer(
             return -1;
         }
         memcpy(out, ctx->h_out, out_bytes);
+        BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_OUT_READBACK);
     }
+    if (dense_profile)
+        cuda_dense_profile_maybe_print(dense_profile_totals,
+                                       &dense_profile_layers, n_tokens, dim);
+#undef BN_CUDA_DENSE_PROFILE_STEP
     return 0;
 }
 

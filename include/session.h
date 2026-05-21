@@ -16,6 +16,7 @@ struct BnSession {
     SHArena *arena;            // owns all session buffer memory
     BnBackendSession *backend; // per-request backend state
     int pos;                   // generation position
+    int gpu_kv_direct_valid;   // prefill wrote current KV window directly to GPU
 };
 typedef struct BnSession BnSession;
 

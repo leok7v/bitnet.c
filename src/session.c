@@ -75,6 +75,7 @@ BnSession *bn_session_create(const BnModel *model, BnAllocator *alloc) {
     }
 
     s->pos = 0;
+    s->gpu_kv_direct_valid = 0;
     return s;
 }
 
@@ -147,4 +148,5 @@ void bn_session_reset(BnSession *s, const BnModel *model) {
     }
 
     s->pos = 0;
+    s->gpu_kv_direct_valid = 0;
 }
