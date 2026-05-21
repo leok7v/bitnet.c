@@ -5880,7 +5880,9 @@ static int cuda_prefill_qkv_attention_wo_impl(
     if (attn_norm && (!attn_norm->data ||
                       attn_norm->rows * attn_norm->cols < dim))
         return -1;
-    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64);
+    int min_tokens = getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS")
+        ? cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64)
+        : (dim >= 2048 ? 16 : 64);
     if (n_tokens < min_tokens || n_tokens > 2048)
         return -1;
 
@@ -6143,7 +6145,9 @@ static int cuda_prefill_dense_layer(
         (!stacked_gateup && !cuda_type_supported(up_type)) ||
         !cuda_type_supported(down_type))
         return -1;
-    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64);
+    int min_tokens = getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS")
+        ? cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64)
+        : (dim >= 2048 ? 16 : 64);
     if (n_tokens < min_tokens || n_tokens > 512)
         return -1;
     if (getenv("BN_CUDA_DISABLE_PREFILL_GEMM_ATTN"))

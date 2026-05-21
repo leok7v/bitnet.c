@@ -285,6 +285,8 @@ static int prefill_dense_ffn_gpu_batch(const BnModel *m,
 }
 
 static int prefill_gpu_attention_min_tokens(void);
+static int prefill_dense_chain_min_tokens(const BnConfig *c,
+                                          const BnGPUBackend *gpu);
 
 static int prefill_dense_layer_gpu_batch(const BnModel *m,
                                          float *out,
@@ -371,7 +373,7 @@ static int prefill_dense_layer_chain_ready(const BnModel *m,
     const BnConfig *c = &m->config;
     if (!gpu || !gpu->prefill_dense_layer || !backend ||
         bn_model_tq_state(m) != NULL ||
-        n_tokens < prefill_gpu_attention_min_tokens() ||
+        n_tokens < prefill_dense_chain_min_tokens(c, gpu) ||
         layer_rope_theta != c->rope_theta ||
         !plan->is_attn || plan->q_gated ||
         lw->moe.router_weight || !c->has_ffn_gate || !lw->ffn.ffn_up.data ||
@@ -670,6 +672,16 @@ static int prefill_gpu_attention_min_tokens(void) {
     if (!env || !*env) return 64;
     int n = atoi(env);
     return n > 0 ? n : 64;
+}
+
+static int prefill_dense_chain_min_tokens(const BnConfig *c,
+                                          const BnGPUBackend *gpu) {
+    const char *env = getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS");
+    if (env && *env)
+        return prefill_gpu_attention_min_tokens();
+    if (gpu && gpu->kind == BN_GPU_BACKEND_CUDA && c && c->dim >= 2048)
+        return 16;
+    return prefill_gpu_attention_min_tokens();
 }
 
 static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
