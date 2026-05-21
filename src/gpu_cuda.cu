@@ -5800,6 +5800,260 @@ static int cuda_prefill_qkv_attention_wo_norm_resid(
         rope_dims, attention_scale, 1);
 }
 
+static int cuda_prefill_dense_layer(
+        void *vctx, float *out, void *qk_buf, void *wv_buf, void *wo_buf,
+        void *gate_buf, void *up_buf, void *down_buf, void *attn_norm_buf,
+        void *ffn_norm_buf, void *q_norm_buf, void *k_norm_buf,
+        const float *X, float *K_out, float *V_out, int n_tokens, int dim,
+        int hidden_dim, int n_heads, int n_kv_heads, int head_size,
+        int kv_mul, int kv_dim, int qk_rows, int qk_type, int wv_rows,
+        int wv_type, int wo_rows, int wo_cols, int wo_type, int gate_type,
+        int up_type, int down_type, int act_type, int qk_norm_per_head,
+        float norm_eps, int pos0, int rope_dims, float attention_scale) {
+    BnCudaCtx *ctx = (BnCudaCtx *)vctx;
+    BnCudaBuffer *qk = (BnCudaBuffer *)qk_buf;
+    BnCudaBuffer *wv = (BnCudaBuffer *)wv_buf;
+    BnCudaBuffer *wo = (BnCudaBuffer *)wo_buf;
+    BnCudaBuffer *gate = (BnCudaBuffer *)gate_buf;
+    BnCudaBuffer *up = (BnCudaBuffer *)up_buf;
+    BnCudaBuffer *down = (BnCudaBuffer *)down_buf;
+    BnCudaBuffer *attn_norm = (BnCudaBuffer *)attn_norm_buf;
+    BnCudaBuffer *ffn_norm = (BnCudaBuffer *)ffn_norm_buf;
+    BnCudaBuffer *q_norm = (BnCudaBuffer *)q_norm_buf;
+    BnCudaBuffer *k_norm = (BnCudaBuffer *)k_norm_buf;
+    int stacked_gateup = up == NULL;
+    if (getenv("BN_CUDA_DISABLE_PREFILL_DENSE_LAYER"))
+        return -1;
+    if (!ctx || !out || !qk || !qk->data || !wv || !wv->data ||
+        !wo || !wo->data || !gate || !gate->data || !down || !down->data ||
+        !attn_norm || !attn_norm->data || !ffn_norm || !ffn_norm->data ||
+        !X || !K_out || !V_out || n_tokens <= 1 || dim <= 0 ||
+        hidden_dim <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_size <= 0 || kv_mul <= 0 || kv_dim <= 0 ||
+        n_heads / kv_mul != n_kv_heads || act_type != 0 ||
+        qk_rows != n_heads * head_size + kv_dim || wv_rows != kv_dim ||
+        wo_cols != n_heads * head_size || wo->rows != wo_rows ||
+        wo->cols != wo_cols || down->rows != dim ||
+        down->cols != hidden_dim || pos0 != 0 || rope_dims <= 0 ||
+        !ctx->act_bufs[BN_GPU_VALUE_ROPE_FREQ])
+        return -1;
+    if ((!stacked_gateup &&
+         (!up || !up->data || gate->rows != hidden_dim ||
+          up->rows != hidden_dim || gate->cols != dim ||
+          up->cols != dim)) ||
+        (stacked_gateup &&
+         (gate->rows != hidden_dim * 2 || gate->cols != dim ||
+          gate_type != up_type)))
+        return -1;
+    if (attn_norm->rows * attn_norm->cols < dim ||
+        ffn_norm->rows * ffn_norm->cols < dim)
+        return -1;
+    if (!cuda_type_supported(qk_type) || !cuda_type_supported(wv_type) ||
+        !cuda_type_supported(wo_type) || !cuda_type_supported(gate_type) ||
+        (!stacked_gateup && !cuda_type_supported(up_type)) ||
+        !cuda_type_supported(down_type))
+        return -1;
+    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64);
+    if (n_tokens < min_tokens || n_tokens > 512)
+        return -1;
+    if (getenv("BN_CUDA_DISABLE_PREFILL_GEMM_ATTN"))
+        return -1;
+
+    int q_dim = n_heads * head_size;
+    size_t dim_values = (size_t)n_tokens * (size_t)dim;
+    size_t q_values = (size_t)n_tokens * (size_t)q_dim;
+    size_t kv_values = (size_t)n_tokens * (size_t)kv_dim;
+    size_t qk_values = (size_t)n_tokens * (size_t)qk_rows;
+    size_t score_values =
+        (size_t)n_heads * (size_t)n_tokens * (size_t)n_tokens;
+    size_t hidden_values = (size_t)n_tokens * (size_t)hidden_dim;
+    size_t gateup_values = hidden_values * 2u;
+    size_t total_values = dim_values + dim_values + q_values +
+                          2u * kv_values + qk_values + score_values +
+                          dim_values + dim_values + hidden_values +
+                          gateup_values;
+    size_t scratch_x_bytes = gateup_values * sizeof(float);
+    size_t scratch_out_bytes = dim_values * sizeof(float);
+    if (cuda_ensure_scratch(ctx, scratch_x_bytes, scratch_out_bytes) != 0)
+        return -1;
+    if (cuda_ensure_prefill(ctx, total_values) != 0)
+        return -1;
+
+    cudaError_t err = cudaMemcpy(ctx->d_out, X,
+                                 dim_values * sizeof(float),
+                                 cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer input upload failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    float *d_orig = ctx->d_prefill;
+    float *d_attn_norm = d_orig + dim_values;
+    float *d_q = d_attn_norm + dim_values;
+    float *d_k = d_q + q_values;
+    float *d_v = d_k + kv_values;
+    float *d_qk = d_v + kv_values;
+    float *d_scores = d_qk + qk_values;
+    float *d_ffn_residual = d_scores + score_values;
+    float *d_ffn_norm = d_ffn_residual + dim_values;
+    float *d_ffn_act = d_ffn_norm + dim_values;
+    float *d_gateup = d_ffn_act + hidden_values;
+
+    err = cudaMemcpy(d_orig, ctx->d_out, dim_values * sizeof(float),
+                     cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer residual copy failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    int threads = 256;
+    int warps = threads / 32;
+    rmsnorm_batch_kernel<<<n_tokens, threads,
+                           (size_t)warps * sizeof(float)>>>(
+        d_attn_norm, ctx->d_out, (const float *)attn_norm->data, dim,
+        n_tokens, norm_eps);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer attn norm failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    if (cuda_matmul_device_out(ctx, d_qk, qk, d_attn_norm, qk_rows, dim,
+                               n_tokens, qk_type) != 0 ||
+        cuda_matmul_device_out(ctx, d_v, wv, d_attn_norm, wv_rows, dim,
+                               n_tokens, wv_type) != 0)
+        return -1;
+
+    int total_qk = n_tokens * (q_dim + kv_dim);
+    int blocks = (total_qk + threads - 1) / threads;
+    split_qk_prefill_kernel<<<blocks, threads>>>(
+        d_qk, d_q, d_k, n_tokens, q_dim, kv_dim, qk_rows);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer qk split failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    const float *q_norm_data = q_norm ? (const float *)q_norm->data : NULL;
+    const float *k_norm_data = k_norm ? (const float *)k_norm->data : NULL;
+    qk_prefill_rmsnorm_rope_kernel<<<dim3(n_heads + n_kv_heads, n_tokens, 1),
+                                     threads,
+                                     (size_t)threads * sizeof(float)>>>(
+        d_q, d_k, q_norm_data, k_norm_data,
+        cuda_act(ctx, BN_GPU_VALUE_ROPE_FREQ), n_tokens, pos0,
+        n_heads, n_kv_heads, head_size, norm_eps, qk_norm_per_head,
+        rope_dims);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer qk norm/rope failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    if (cuda_prefill_attention_gemm(ctx, ctx->d_x, d_q, d_k, d_v, d_scores,
+                                    n_tokens, n_heads, n_kv_heads,
+                                    head_size, kv_mul, kv_dim,
+                                    attention_scale) != 0)
+        return -1;
+    if (cuda_matmul_device_out(ctx, ctx->d_out, wo, ctx->d_x, wo_rows,
+                               wo_cols, n_tokens, wo_type) != 0)
+        return -1;
+    blocks = ((int)dim_values + threads - 1) / threads;
+    residual_add_kernel<<<blocks, threads>>>(ctx->d_out, d_orig,
+                                             (int)dim_values);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer attn residual failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    err = cudaMemcpy(d_ffn_residual, ctx->d_out, dim_values * sizeof(float),
+                     cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer ffn residual copy failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    rmsnorm_batch_kernel<<<n_tokens, threads,
+                           (size_t)warps * sizeof(float)>>>(
+        d_ffn_norm, ctx->d_out, (const float *)ffn_norm->data, dim,
+        n_tokens, norm_eps);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer ffn norm failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    if (stacked_gateup) {
+        if (cuda_matmul_device_out(ctx, d_gateup, gate, d_ffn_norm,
+                                   hidden_dim * 2, dim, n_tokens,
+                                   gate_type) != 0)
+            return -1;
+    } else {
+        if (cuda_matmul_device_out(ctx, d_gateup, gate, d_ffn_norm,
+                                   hidden_dim, dim, n_tokens,
+                                   gate_type) != 0 ||
+            cuda_matmul_device_out(ctx, d_gateup + hidden_values, up,
+                                   d_ffn_norm, hidden_dim, dim, n_tokens,
+                                   up_type) != 0)
+            return -1;
+    }
+
+    int act_total = n_tokens * hidden_dim;
+    blocks = (act_total + threads - 1) / threads;
+    if (stacked_gateup) {
+        ffn_activation_batch_stacked_kernel<<<blocks, threads>>>(
+            d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
+    } else {
+        ffn_activation_batch_kernel<<<blocks, threads>>>(
+            d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
+    }
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer ffn activation failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    if (cuda_matmul_device_out(ctx, ctx->d_out, down, d_ffn_act, dim,
+                               hidden_dim, n_tokens, down_type) != 0)
+        return -1;
+    blocks = ((int)dim_values + threads - 1) / threads;
+    residual_add_kernel<<<blocks, threads>>>(ctx->d_out, d_ffn_residual,
+                                             (int)dim_values);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer ffn residual failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    size_t kv_bytes = kv_values * sizeof(float);
+    err = cudaMemcpy(K_out, d_k, kv_bytes, cudaMemcpyDeviceToHost);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(V_out, d_v, kv_bytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer kv readback failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    size_t out_bytes = dim_values * sizeof(float);
+    if (cuda_ensure_host_out(ctx, out_bytes) != 0)
+        return -1;
+    err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer output readback failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    memcpy(out, ctx->h_out, out_bytes);
+    return 0;
+}
+
 static float cuda_u32_to_f32(uint32_t bits) {
     float out;
     memcpy(&out, &bits, sizeof(out));
@@ -7512,6 +7766,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->prefill_qkv_attention_wo_norm = cuda_prefill_qkv_attention_wo_norm;
     gpu->prefill_qkv_attention_wo_norm_resid =
         cuda_prefill_qkv_attention_wo_norm_resid;
+    gpu->prefill_dense_layer = cuda_prefill_dense_layer;
     gpu->init_activations = cuda_init_activations;
     gpu->free_activations = cuda_free_activations;
     gpu->write_activation = cuda_write_activation;

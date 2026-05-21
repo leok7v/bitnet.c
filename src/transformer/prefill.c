@@ -284,6 +284,78 @@ static int prefill_dense_ffn_gpu_batch(const BnModel *m,
         lw->ffn.ffn_down.type, act_type);
 }
 
+static int prefill_dense_layer_gpu_batch(const BnModel *m,
+                                         float *out,
+                                         const BnLayerWeights *lw,
+                                         const float *X,
+                                         float *K_out,
+                                         float *V_out,
+                                         int n_tokens,
+                                         int dim,
+                                         int hidden_dim,
+                                         int n_heads,
+                                         int n_kv_heads,
+                                         int head_size,
+                                         int kv_mul,
+                                         int kv_dim,
+                                         int rope_dims,
+                                         int layer,
+                                         int pos0,
+                                         float attention_scale) {
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    const BnBackendModel *backend = bn_model_backend(m);
+    if (!gpu || !gpu->prefill_dense_layer || !backend ||
+        !lw->attn.wq.data || !lw->attn.wk.data || !lw->attn.wv.data ||
+        !lw->attn.wo.data || !lw->ffn.ffn_gate.data ||
+        !lw->ffn.ffn_up.data || !lw->ffn.ffn_down.data)
+        return -1;
+
+    void *qk_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_QK_STACKED);
+    void *wv_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_WV_PREFILL);
+    if (!wv_buf)
+        wv_buf = prefill_qweight_backend_buf(backend, &lw->attn.wv);
+    void *wo_buf = prefill_backend_role_or_qweight(
+        backend, layer, BN_BACKEND_HANDLE_WO_PREFILL, &lw->attn.wo);
+    void *gateup_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_GATEUP_STACKED);
+    void *gate_buf = NULL;
+    void *up_buf = NULL;
+    if (gateup_buf && lw->ffn.ffn_gate.type == lw->ffn.ffn_up.type) {
+        gate_buf = gateup_buf;
+    } else {
+        gate_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_gate);
+        up_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_up);
+    }
+    void *down_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_down);
+    if (!down_buf)
+        down_buf = bn_backend_model_handle(
+            backend, layer, BN_BACKEND_HANDLE_FFN_DOWN_PREFILL);
+    void *attn_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_ATTN_NORM);
+    void *ffn_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_FFN_NORM);
+    void *q_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_Q_NORM);
+    void *k_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_K_NORM);
+    if (!qk_buf || !wv_buf || !wo_buf || !gate_buf || !down_buf ||
+        !attn_norm_buf || !ffn_norm_buf)
+        return -1;
+
+    return gpu->prefill_dense_layer(
+        gpu->ctx, out, qk_buf, wv_buf, wo_buf, gate_buf, up_buf, down_buf,
+        attn_norm_buf, ffn_norm_buf, q_norm_buf, k_norm_buf, X, K_out, V_out,
+        n_tokens, dim, hidden_dim, n_heads, n_kv_heads, head_size, kv_mul,
+        kv_dim, lw->attn.wq.rows + lw->attn.wk.rows, lw->attn.wq.type,
+        lw->attn.wv.rows, lw->attn.wv.type, lw->attn.wo.rows,
+        lw->attn.wo.cols, lw->attn.wo.type, lw->ffn.ffn_gate.type,
+        lw->ffn.ffn_up.type, lw->ffn.ffn_down.type, m->config.act_type,
+        m->config.qk_norm_per_head, m->config.norm_eps, pos0, rope_dims,
+        attention_scale);
+}
+
 #ifdef __AVX2__
 static int prefill_quant_can_preq8k_pair(int a, int b) {
     return bn_quant_format_can_preq8k(a) && bn_quant_format_can_preq8k(b);
@@ -687,6 +759,47 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                   layer_rope_dims, layer_rope_theta);
                 rope_cache_dims = layer_rope_dims;
                 rope_cache_theta = layer_rope_theta;
+            }
+            if (bn_model_gpu(m) &&
+                bn_model_tq_state(m) == NULL &&
+                n_tokens >= prefill_gpu_attention_min_tokens() &&
+                pos0 == 0 &&
+                layer_rope_theta == c->rope_theta &&
+                !lw->moe.router_weight &&
+                c->has_ffn_gate &&
+                lw->ffn.ffn_up.data &&
+                !plan.q_gated &&
+                !lw->attn.q_bias && !lw->attn.k_bias && !lw->attn.v_bias &&
+                !lw->norm.attn_sub_norm && !lw->norm.ffn_sub_norm &&
+                !lw->norm.layer_output_scale &&
+                !((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
+                  (lw->norm.attn_post_norm || lw->norm.ffn_post_norm))) {
+                t_prof = prefill_profile_now(&prof);
+                if (prefill_dense_layer_gpu_batch(
+                        m, act, lw, act, K_new, V_new, n_tokens, dim,
+                        hidden_dim, c->n_heads, layer_n_kv_heads,
+                        layer_head_size, layer_kv_mul, layer_kv_dim,
+                        layer_rope_dims, l, pos0,
+                        prefill_attention_scale(c, layer_head_size)) == 0) {
+                    prefill_profile_add(&prof.qkv_ms, t_prof);
+                    int attn_idx = plan.attn_idx;
+                    size_t loff = (size_t)attn_idx * c->seq_len * kv_dim;
+                    for (int t = 0; t < n_tokens; t++) {
+                        int pos = pos0 + t;
+                        int cache_pos = pos % c->seq_len;
+                        float *k_t = K_new + (size_t)t * layer_kv_dim;
+                        float *v_t = V_new + (size_t)t * layer_kv_dim;
+                        if (c->kv_f16)
+                            bn_transformer_write_kv_fp16(s, loff, cache_pos,
+                                                         kv_dim, k_t, v_t,
+                                                         layer_kv_dim);
+                        else
+                            bn_transformer_write_kv_fp32(s, loff, cache_pos,
+                                                         kv_dim, k_t, v_t,
+                                                         layer_kv_dim);
+                    }
+                    continue;
+                }
             }
             int q_read_stride = lw->attn.wq.rows;
             int attn_idx = plan.attn_idx;

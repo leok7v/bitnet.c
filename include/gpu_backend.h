@@ -202,6 +202,29 @@ struct BnGPUBackend {
                                     int pos0, int rope_dims,
                                     float attention_scale);
 
+    // Full dense transformer layer prefill fast path:
+    // X + Attention(norm(X)) + FFN(norm(...)), with K/V rows copied back for
+    // the existing CPU-owned session KV cache. Optional CUDA-oriented hook.
+    int (*prefill_dense_layer)(
+                                    void *ctx, float *out,
+                                    void *qk_buf, void *wv_buf, void *wo_buf,
+                                    void *gate_buf, void *up_buf,
+                                    void *down_buf, void *attn_norm_buf,
+                                    void *ffn_norm_buf,
+                                    void *q_norm_buf, void *k_norm_buf,
+                                    const float *X, float *K_out,
+                                    float *V_out, int n_tokens, int dim,
+                                    int hidden_dim, int n_heads,
+                                    int n_kv_heads, int head_size,
+                                    int kv_mul, int kv_dim, int qk_rows,
+                                    int qk_type, int wv_rows, int wv_type,
+                                    int wo_rows, int wo_cols, int wo_type,
+                                    int gate_type, int up_type,
+                                    int down_type, int act_type,
+                                    int qk_norm_per_head, float norm_eps,
+                                    int pos0, int rope_dims,
+                                    float attention_scale);
+
     // GPU-resident forward pass: execute a backend-private lowered command list
     // as a single submission. All intermediate buffers stay on GPU. Only
     // readback_buf is copied to out_host.
