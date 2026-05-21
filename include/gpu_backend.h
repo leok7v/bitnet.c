@@ -231,6 +231,25 @@ struct BnGPUBackend {
                                     int kv_cache_stride,
                                     float attention_scale);
 
+    // Hybrid/SSM prompt block fast path:
+    // out[n_tokens, dim] = X + ssm_out(SSM(norm(X))). Backend owns and updates
+    // its resident SSM recurrent state. Optional CUDA-oriented hook.
+    int (*prefill_ssm_layer)(
+                                    void *ctx, float *out,
+                                    void *wqkv_buf, void *wz_buf,
+                                    void *alpha_buf, void *beta_buf,
+                                    void *ssm_out_buf, void *attn_norm_buf,
+                                    void *conv1d_buf, void *dt_bias_buf,
+                                    void *a_log_buf, void *ssm_norm_buf,
+                                    const float *X, int n_tokens, int dim,
+                                    int qkv_dim, int inner_dim,
+                                    int num_k_heads, int head_k_dim,
+                                    int num_v_heads, int head_v_dim,
+                                    int conv_kernel, int ssm_idx,
+                                    int wqkv_type, int wz_type,
+                                    int alpha_type, int beta_type,
+                                    int out_type, float norm_eps);
+
     // GPU-resident forward pass: execute a backend-private lowered command list
     // as a single submission. All intermediate buffers stay on GPU. Only
     // readback_buf is copied to out_host.

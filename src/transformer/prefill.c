@@ -455,6 +455,59 @@ static int prefill_dense_layer_chain_ready(const BnModel *m,
            down_buf && attn_norm_buf && ffn_norm_buf;
 }
 
+static int prefill_ssm_layer_gpu(const BnModel *m,
+                                 float *out,
+                                 const BnLayerWeights *lw,
+                                 const float *X,
+                                 int n_tokens,
+                                 int dim,
+                                 int qkv_dim,
+                                 int inner_dim,
+                                 int num_k_heads,
+                                 int head_k_dim,
+                                 int num_v_heads,
+                                 int head_v_dim,
+                                 int conv_kernel,
+                                 int ssm_idx,
+                                 int layer,
+                                 float norm_eps) {
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    const BnBackendModel *backend = bn_model_backend(m);
+    if (!gpu || !gpu->prefill_ssm_layer || !backend || !out || !lw || !X ||
+        !lw->ssm.wqkv.data || !lw->ssm.wz.data ||
+        !lw->ssm.ssm_alpha.data || !lw->ssm.ssm_beta.data ||
+        !lw->ssm.ssm_out.data || !lw->norm.attn_norm ||
+        !lw->ssm.ssm_conv1d || !lw->ssm.ssm_dt_bias ||
+        !lw->ssm.ssm_a || !lw->ssm.ssm_norm)
+        return -1;
+    void *wqkv_buf = prefill_qweight_backend_buf(backend, &lw->ssm.wqkv);
+    void *wz_buf = prefill_qweight_backend_buf(backend, &lw->ssm.wz);
+    void *alpha_buf = prefill_qweight_backend_buf(backend, &lw->ssm.ssm_alpha);
+    void *beta_buf = prefill_qweight_backend_buf(backend, &lw->ssm.ssm_beta);
+    void *out_buf = prefill_qweight_backend_buf(backend, &lw->ssm.ssm_out);
+    void *attn_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_ATTN_NORM);
+    void *conv1d_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_CONV1D);
+    void *dt_bias_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_DT_BIAS);
+    void *a_log_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_A_LOG);
+    void *ssm_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_NORM);
+    if (!wqkv_buf || !wz_buf || !alpha_buf || !beta_buf || !out_buf ||
+        !attn_norm_buf || !conv1d_buf || !dt_bias_buf || !a_log_buf ||
+        !ssm_norm_buf)
+        return -1;
+    return gpu->prefill_ssm_layer(
+        gpu->ctx, out, wqkv_buf, wz_buf, alpha_buf, beta_buf, out_buf,
+        attn_norm_buf, conv1d_buf, dt_bias_buf, a_log_buf, ssm_norm_buf,
+        X, n_tokens, dim, qkv_dim, inner_dim, num_k_heads, head_k_dim,
+        num_v_heads, head_v_dim, conv_kernel, ssm_idx, lw->ssm.wqkv.type,
+        lw->ssm.wz.type, lw->ssm.ssm_alpha.type, lw->ssm.ssm_beta.type,
+        lw->ssm.ssm_out.type, norm_eps);
+}
+
 #ifdef __AVX2__
 static int prefill_quant_can_preq8k_pair(int a, int b) {
     return bn_quant_format_can_preq8k(a) && bn_quant_format_can_preq8k(b);
@@ -1401,6 +1454,14 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             size_t conv_per_layer = (size_t)(kern_ssm - 1) * qkv_dim_ssm;
             float *conv_state = s->ssm_conv_state + (size_t)ssm_idx * conv_per_layer;
 
+            if (prefill_ssm_layer_gpu(m, act, lw, act, n_tokens, dim,
+                                      qkv_dim_ssm, value_dim, num_k_heads,
+                                      head_k_dim, num_v_heads, head_v_dim,
+                                      kern_ssm, ssm_idx, l,
+                                      c->norm_eps) == 0) {
+                goto prefill_ssm_done;
+            }
+
             for (int t = 0; t < n_tokens; t++)
                 prefill_rmsnorm(Xb + (size_t)t * dim, act + (size_t)t * dim,
                                 lw->norm.attn_norm, dim, c->norm_eps);
@@ -1468,6 +1529,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                 for (int d = 0; d < dim; d++)
                     act[(size_t)t * dim + d] += Xb[(size_t)t * dim + d];
         }
+prefill_ssm_done:
 
         if (lw->moe.router_weight) {
             if (bn_moe_forward_batch(m, sess, lw, l, act, Xb, n_tokens) != 0) {
