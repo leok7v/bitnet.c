@@ -5824,10 +5824,10 @@ static int cuda_prefill_dense_layer(
     int stacked_gateup = up == NULL;
     if (getenv("BN_CUDA_DISABLE_PREFILL_DENSE_LAYER"))
         return -1;
-    if (!ctx || !out || !qk || !qk->data || !wv || !wv->data ||
+    if (!ctx || !qk || !qk->data || !wv || !wv->data ||
         !wo || !wo->data || !gate || !gate->data || !down || !down->data ||
         !attn_norm || !attn_norm->data || !ffn_norm || !ffn_norm->data ||
-        !X || !K_out || !V_out || n_tokens <= 1 || dim <= 0 ||
+        !K_out || !V_out || n_tokens <= 1 || dim <= 0 ||
         hidden_dim <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
         head_size <= 0 || kv_mul <= 0 || kv_dim <= 0 ||
         n_heads / kv_mul != n_kv_heads || act_type != 0 ||
@@ -5879,13 +5879,15 @@ static int cuda_prefill_dense_layer(
     if (cuda_ensure_prefill(ctx, total_values) != 0)
         return -1;
 
-    cudaError_t err = cudaMemcpy(ctx->d_out, X,
-                                 dim_values * sizeof(float),
-                                 cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer input upload failed: %s\n",
-                cudaGetErrorString(err));
-        return -1;
+    cudaError_t err = cudaSuccess;
+    if (X) {
+        err = cudaMemcpy(ctx->d_out, X, dim_values * sizeof(float),
+                         cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill dense layer input upload failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
     }
 
     float *d_orig = ctx->d_prefill;
@@ -6040,17 +6042,19 @@ static int cuda_prefill_dense_layer(
                 cudaGetErrorString(err));
         return -1;
     }
-    size_t out_bytes = dim_values * sizeof(float);
-    if (cuda_ensure_host_out(ctx, out_bytes) != 0)
-        return -1;
-    err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
-                     cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[bn:gpu:cuda] prefill dense layer output readback failed: %s\n",
-                cudaGetErrorString(err));
-        return -1;
+    if (out) {
+        size_t out_bytes = dim_values * sizeof(float);
+        if (cuda_ensure_host_out(ctx, out_bytes) != 0)
+            return -1;
+        err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill dense layer output readback failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        memcpy(out, ctx->h_out, out_bytes);
     }
-    memcpy(out, ctx->h_out, out_bytes);
     return 0;
 }
 

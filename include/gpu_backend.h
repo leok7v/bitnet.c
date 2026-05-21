@@ -205,6 +205,8 @@ struct BnGPUBackend {
     // Full dense transformer layer prefill fast path:
     // X + Attention(norm(X)) + FFN(norm(...)), with K/V rows copied back for
     // the existing CPU-owned session KV cache. Optional CUDA-oriented hook.
+    // CUDA may accept X == NULL to reuse the previous device-resident output,
+    // and out == NULL to leave the new output resident for the next layer.
     int (*prefill_dense_layer)(
                                     void *ctx, float *out,
                                     void *qk_buf, void *wv_buf, void *wo_buf,
