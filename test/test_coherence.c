@@ -793,7 +793,7 @@ int main(int argc, char **argv) {
             memcpy(cpu_step_logits + (size_t)i * (size_t)vocab_size,
                    logits, (size_t)vocab_size * sizeof(float));
             memcpy(cpu_step_hidden + (size_t)i * (size_t)model.config.dim,
-                   s->state.x, (size_t)model.config.dim * sizeof(float));
+                   s->state.xb, (size_t)model.config.dim * sizeof(float));
             token = bn_sampler_sample(&sampler, logits);
             cpu_tokens[i] = token;
             if (i + 1 < N_DECODE_STEPS) {
@@ -875,7 +875,7 @@ int main(int argc, char **argv) {
                     memcpy(gpu_step_logits + (size_t)i * (size_t)vocab_size,
                            logits, (size_t)vocab_size * sizeof(float));
                     memcpy(gpu_step_hidden + (size_t)i * (size_t)model.config.dim,
-                           s->state.x, (size_t)model.config.dim * sizeof(float));
+                           s->state.xb, (size_t)model.config.dim * sizeof(float));
                     token = bn_sampler_sample(&sampler, logits);
                     gpu_tokens[i] = token;
                     if (i + 1 < N_DECODE_STEPS) {
@@ -1001,7 +1001,7 @@ int main(int argc, char **argv) {
                     memcpy(gpu_step_logits + (size_t)i * (size_t)vocab_size,
                            logits, (size_t)vocab_size * sizeof(float));
                     memcpy(gpu_step_hidden + (size_t)i * (size_t)model.config.dim,
-                           s->state.x, (size_t)model.config.dim * sizeof(float));
+                           s->state.xb, (size_t)model.config.dim * sizeof(float));
                     token = bn_sampler_sample(&sampler, logits);
                     gpu_tokens[i] = token;
                     if (i + 1 < N_DECODE_STEPS) {
@@ -1120,8 +1120,20 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < N_DECODE_STEPS; i++) {
                     memcpy(gpu_step_logits + (size_t)i * (size_t)vocab_size,
                            logits, (size_t)vocab_size * sizeof(float));
+                    if (gpu->read_activation &&
+                        gpu->read_activation(
+                            gpu->ctx, BN_GPU_BUF_XB, s->state.xb,
+                            (size_t)model.config.dim * sizeof(float), 0) != 0) {
+                        fprintf(stderr, "Failed to read CUDA logits input state\n");
+                        free(gpu_step_logits);
+                        free(gpu_step_hidden);
+                        bn_session_free(s, NULL);
+                        bn_model_release_gpu(&model);
+                        bn_gpu_cuda_destroy(gpu);
+                        return 1;
+                    }
                     memcpy(gpu_step_hidden + (size_t)i * (size_t)model.config.dim,
-                           s->state.x, (size_t)model.config.dim * sizeof(float));
+                           s->state.xb, (size_t)model.config.dim * sizeof(float));
                     token = bn_sampler_sample(&sampler, logits);
                     gpu_tokens[i] = token;
                     if (i + 1 < N_DECODE_STEPS) {
