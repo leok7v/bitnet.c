@@ -1570,6 +1570,8 @@ prefill_ssm_done:
                 if (c->has_ffn_gate && !lw->norm.ffn_sub_norm &&
                     !((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
                       lw->norm.ffn_post_norm) &&
+                    (c->full_attn_interval <= 0 ||
+                     n_tokens >= prefill_gpu_attention_min_tokens()) &&
                     prefill_dense_ffn_gpu_batch(m, Xb, lw, Xb, n_tokens,
                                                 dim, hidden_dim,
                                                 c->act_type, l, NULL,
