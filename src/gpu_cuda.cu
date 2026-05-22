@@ -4894,6 +4894,8 @@ static int cuda_cublas_matmul_f16(BnCudaCtx *ctx, float *d_out,
     if (w->f32_data) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
+        if (ctx->exec_stream)
+            cublasSetStream(ctx->cublas, ctx->exec_stream);
         cublasStatus_t st = cublasSgemm(
             ctx->cublas,
             CUBLAS_OP_T, CUBLAS_OP_N,
@@ -4918,7 +4920,7 @@ static int cuda_cublas_matmul_f16(BnCudaCtx *ctx, float *d_out,
     size_t x_values = (size_t)n_tokens * (size_t)cols;
     int threads = 256;
     int blocks = (int)((x_values + (size_t)threads - 1u) / (size_t)threads);
-    f32_to_f16_kernel<<<blocks, threads>>>(
+    f32_to_f16_kernel<<<blocks, threads, 0, ctx->exec_stream>>>(
         (__half *)ctx->d_x_f16, d_x, x_values);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -4940,7 +4942,7 @@ static int cuda_convert_f32_to_f16(BnCudaCtx *ctx, const float *d_x,
     int threads = 256;
     int blocks = (int)((n_values + (size_t)threads - 1u) /
                        (size_t)threads);
-    f32_to_f16_kernel<<<blocks, threads>>>(
+    f32_to_f16_kernel<<<blocks, threads, 0, ctx->exec_stream>>>(
         (__half *)ctx->d_x_f16, d_x, n_values);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -4961,6 +4963,8 @@ static int cuda_cublas_matmul_f16_preconverted(BnCudaCtx *ctx, float *d_out,
         return -1;
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    if (ctx->exec_stream)
+        cublasSetStream(ctx->cublas, ctx->exec_stream);
     cublasStatus_t st = cublasGemmEx(
         ctx->cublas,
         CUBLAS_OP_T, CUBLAS_OP_N,
