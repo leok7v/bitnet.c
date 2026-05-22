@@ -7438,7 +7438,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
         enable_bias_rope_flash_fuse_flag =
             getenv("BN_CUDA_ENABLE_BIAS_ROPE_FLASH_FUSE") != NULL;
         enable_graph_exec_flag =
-            getenv("BN_CUDA_ENABLE_GRAPH_EXEC") != NULL;
+            getenv("BN_CUDA_ENABLE_GRAPH_EXEC") != NULL ||
+            getenv("BN_CUDA_ENABLE_UNSAFE_MOE_FFN") != NULL;
         enable_q8_preq_all_flag =
             getenv("BN_CUDA_ENABLE_Q8_PREQ") != NULL;
         disable_q8_preq_logits_flag =
