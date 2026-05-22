@@ -808,6 +808,20 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
         return NULL;
     }
 
+    if (c->full_attn_interval > 0 && c->ssm_inner_size > 0 &&
+        !getenv("BN_PREFILL_ALLOW_HYBRID_BATCH")) {
+        float *logits = NULL;
+        for (int t = 0; t < n_tokens; t++) {
+            logits = bn_transformer_forward(m, sess, tokens[t], pos0 + t);
+            if (!logits)
+                return NULL;
+            if (all_logits)
+                memcpy(all_logits + (size_t)t * c->vocab_size, logits,
+                       (size_t)c->vocab_size * sizeof(float));
+        }
+        return need_last_logits ? logits : (logits ? sess->state.x : NULL);
+    }
+
     size_t act_elems = (size_t)n_tokens * dim;
     if (act_elems / n_tokens != (size_t)dim) {
         SH_LOG_ERROR("Prefill activation buffer size overflow");
@@ -1471,8 +1485,33 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             float *Z_all = Xb2;
             float *Out_all = Hb;
 
-            prefill_quant_matmul_gpu(m, QKV_all, &lw->ssm.wqkv, Xb, n_tokens, s->x_q);
-            prefill_quant_matmul_gpu(m, Z_all, &lw->ssm.wz, Xb, n_tokens, s->x_q);
+#ifdef __AVX2__
+            int ssm_preq8k = 0;
+            if (pf_xq && !bn_model_gpu(m) &&
+                prefill_quant_can_preq8k_pair(lw->ssm.wqkv.type,
+                                              lw->ssm.wz.type)) {
+                int n_bpr = dim / BN_QK_K;
+                for (int t = 0; t < n_tokens; t++)
+                    bn_quant_x_to_q8k(Xb + (size_t)t * dim,
+                                      pf_xq + (size_t)t * dim,
+                                      pf_xd + (size_t)t * n_bpr,
+                                      pf_xbs + (size_t)t * n_bpr * 16, dim);
+                {
+                    float *qz_out[2] = { QKV_all, Z_all };
+                    const BnQWeight *qz_w[2] = { &lw->ssm.wqkv, &lw->ssm.wz };
+                    prefill_quant_matmul_preq8k_multi(m, qz_out, qz_w, 2,
+                                                       n_tokens, pf_xq, pf_xd,
+                                                       pf_xbs, Xb);
+                }
+                ssm_preq8k = 1;
+            } else
+#endif
+            {
+                prefill_quant_matmul_gpu(m, QKV_all, &lw->ssm.wqkv, Xb,
+                                         n_tokens, s->x_q);
+                prefill_quant_matmul_gpu(m, Z_all, &lw->ssm.wz, Xb,
+                                         n_tokens, s->x_q);
+            }
 
             for (int t = 0; t < n_tokens; t++) {
                 float *qkv_t = QKV_all + (size_t)t * lw->ssm.wqkv.rows;
@@ -1500,7 +1539,22 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                     { alpha_arr, &lw->ssm.ssm_alpha, NULL, 0 },
                     { beta_arr,  &lw->ssm.ssm_beta, NULL, 0 },
                 };
-                bn_quant_matvec_batch(ab, 2, xb_t, s->x_q, bn_model_pool(m));
+#ifdef __AVX2__
+                if (ssm_preq8k &&
+                    prefill_quant_can_preq8k_pair(lw->ssm.ssm_alpha.type,
+                                                  lw->ssm.ssm_beta.type)) {
+                    int n_bpr = dim / BN_QK_K;
+                    bn_quant_matvec_batch_preq8k(
+                        ab, 2, pf_xq + (size_t)t * dim,
+                        pf_xd + (size_t)t * n_bpr,
+                        pf_xbs + (size_t)t * n_bpr * 16,
+                        xb_t, bn_model_pool(m));
+                } else
+#endif
+                {
+                    bn_quant_matvec_batch(ab, 2, xb_t, s->x_q,
+                                          bn_model_pool(m));
+                }
                 for (int h = 0; h < num_v_heads; h++) {
                     float dt = alpha_arr[h] + lw->ssm.ssm_dt_bias[h];
                     float dt_sp = (dt > 20.0f) ? dt : logf(1.0f + expf(dt));
