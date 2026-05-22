@@ -522,8 +522,11 @@ static int bench_use_gpu_batch_prefill(const BnModel *m) {
     if (getenv("BN_GPU_DISABLE_PREFILL_MATMUL")) return 0;
     if (getenv("BN_GPU_PREFILL_MATMUL")) return 1;
     const BnConfig *c = &m->config;
-    if (c->kv_tq_bits != 0 || c->full_attn_interval > 0)
+    if (c->kv_tq_bits != 0)
         return 0;
+    BnGPUBackend *gpu = bn_model_gpu((BnModel *)m);
+    if (c->full_attn_interval > 0)
+        return gpu && gpu->kind == BN_GPU_BACKEND_CUDA && c->n_experts <= 0;
     if (c->n_experts > 0)
         return 1;
     return c->dim <= 2560;
