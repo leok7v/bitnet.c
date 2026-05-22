@@ -968,6 +968,11 @@ int main(int argc, char **argv) {
         { "wk",   &L->attn.wk },
         { "wv",   &L->attn.wv },
         { "wo",   &L->attn.wo },
+        { "ssm_qkv", &L->ssm.wqkv },
+        { "ssm_z",   &L->ssm.wz },
+        { "ssm_alpha", &L->ssm.ssm_alpha },
+        { "ssm_beta",  &L->ssm.ssm_beta },
+        { "ssm_out", &L->ssm.ssm_out },
         { "up",   &L->ffn.ffn_up },
         { "down",  &L->ffn.ffn_down },
     };

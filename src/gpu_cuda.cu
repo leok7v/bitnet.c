@@ -3512,6 +3512,165 @@ static __global__ void ssm_gate_kernel(
     }
 }
 
+static __global__ void ssm_prefill_conv_silu_kernel(
+    float *qkv, float *conv_state, const float *conv1d_w,
+    int qkv_dim, int kern, int n_tokens, size_t conv_off) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= qkv_dim || kern < 2) return;
+    float hist[7];
+    int hist_n = kern - 1;
+    if (hist_n > 7) return;
+    for (int k = 0; k < hist_n; k++)
+        hist[k] = conv_state[conv_off + (size_t)k * qkv_dim + ch];
+    for (int t = 0; t < n_tokens; t++) {
+        float cur = qkv[(size_t)t * qkv_dim + ch];
+        float sum = cur * conv1d_w[(size_t)ch * kern + (kern - 1)];
+        for (int k = 0; k < hist_n; k++)
+            sum += hist[k] * conv1d_w[(size_t)ch * kern + k];
+        for (int k = 0; k < hist_n - 1; k++)
+            hist[k] = hist[k + 1];
+        hist[hist_n - 1] = cur;
+        qkv[(size_t)t * qkv_dim + ch] = sum / (1.0f + expf(-sum));
+    }
+    for (int k = 0; k < hist_n; k++)
+        conv_state[conv_off + (size_t)k * qkv_dim + ch] = hist[k];
+}
+
+static __global__ void ssm_prefill_l2norm_kernel(
+    float *qkv, int n_tokens, int head_dim, int q_off, int k_off,
+    int num_k_heads, int qkv_dim) {
+    int head = blockIdx.x;
+    int tok = blockIdx.y;
+    int tid = threadIdx.x;
+    if (head >= num_k_heads || tok >= n_tokens) return;
+    extern __shared__ float scratch[];
+    float qn = 0.0f;
+    float kn = 0.0f;
+    size_t tok_off = (size_t)tok * qkv_dim;
+    size_t qb = tok_off + (size_t)q_off + (size_t)head * head_dim;
+    size_t kb = tok_off + (size_t)k_off + (size_t)head * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float qv = qkv[qb + d];
+        float kv = qkv[kb + d];
+        qn += qv * qv;
+        kn += kv * kv;
+    }
+    float *scratch_q = scratch;
+    float *scratch_k = scratch + 8;
+    qn = cuda_block_reduce_sum_all(qn, scratch_q);
+    kn = cuda_block_reduce_sum_all(kn, scratch_k);
+    float inv_q = 1.0f / (sqrtf(qn) + 1e-6f);
+    float inv_k = 1.0f / (sqrtf(kn) + 1e-6f);
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        qkv[qb + d] *= inv_q;
+        qkv[kb + d] *= inv_k;
+    }
+}
+
+static __global__ void ssm_prefill_alpha_beta_kernel(
+    float *alpha, float *beta, const float *dt_bias, const float *a_log,
+    int num_v_heads, int n_tokens) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_v_heads * n_tokens;
+    if (h >= total) return;
+    int hv = h % num_v_heads;
+    float dt = alpha[h] + dt_bias[hv];
+    float dt_sp = dt > 20.0f ? dt : logf(1.0f + expf(dt));
+    alpha[h] = expf(dt_sp * a_log[hv]);
+    beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+}
+
+static __global__ void ssm_prefill_delta_128_warp_kernel(
+    float *state, float *out, const float *qkv,
+    const float *alpha, const float *beta, int n_tokens, int qkv_dim,
+    int num_k_heads, int num_v_heads, float q_scale, size_t state_off,
+    int q_off, int k_off, int v_off) {
+    const int hv_idx = blockIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+    if (col >= 128 || hv_idx >= num_v_heads) return;
+
+    const int hk_idx = hv_idx % num_k_heads;
+    const size_t state_base = state_off + (size_t)hv_idx * 128u * 128u;
+    float s_shard[4];
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        int row = r * 32 + lane;
+        s_shard[r] = state[state_base + (size_t)col * 128u + (size_t)row];
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float *q_t = qkv + (size_t)t * qkv_dim + q_off +
+                           (size_t)hk_idx * 128u;
+        const float *k_t = qkv + (size_t)t * qkv_dim + k_off +
+                           (size_t)hk_idx * 128u;
+        const float *v_t = qkv + (size_t)t * qkv_dim + v_off +
+                           (size_t)hv_idx * 128u;
+        const float decay = alpha[(size_t)t * num_v_heads + hv_idx];
+        const float b = beta[(size_t)t * num_v_heads + hv_idx];
+        float k_reg[4];
+        float q_reg[4];
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            int row = r * 32 + lane;
+            s_shard[r] *= decay;
+            k_reg[r] = k_t[row];
+            q_reg[r] = q_t[row];
+        }
+
+        float kv_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+            kv_partial += s_shard[r] * k_reg[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            kv_partial += __shfl_down_sync(0xffffffffu, kv_partial, offset);
+        float kv_col = __shfl_sync(0xffffffffu, kv_partial, 0);
+        float delta = (v_t[col] - kv_col) * b;
+
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            s_shard[r] += k_reg[r] * delta;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            attn_partial += __shfl_down_sync(0xffffffffu, attn_partial, offset);
+        if (lane == 0)
+            out[(size_t)t * (size_t)num_v_heads * 128u +
+                (size_t)hv_idx * 128u + (size_t)col] =
+                attn_partial * q_scale;
+    }
+
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        int row = r * 32 + lane;
+        state[state_base + (size_t)col * 128u + (size_t)row] = s_shard[r];
+    }
+}
+
+static __global__ void ssm_prefill_gate_kernel(
+    float *out, const float *z, const float *norm_w, int head_v_dim,
+    int num_v_heads, int n_tokens, float eps) {
+    int hv_idx = blockIdx.x;
+    int tok = blockIdx.y;
+    int tid = threadIdx.x;
+    if (hv_idx >= num_v_heads || tok >= n_tokens) return;
+    extern __shared__ float scratch[];
+    size_t base = ((size_t)tok * num_v_heads + hv_idx) * head_v_dim;
+    float ss = 0.0f;
+    for (int d = tid; d < head_v_dim; d += blockDim.x) {
+        float v = out[base + d];
+        ss += v * v;
+    }
+    ss = cuda_block_reduce_sum_all(ss, scratch);
+    float inv = 1.0f / sqrtf(ss / (float)head_v_dim + eps);
+    for (int d = tid; d < head_v_dim; d += blockDim.x) {
+        float normed = out[base + d] * inv * norm_w[d];
+        float g = z[base + d];
+        out[base + d] = normed * (g / (1.0f + expf(-g)));
+    }
+}
+
 static __global__ void rope_kernel(float *q, float *k, const float *freq,
                                    int n_heads, int head_size, int pos,
                                    int rope_dims, int n_kv_heads,
@@ -7058,70 +7217,134 @@ static int cuda_prefill_ssm_layer(
                        (size_t)head_k_dim * (size_t)head_v_dim;
     size_t conv_off = (size_t)ssm_idx * (size_t)(conv_kernel - 1) *
                       (size_t)qkv_dim;
-    for (int t = 0; t < n_tokens; t++) {
-        float *qkv_t = d_qkv + (size_t)t * (size_t)qkv_dim;
-        float *z_t = d_z + (size_t)t * (size_t)inner_dim;
-        float *out_t = d_ssm + (size_t)t * (size_t)inner_dim;
-        float *alpha_t = d_alpha + (size_t)t * (size_t)num_v_heads;
-        float *beta_t = d_beta + (size_t)t * (size_t)num_v_heads;
-
-        ssm_conv_silu_kernel<<<(qkv_dim + threads - 1) / threads,
-                               threads, 0>>>(
-            qkv_t, cuda_act(ctx, BN_GPU_VALUE_SSM_CONV_STATE),
-            (const float *)conv1d->data, qkv_dim, conv_kernel, conv_off);
+    int fast_prefill = head_k_dim == 128 && head_v_dim == 128 &&
+                       !getenv("BN_CUDA_DISABLE_SSM_PREFILL_SCAN");
+    if (fast_prefill) {
+        ssm_prefill_conv_silu_kernel<<<(qkv_dim + threads - 1) / threads,
+                                       threads, 0>>>(
+            d_qkv, cuda_act(ctx, BN_GPU_VALUE_SSM_CONV_STATE),
+            (const float *)conv1d->data, qkv_dim, conv_kernel, n_tokens,
+            conv_off);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "[bn:gpu:cuda] prefill ssm conv failed: %s\n",
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm batched conv failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
         }
 
-        ssm_l2norm_kernel<<<num_k_heads, threads, 16 * sizeof(float)>>>(
-            qkv_t, qkv_t, head_k_dim, 0, key_dim);
+        ssm_prefill_l2norm_kernel<<<dim3(num_k_heads, n_tokens, 1),
+                                    threads, 16 * sizeof(float)>>>(
+            d_qkv, n_tokens, head_k_dim, 0, key_dim, num_k_heads, qkv_dim);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "[bn:gpu:cuda] prefill ssm l2norm failed: %s\n",
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm batched l2norm failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
         }
 
-        ssm_alpha_beta_kernel<<<1, threads, 0>>>(
-            alpha_t, beta_t, (const float *)dt_bias->data,
-            (const float *)a_log->data, num_v_heads);
+        ssm_prefill_alpha_beta_kernel<<<
+            ((int)ab_values + threads - 1) / threads, threads, 0>>>(
+            d_alpha, d_beta, (const float *)dt_bias->data,
+            (const float *)a_log->data, num_v_heads, n_tokens);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "[bn:gpu:cuda] prefill ssm alpha/beta failed: %s\n",
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm batched alpha/beta failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
         }
 
-        if (head_k_dim == 128 && head_v_dim == 128) {
-            ssm_delta_128_warp_kernel<<<dim3(num_v_heads, 32, 1),
-                                        dim3(32, 4, 1), 0>>>(
-                cuda_act(ctx, BN_GPU_VALUE_SSM_STATE), out_t, qkv_t, qkv_t,
-                qkv_t, alpha_t, beta_t, num_k_heads, q_scale, state_off,
-                0, key_dim, 2 * key_dim);
-        } else {
-            ssm_delta_kernel<<<num_v_heads, threads,
-                               (size_t)head_v_dim * sizeof(float)>>>(
-                cuda_act(ctx, BN_GPU_VALUE_SSM_STATE), out_t, qkv_t, qkv_t,
-                qkv_t, alpha_t, beta_t, head_k_dim, head_v_dim,
-                num_k_heads, q_scale, state_off, 0, key_dim, 2 * key_dim);
-        }
+        ssm_prefill_delta_128_warp_kernel<<<dim3(num_v_heads, 32, 1),
+                                             dim3(32, 4, 1), 0>>>(
+            cuda_act(ctx, BN_GPU_VALUE_SSM_STATE), d_ssm, d_qkv,
+            d_alpha, d_beta, n_tokens, qkv_dim, num_k_heads, num_v_heads,
+            q_scale, state_off, 0, key_dim, 2 * key_dim);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "[bn:gpu:cuda] prefill ssm delta failed: %s\n",
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm batched delta failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
         }
 
-        ssm_gate_kernel<<<num_v_heads, threads, 8 * sizeof(float)>>>(
-            out_t, z_t, (const float *)ssm_norm->data, head_v_dim, norm_eps);
+        ssm_prefill_gate_kernel<<<dim3(num_v_heads, n_tokens, 1),
+                                  threads, 8 * sizeof(float)>>>(
+            d_ssm, d_z, (const float *)ssm_norm->data, head_v_dim,
+            num_v_heads, n_tokens, norm_eps);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "[bn:gpu:cuda] prefill ssm gate failed: %s\n",
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm batched gate failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
+        }
+    } else {
+        for (int t = 0; t < n_tokens; t++) {
+            float *qkv_t = d_qkv + (size_t)t * (size_t)qkv_dim;
+            float *z_t = d_z + (size_t)t * (size_t)inner_dim;
+            float *out_t = d_ssm + (size_t)t * (size_t)inner_dim;
+            float *alpha_t = d_alpha + (size_t)t * (size_t)num_v_heads;
+            float *beta_t = d_beta + (size_t)t * (size_t)num_v_heads;
+
+            ssm_conv_silu_kernel<<<(qkv_dim + threads - 1) / threads,
+                                   threads, 0>>>(
+                qkv_t, cuda_act(ctx, BN_GPU_VALUE_SSM_CONV_STATE),
+                (const float *)conv1d->data, qkv_dim, conv_kernel,
+                conv_off);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[bn:gpu:cuda] prefill ssm conv failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
+
+            ssm_l2norm_kernel<<<num_k_heads, threads, 16 * sizeof(float)>>>(
+                qkv_t, qkv_t, head_k_dim, 0, key_dim);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[bn:gpu:cuda] prefill ssm l2norm failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
+
+            ssm_alpha_beta_kernel<<<1, threads, 0>>>(
+                alpha_t, beta_t, (const float *)dt_bias->data,
+                (const float *)a_log->data, num_v_heads);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "[bn:gpu:cuda] prefill ssm alpha/beta failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
+
+            if (head_k_dim == 128 && head_v_dim == 128) {
+                ssm_delta_128_warp_kernel<<<dim3(num_v_heads, 32, 1),
+                                            dim3(32, 4, 1), 0>>>(
+                    cuda_act(ctx, BN_GPU_VALUE_SSM_STATE), out_t, qkv_t,
+                    qkv_t, qkv_t, alpha_t, beta_t, num_k_heads, q_scale,
+                    state_off, 0, key_dim, 2 * key_dim);
+            } else {
+                ssm_delta_kernel<<<num_v_heads, threads,
+                                   (size_t)head_v_dim * sizeof(float)>>>(
+                    cuda_act(ctx, BN_GPU_VALUE_SSM_STATE), out_t, qkv_t,
+                    qkv_t, qkv_t, alpha_t, beta_t, head_k_dim, head_v_dim,
+                    num_k_heads, q_scale, state_off, 0, key_dim,
+                    2 * key_dim);
+            }
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[bn:gpu:cuda] prefill ssm delta failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
+
+            ssm_gate_kernel<<<num_v_heads, threads, 8 * sizeof(float)>>>(
+                out_t, z_t, (const float *)ssm_norm->data, head_v_dim,
+                norm_eps);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[bn:gpu:cuda] prefill ssm gate failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
         }
     }
 
@@ -7383,6 +7606,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
 
     const int profile = getenv("BN_CUDA_PROFILE") != NULL;
     const int profile_wall = getenv("BN_CUDA_PROFILE_WALL") != NULL;
+    const int debug_exec_fail = getenv("BN_CUDA_DEBUG_EXEC_FAIL") != NULL;
     static unsigned long long profile_calls = 0;
     static unsigned long long profile_ops[BN_CUDA_PROFILE_MAX] = {0};
     static double profile_ms[BN_CUDA_PROFILE_MAX] = {0.0};
@@ -7607,6 +7831,19 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             continue;
         const BnGPUOp *op = &ops[i];
         const BnGPUOp *next = (i + 1 < n_ops) ? &ops[i + 1] : NULL;
+#define BN_CUDA_EXEC_FAIL(reason) do { \
+            if (debug_exec_fail) { \
+                fprintf(stderr, \
+                        "[bn:gpu:cuda:exec-fail] op=%d/%d code=%s(%d) " \
+                        "reason=%s in=%d out=%d aux=%d rows=%d cols=%d " \
+                        "p0=%u p1=%u p2=%u p3=%u p5=%u p6=%u p7=%u\n", \
+                        i, n_ops, cuda_op_name(op->op_code), op->op_code, \
+                        (reason), op->buf_in, op->buf_out, op->buf_aux, \
+                        op->rows, op->cols, op->p[0], op->p[1], op->p[2], \
+                        op->p[3], op->p[5], op->p[6], op->p[7]); \
+            } \
+            return -1; \
+        } while (0)
         cudaError_t err = cudaSuccess;
         int is_logits_op = op->op_kind == BN_GPU_OP_LOGITS ||
                            (op->op_code == BN_GPU_CODE_MATVEC &&
@@ -7628,7 +7865,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             if (!w || !w->data || !in || !out ||
                 !cuda_type_supported(op->type) ||
                 op->rows <= 0 || op->cols <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("matvec invalid args");
             if (next && i + 2 < n_ops &&
                 next->op_code == BN_GPU_CODE_BIAS_ADD &&
                 next->buf_in == op->buf_out &&
@@ -7682,7 +7919,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                        (op->cols % BN_QK_K) == 0 &&
                        (force_q6k_dot ||
                         (enable_q6k_dot && op->cols >= 2048))) {
-                if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0) return -1;
+                if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0)
+                    BN_CUDA_EXEC_FAIL("q6k q8k scratch alloc failed");
                 BnBlockQ8K *xq = (BnBlockQ8K *)ctx->d_q8_k;
                 BN_CUDA_LAUNCH(ctx, quantize_q8k_batch_kernel,
                     dim3(op->cols / BN_QK_K, 1, 1), BN_QK_K, 0,
@@ -7717,7 +7955,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                        (getenv("BN_CUDA_ENABLE_Q4K_Q8K_DOT") ||
                         getenv("BN_CUDA_ENABLE_UNSAFE_MOE_FFN") ||
                         op->p[6])) {
-                if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0) return -1;
+                if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0)
+                    BN_CUDA_EXEC_FAIL("q4k q8k scratch alloc failed");
                 BnBlockQ8K *xq = (BnBlockQ8K *)ctx->d_q8_k;
                 BN_CUDA_LAUNCH(ctx, quantize_q8k_batch_kernel,
                     dim3(op->cols / BN_QK_K, 1, 1), BN_QK_K, 0,
@@ -7731,7 +7970,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     op->rows, op->cols, out_offset);
             } else if (op->type == BN_GGUF_TENSOR_Q4_K &&
                        (op->cols % BN_QK_K) == 0 && enable_q4k_dot) {
-                if (cuda_ensure_q8_1(ctx, op->cols) != 0) return -1;
+                if (cuda_ensure_q8_1(ctx, op->cols) != 0)
+                    BN_CUDA_EXEC_FAIL("q4k q8_1 scratch alloc failed");
                 BnCudaBlockQ8_1 *xq =
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
@@ -7752,7 +7992,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 }
             } else if (op->type == BN_GGUF_TENSOR_Q5_K &&
                        (op->cols % BN_QK_K) == 0 && enable_q5k_dot) {
-                if (cuda_ensure_q8_1(ctx, op->cols) != 0) return -1;
+                if (cuda_ensure_q8_1(ctx, op->cols) != 0)
+                    BN_CUDA_EXEC_FAIL("q5k q8_1 scratch alloc failed");
                 BnCudaBlockQ8_1 *xq =
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
@@ -7768,7 +8009,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                         (is_logits_op && q8_preq_logits_default)) &&
                        op->type == BN_GGUF_TENSOR_Q8_0 &&
                        (op->cols & 31) == 0) {
-                if (cuda_ensure_q8_1(ctx, op->cols) != 0) return -1;
+                if (cuda_ensure_q8_1(ctx, op->cols) != 0)
+                    BN_CUDA_EXEC_FAIL("q8 preq scratch alloc failed");
                 BnCudaBlockQ8_1 *xq =
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
@@ -7838,9 +8080,9 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             if (!w || !w->data || !in || !out0 || !out1 ||
                 !cuda_type_supported(op->type) || total_rows <= 0 ||
                 cols <= 0 || split0 <= 0 || split0 > total_rows)
-                return -1;
+                BN_CUDA_EXEC_FAIL("matvec split invalid args");
             if (split1 > split0 && (!out2 || split1 > total_rows))
-                return -1;
+                BN_CUDA_EXEC_FAIL("matvec split invalid third output");
             if (!disable_qkv_mixed_fuse &&
                 next && i + 7 < n_ops &&
                 next->op_code == BN_GPU_CODE_BIAS_ADD &&
@@ -7886,7 +8128,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     float *freq = qkv_fuse_key_cache
                         ? cuda_act(ctx, BN_GPU_VALUE_ROPE_FREQ)
                         : NULL;
-                    if (qkv_fuse_key_cache && !freq) return -1;
+                    if (qkv_fuse_key_cache && !freq)
+                        BN_CUDA_EXEC_FAIL("qkv mixed missing rope freq");
                     int k_pair_opt = enable_qkv_kpair_opt;
                     int k_grid_rows = k_pair_opt
                         ? (total_rows - split0 + 1) / 2
@@ -7896,7 +8139,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                         (op->type == BN_GGUF_TENSOR_Q8_0 ||
                          ops[i + 5].type == BN_GGUF_TENSOR_Q8_0) &&
                         (cols & 31) == 0) {
-                        if (cuda_ensure_q8_1(ctx, cols) != 0) return -1;
+                        if (cuda_ensure_q8_1(ctx, cols) != 0)
+                            BN_CUDA_EXEC_FAIL("qkv mixed q8 scratch alloc failed");
                         BnCudaBlockQ8_1 *xq =
                             (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                         BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
@@ -7982,7 +8226,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             }
             if (op->type == BN_GGUF_TENSOR_Q4_K &&
                 (cols % BN_QK_K) == 0 && split1 != 1 && enable_q4k_dot) {
-                if (cuda_ensure_q8_1(ctx, cols) != 0) return -1;
+                if (cuda_ensure_q8_1(ctx, cols) != 0)
+                    BN_CUDA_EXEC_FAIL("q4k split q8 scratch alloc failed");
                 BnCudaBlockQ8_1 *xq =
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
@@ -7997,7 +8242,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     (size_t)op->p[6], (size_t)op->p[7]);
             } else if (op->type == BN_GGUF_TENSOR_Q5_K &&
                 (cols % BN_QK_K) == 0 && split1 != 1 && enable_q5k_dot) {
-                if (cuda_ensure_q8_1(ctx, cols) != 0) return -1;
+                if (cuda_ensure_q8_1(ctx, cols) != 0)
+                    BN_CUDA_EXEC_FAIL("q5k split q8 scratch alloc failed");
                 BnCudaBlockQ8_1 *xq =
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
@@ -8012,7 +8258,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     (size_t)op->p[6], (size_t)op->p[7]);
             } else if (op->type == BN_GGUF_TENSOR_Q8_0 &&
                        (cols & 31) == 0 && split1 != 1) {
-                if (cuda_ensure_q8_1(ctx, cols) != 0) return -1;
+                if (cuda_ensure_q8_1(ctx, cols) != 0)
+                    BN_CUDA_EXEC_FAIL("q8 split q8 scratch alloc failed");
                 BnCudaBlockQ8_1 *xq =
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
@@ -8429,7 +8676,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             int rope_dims = (int)op->p[3];
             if (!q || !freq || n_heads <= 0 || head_size <= 0 ||
                 rope_dims <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("rope invalid args");
             if (fuse_rope_flash_enabled &&
                 op->op_code == BN_GPU_CODE_ROPE && next &&
                 next->op_code == BN_GPU_CODE_FLASH_ATTN &&
@@ -8444,7 +8691,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 float *out = cuda_act(ctx, next->buf_out);
                 void *key = cuda_act(ctx, BN_GPU_VALUE_KEY_CACHE);
                 void *value = cuda_act(ctx, BN_GPU_VALUE_VALUE_CACHE);
-                if (!out || !key || !value) return -1;
+                if (!out || !key || !value)
+                    BN_CUDA_EXEC_FAIL("rope flash missing buffers");
                 int flash_scratch = graph_exec ? (int)next->p[5]
                                                 : (int)next->p[2];
                 size_t shared = (size_t)(flash_scratch + threads + head_size) *
@@ -8489,7 +8737,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             int seq_len = (int)op->p[5];
             if (!q || !key || !att || n_heads <= 0 || head_size <= 0 ||
                 n_kv <= 0 || kv_mul <= 0 || kv_dim <= 0 || seq_len <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("gqa scores invalid args");
             BN_CUDA_LAUNCH(ctx, gqa_scores_kernel,
                 dim3(n_heads, n_kv, 1), threads,
                 (size_t)threads * sizeof(float),
@@ -8504,7 +8752,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             int n_kv = (int)op->p[1];
             int seq_len = (int)op->p[2];
             if (!att || n_heads <= 0 || n_kv <= 0 || seq_len <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("softmax invalid args");
             BN_CUDA_LAUNCH(ctx, softmax_kernel, n_heads, threads,
                 (size_t)threads * sizeof(float),
                 att, n_heads, n_kv, seq_len);
@@ -8522,7 +8770,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             int seq_len = (int)op->p[5];
             if (!out || !att || !value || n_heads <= 0 || head_size <= 0 ||
                 n_kv <= 0 || kv_mul <= 0 || kv_dim <= 0 || seq_len <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("gqa combine invalid args");
             BN_CUDA_LAUNCH(ctx, gqa_combine_kernel, n_heads, head_size, 0,
                 out, att, value, n_heads, head_size, n_kv, kv_mul, kv_dim,
                 seq_len, op->p[6], ctx->kv_f16);
@@ -8542,7 +8790,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             if (!q || !out || !key || !value || n_heads <= 0 ||
                 head_size <= 0 || n_kv <= 0 || kv_mul <= 0 ||
                 kv_dim <= 0 || seq_len <= 0 || n_kv > 2048)
-                return -1;
+                BN_CUDA_EXEC_FAIL("flash attention invalid args");
             int flash_scratch = graph_exec ? seq_len : n_kv;
             size_t shared = (size_t)(flash_scratch + threads) * sizeof(float);
             BN_CUDA_LAUNCH(ctx, flash_attention_kernel, n_heads, threads,
@@ -8561,7 +8809,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             size_t conv_off = (size_t)op->p[2];
             if (!w || !w->data || !qkv || !conv_state ||
                 qkv_dim <= 0 || kern <= 1)
-                return -1;
+                BN_CUDA_EXEC_FAIL("ssm conv invalid args");
             BN_CUDA_LAUNCH(ctx, ssm_conv_silu_kernel,
                 (qkv_dim + threads - 1) / threads, threads, 0,
                 qkv, conv_state, (const float *)w->data, qkv_dim, kern,
@@ -8570,13 +8818,14 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
         }
         case BN_GPU_CODE_SSM_L2NORM: {
             float *q = cuda_act(ctx, op->buf_in);
-            float *k = cuda_act(ctx, op->buf_out);
+            float *k = cuda_act(ctx, op->buf_aux >= 0 ? op->buf_aux
+                                                       : op->buf_out);
             int head_dim = (int)op->p[0];
             int q_off = (int)op->p[1];
             int k_off = (int)op->p[2];
             int n_heads = op->rows;
             if (!q || !k || head_dim <= 0 || n_heads <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("ssm l2norm invalid args");
             BN_CUDA_LAUNCH(ctx, ssm_l2norm_kernel, n_heads, threads,
                 16 * sizeof(float), q, k, head_dim, q_off, k_off);
             break;
@@ -8591,7 +8840,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             int n = (int)op->p[0];
             if (!dt || !dt->data || !a || !a->data ||
                 !alpha || !beta || n <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("ssm alpha beta invalid args");
             BN_CUDA_LAUNCH(ctx, ssm_alpha_beta_kernel, 1, threads, 0,
                 alpha, beta, (const float *)dt->data, (const float *)a->data,
                 n);
@@ -8609,7 +8858,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             int beta_off = (int)op->p[1];
             if (!dt || !dt->data || !a || !a->data ||
                 !src || !alpha || !beta || n <= 0 || beta_off < n)
-                return -1;
+                BN_CUDA_EXEC_FAIL("ssm alpha beta split invalid args");
             BN_CUDA_LAUNCH(ctx, ssm_alpha_beta_split_kernel, 1, threads, 0,
                 src, alpha, beta, (const float *)dt->data,
                 (const float *)a->data, n, beta_off);
@@ -8636,7 +8885,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             if (!state || !out || !q || !k || !v || !alpha || !beta ||
                 head_k_dim <= 0 || head_v_dim <= 0 || num_k_heads <= 0 ||
                 num_v_heads <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("ssm delta invalid args");
             if (head_k_dim == 128 && head_v_dim == 128) {
                 BN_CUDA_LAUNCH(ctx, ssm_delta_128_warp_kernel,
                     dim3(num_v_heads, 32, 1), dim3(32, 4, 1), 0,
@@ -8659,15 +8908,16 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             int num_v_heads = op->rows;
             if (!w || !w->data || !out || !z ||
                 head_v_dim <= 0 || num_v_heads <= 0)
-                return -1;
+                BN_CUDA_EXEC_FAIL("ssm gate invalid args");
             BN_CUDA_LAUNCH(ctx, ssm_gate_kernel, num_v_heads, threads,
                 8 * sizeof(float), out, z, (const float *)w->data,
                 head_v_dim, eps);
             break;
         }
         default:
-            return -1;
+            BN_CUDA_EXEC_FAIL("unsupported op");
         }
+#undef BN_CUDA_EXEC_FAIL
         exec_launches++;
         if (profile_code >= 0 && profile_code < BN_CUDA_PROFILE_MAX)
             exec_launch_by_code[profile_code]++;
