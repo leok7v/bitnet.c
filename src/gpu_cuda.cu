@@ -7670,7 +7670,9 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     op->rows, op->cols, out_offset);
             } else if (op->type == BN_GGUF_TENSOR_Q4_K &&
                        (op->cols % BN_QK_K) == 0 && enable_q4k_dot &&
-                       getenv("BN_CUDA_ENABLE_Q4K_Q8K_DOT")) {
+                       (getenv("BN_CUDA_ENABLE_Q4K_Q8K_DOT") ||
+                        getenv("BN_CUDA_ENABLE_UNSAFE_MOE_FFN") ||
+                        op->p[6])) {
                 if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0) return -1;
                 BnBlockQ8K *xq = (BnBlockQ8K *)ctx->d_q8_k;
                 BN_CUDA_LAUNCH(ctx, quantize_q8k_batch_kernel,
