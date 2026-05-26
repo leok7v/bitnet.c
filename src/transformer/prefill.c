@@ -470,7 +470,9 @@ static int prefill_ssm_layer_gpu(const BnModel *m,
                                  int conv_kernel,
                                  int ssm_idx,
                                  int layer,
-                                 float norm_eps) {
+                                 int fuse_ffn,
+                                 float norm_eps,
+                                 int *did_ffn) {
     BnGPUBackend *gpu = bn_model_gpu(m);
     const BnBackendModel *backend = bn_model_backend(m);
     if (!gpu || !gpu->prefill_ssm_layer || !backend || !out || !lw || !X ||
@@ -499,18 +501,56 @@ static int prefill_ssm_layer_gpu(const BnModel *m,
         backend, layer, BN_BACKEND_HANDLE_SSM_A_LOG);
     void *ssm_norm_buf = bn_backend_model_handle(
         backend, layer, BN_BACKEND_HANDLE_SSM_NORM);
+    void *gateup_buf = NULL;
+    void *gate_buf = NULL;
+    void *up_buf = NULL;
+    void *down_buf = NULL;
+    void *ffn_norm_buf = NULL;
+    if (fuse_ffn && getenv("BN_CUDA_ENABLE_SSM_FFN_FUSE") &&
+        lw->ffn.ffn_gate.data && lw->ffn.ffn_up.data &&
+        lw->ffn.ffn_down.data && m->config.has_ffn_gate &&
+        !lw->norm.ffn_sub_norm &&
+        !lw->norm.layer_output_scale &&
+        !((m->config.arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
+          lw->norm.ffn_post_norm)) {
+        gateup_buf = bn_backend_model_handle(
+            backend, layer, BN_BACKEND_HANDLE_GATEUP_STACKED);
+        if (gateup_buf && lw->ffn.ffn_gate.type == lw->ffn.ffn_up.type) {
+            gate_buf = gateup_buf;
+        } else {
+            gate_buf = prefill_qweight_backend_buf(backend,
+                                                   &lw->ffn.ffn_gate);
+            up_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_up);
+        }
+        down_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_down);
+        if (!down_buf)
+            down_buf = bn_backend_model_handle(
+                backend, layer, BN_BACKEND_HANDLE_FFN_DOWN_PREFILL);
+        ffn_norm_buf = bn_backend_model_handle(
+            backend, layer, BN_BACKEND_HANDLE_FFN_NORM);
+        if (!gate_buf || !down_buf || !ffn_norm_buf) {
+            gate_buf = NULL;
+            up_buf = NULL;
+            down_buf = NULL;
+            ffn_norm_buf = NULL;
+        }
+    }
     if (!wqkv_buf || !wz_buf || !alpha_buf || !beta_buf || !out_buf ||
         !attn_norm_buf || !conv1d_buf || !dt_bias_buf || !a_log_buf ||
         !ssm_norm_buf)
         return -1;
+    if (did_ffn)
+        *did_ffn = 0;
     return gpu->prefill_ssm_layer(
         gpu->ctx, out, wqkv_buf, wz_buf, alpha_buf, beta_buf,
         qkvz_stacked_buf, ab_stacked_buf, out_buf, attn_norm_buf, conv1d_buf,
-        dt_bias_buf, a_log_buf, ssm_norm_buf, X, n_tokens, dim, qkv_dim,
-        inner_dim, num_k_heads, head_k_dim, num_v_heads, head_v_dim,
+        dt_bias_buf, a_log_buf, ssm_norm_buf, gate_buf, up_buf, down_buf,
+        ffn_norm_buf, X, n_tokens, dim, qkv_dim, inner_dim,
+        num_k_heads, head_k_dim, num_v_heads, head_v_dim,
         conv_kernel, ssm_idx, lw->ssm.wqkv.type, lw->ssm.wz.type,
         lw->ssm.ssm_alpha.type, lw->ssm.ssm_beta.type, lw->ssm.ssm_out.type,
-        norm_eps);
+        lw->ffn.ffn_down.cols, lw->ffn.ffn_gate.type, lw->ffn.ffn_up.type,
+        lw->ffn.ffn_down.type, m->config.act_type, norm_eps, did_ffn);
 }
 
 #ifdef __AVX2__
@@ -1487,11 +1527,15 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             size_t conv_per_layer = (size_t)(kern_ssm - 1) * qkv_dim_ssm;
             float *conv_state = s->ssm_conv_state + (size_t)ssm_idx * conv_per_layer;
 
+            int ssm_did_ffn = 0;
             if (prefill_ssm_layer_gpu(m, act, lw, act, n_tokens, dim,
                                       qkv_dim_ssm, value_dim, num_k_heads,
                                       head_k_dim, num_v_heads, head_v_dim,
                                       kern_ssm, ssm_idx, l,
-                                      c->norm_eps) == 0) {
+                                      n_tokens >= prefill_dense_chain_min_tokens(c, bn_model_gpu(m)),
+                                      c->norm_eps, &ssm_did_ffn) == 0) {
+                if (ssm_did_ffn)
+                    goto prefill_layer_done;
                 goto prefill_ssm_done;
             }
 
@@ -1621,8 +1665,8 @@ prefill_ssm_done:
             if (c->has_ffn_gate && !lw->norm.ffn_sub_norm &&
                 !((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
                   lw->norm.ffn_post_norm) &&
-                n_tokens >= prefill_gpu_attention_min_tokens() &&
                 gpu_ffn && gpu_ffn->dense_ffn_batch_norm_resid &&
+                n_tokens >= prefill_dense_chain_min_tokens(c, gpu_ffn) &&
                 ffn_norm_buf &&
                 prefill_dense_ffn_gpu_batch(m, act, lw, act, n_tokens,
                                             dim, hidden_dim,
@@ -1644,7 +1688,7 @@ prefill_ssm_done:
                     !((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
                       lw->norm.ffn_post_norm) &&
                     (c->full_attn_interval <= 0 ||
-                     n_tokens >= prefill_gpu_attention_min_tokens()) &&
+                     n_tokens >= prefill_dense_chain_min_tokens(c, gpu_ffn)) &&
                     prefill_dense_ffn_gpu_batch(m, Xb, lw, Xb, n_tokens,
                                                 dim, hidden_dim,
                                                 c->act_type, l, NULL,
@@ -1725,6 +1769,8 @@ prefill_ssm_done:
                 for (int d = 0; d < dim; d++)
                     act[(size_t)t * dim + d] *= scale;
         }
+prefill_layer_done:
+        ;
     }
 
 prefill_layers_done:

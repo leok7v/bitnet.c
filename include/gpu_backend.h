@@ -243,6 +243,8 @@ struct BnGPUBackend {
                                     void *ssm_out_buf, void *attn_norm_buf,
                                     void *conv1d_buf, void *dt_bias_buf,
                                     void *a_log_buf, void *ssm_norm_buf,
+                                    void *ffn_gate_buf, void *ffn_up_buf,
+                                    void *ffn_down_buf, void *ffn_norm_buf,
                                     const float *X, int n_tokens, int dim,
                                     int qkv_dim, int inner_dim,
                                     int num_k_heads, int head_k_dim,
@@ -250,7 +252,10 @@ struct BnGPUBackend {
                                     int conv_kernel, int ssm_idx,
                                     int wqkv_type, int wz_type,
                                     int alpha_type, int beta_type,
-                                    int out_type, float norm_eps);
+                                    int out_type, int hidden_dim,
+                                    int ffn_gate_type, int ffn_up_type,
+                                    int ffn_down_type, int act_type,
+                                    float norm_eps, int *did_ffn);
 
     // GPU-resident forward pass: execute a backend-private lowered command list
     // as a single submission. All intermediate buffers stay on GPU. Only

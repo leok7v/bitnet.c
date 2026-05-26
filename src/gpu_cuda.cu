@@ -5019,9 +5019,25 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
     size_t bytes = n * (buf->type == BN_GGUF_TENSOR_Q6_K && !q6_as_f16
                         ? sizeof(float)
                         : sizeof(__half));
-    int max_mb = cuda_env_int("BN_CUDA_CUBLAS_CACHE_MAX_MB", 128);
+    int max_mb = 128;
+    const char *max_env = getenv("BN_CUDA_CUBLAS_CACHE_MAX_MB");
+    if (max_env && *max_env) {
+        max_mb = atoi(max_env);
+    } else if (buf->type == BN_GGUF_TENSOR_Q4_K ||
+               buf->type == BN_GGUF_TENSOR_Q6_K) {
+        max_mb = 512;
+    }
     if (max_mb > 0 && bytes > (size_t)max_mb * 1024u * 1024u)
         return 0;
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
+        int reserve_mb = cuda_env_int("BN_CUDA_CUBLAS_CACHE_RESERVE_MB", 4096);
+        size_t reserve = reserve_mb > 0
+            ? (size_t)reserve_mb * 1024u * 1024u : 0u;
+        if (free_mem <= bytes + reserve)
+            return 0;
+    }
     void **cache_ptr = buf->type == BN_GGUF_TENSOR_Q6_K && !q6_as_f16
         ? &buf->f32_data
         : &buf->f16_data;
@@ -7181,11 +7197,14 @@ static int cuda_prefill_ssm_layer(
         void *alpha_buf, void *beta_buf, void *qkvz_stacked_buf,
         void *ab_stacked_buf, void *ssm_out_buf, void *attn_norm_buf,
         void *conv1d_buf, void *dt_bias_buf, void *a_log_buf,
-        void *ssm_norm_buf, const float *X, int n_tokens, int dim,
+        void *ssm_norm_buf, void *ffn_gate_buf, void *ffn_up_buf,
+        void *ffn_down_buf, void *ffn_norm_buf, const float *X, int n_tokens, int dim,
         int qkv_dim, int inner_dim, int num_k_heads,
         int head_k_dim, int num_v_heads, int head_v_dim, int conv_kernel,
         int ssm_idx, int wqkv_type, int wz_type, int alpha_type,
-        int beta_type, int out_type, float norm_eps) {
+        int beta_type, int out_type, int hidden_dim, int ffn_gate_type,
+        int ffn_up_type, int ffn_down_type, int act_type, float norm_eps,
+        int *did_ffn) {
     BnCudaCtx *ctx = (BnCudaCtx *)vctx;
     BnCudaBuffer *wqkv = (BnCudaBuffer *)wqkv_buf;
     BnCudaBuffer *wz = (BnCudaBuffer *)wz_buf;
@@ -7199,6 +7218,16 @@ static int cuda_prefill_ssm_layer(
     BnCudaBuffer *dt_bias = (BnCudaBuffer *)dt_bias_buf;
     BnCudaBuffer *a_log = (BnCudaBuffer *)a_log_buf;
     BnCudaBuffer *ssm_norm = (BnCudaBuffer *)ssm_norm_buf;
+    BnCudaBuffer *ffn_gate = (BnCudaBuffer *)ffn_gate_buf;
+    BnCudaBuffer *ffn_up = (BnCudaBuffer *)ffn_up_buf;
+    BnCudaBuffer *ffn_down = (BnCudaBuffer *)ffn_down_buf;
+    BnCudaBuffer *ffn_norm = (BnCudaBuffer *)ffn_norm_buf;
+    int stacked_ffn_gateup = ffn_gate && ffn_gate->data && ffn_up == NULL;
+    int fuse_ffn = ffn_gate && ffn_gate->data && ffn_down && ffn_down->data &&
+                   ffn_norm && ffn_norm->data && hidden_dim > 0 &&
+                   act_type == 0;
+    if (did_ffn)
+        *did_ffn = 0;
     if (getenv("BN_CUDA_DISABLE_PREFILL_SSM_LAYER"))
         return -1;
     if (!ctx || !out || !X || !wqkv || !wqkv->data || !wz || !wz->data ||
@@ -7224,6 +7253,22 @@ static int cuda_prefill_ssm_layer(
         !cuda_type_supported(alpha_type) || !cuda_type_supported(beta_type) ||
         !cuda_type_supported(out_type))
         return -1;
+    if (fuse_ffn) {
+        if ((!stacked_ffn_gateup &&
+             (!ffn_up || !ffn_up->data ||
+              ffn_gate->rows != hidden_dim || ffn_up->rows != hidden_dim ||
+              ffn_gate->cols != dim || ffn_up->cols != dim)) ||
+            (stacked_ffn_gateup &&
+             (ffn_gate->rows != hidden_dim * 2 || ffn_gate->cols != dim ||
+              ffn_gate_type != ffn_up_type)) ||
+            ffn_down->rows != dim || ffn_down->cols != hidden_dim ||
+            ffn_norm->rows * ffn_norm->cols < dim ||
+            !cuda_type_supported(ffn_gate_type) ||
+            (!stacked_ffn_gateup && !cuda_type_supported(ffn_up_type)) ||
+            !cuda_type_supported(ffn_down_type)) {
+            fuse_ffn = 0;
+        }
+    }
 
     int use_stacked_prefill = getenv("BN_CUDA_ENABLE_SSM_STACKED_PREFILL") != NULL;
     int use_qkvz = use_stacked_prefill &&
@@ -7241,10 +7286,17 @@ static int cuda_prefill_ssm_layer(
         ? (size_t)n_tokens * (size_t)(qkv_dim + inner_dim) : 0u;
     size_t ab_stacked_values = use_ab
         ? (size_t)n_tokens * (size_t)(2 * num_v_heads) : 0u;
+    size_t hidden_values = fuse_ffn
+        ? (size_t)n_tokens * (size_t)hidden_dim : 0u;
+    size_t gateup_values = hidden_values * 2u;
     size_t total_values = dim_values + qkv_values + z_values +
                           z_values + 2u * ab_values + qkvz_values +
-                          ab_stacked_values;
-    if (cuda_ensure_scratch(ctx, dim_values * sizeof(float),
+                          ab_stacked_values +
+                          (fuse_ffn ? (2u * dim_values + hidden_values +
+                                       gateup_values) : 0u);
+    size_t scratch_x_bytes = fuse_ffn && gateup_values > dim_values
+        ? gateup_values * sizeof(float) : dim_values * sizeof(float);
+    if (cuda_ensure_scratch(ctx, scratch_x_bytes,
                             dim_values * sizeof(float)) != 0)
         return -1;
     if (cuda_ensure_prefill(ctx, total_values) != 0)
@@ -7266,6 +7318,10 @@ static int cuda_prefill_ssm_layer(
     float *d_beta = d_alpha + ab_values;
     float *d_qkvz = d_beta + ab_values;
     float *d_ab = d_qkvz + qkvz_values;
+    float *d_ffn_residual = d_ab + ab_stacked_values;
+    float *d_ffn_norm = d_ffn_residual + (fuse_ffn ? dim_values : 0u);
+    float *d_ffn_act = d_ffn_norm + (fuse_ffn ? dim_values : 0u);
+    float *d_gateup = d_ffn_act + hidden_values;
 
     int threads = 256;
     int warps = threads / 32;
@@ -7492,6 +7548,70 @@ static int cuda_prefill_ssm_layer(
         fprintf(stderr, "[bn:gpu:cuda] prefill ssm residual failed: %s\n",
                 cudaGetErrorString(err));
         return -1;
+    }
+
+    if (fuse_ffn) {
+        err = cudaMemcpy(d_ffn_residual, ctx->d_out,
+                         dim_values * sizeof(float), cudaMemcpyDeviceToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm ffn residual copy failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        rmsnorm_batch_kernel<<<n_tokens, threads,
+                               (size_t)warps * sizeof(float)>>>(
+            d_ffn_norm, ctx->d_out, (const float *)ffn_norm->data, dim,
+            n_tokens, norm_eps);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm ffn norm failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        if (stacked_ffn_gateup) {
+            if (cuda_matmul_device_out(ctx, d_gateup, ffn_gate, d_ffn_norm,
+                                       hidden_dim * 2, dim, n_tokens,
+                                       ffn_gate_type) != 0)
+                return -1;
+        } else {
+            if (cuda_matmul_device_out(ctx, d_gateup, ffn_gate, d_ffn_norm,
+                                       hidden_dim, dim, n_tokens,
+                                       ffn_gate_type) != 0 ||
+                cuda_matmul_device_out(ctx, d_gateup + hidden_values, ffn_up,
+                                       d_ffn_norm, hidden_dim, dim,
+                                       n_tokens, ffn_up_type) != 0)
+                return -1;
+        }
+        int act_total = n_tokens * hidden_dim;
+        if (stacked_ffn_gateup) {
+            ffn_activation_batch_stacked_kernel<<<(act_total + threads - 1) / threads,
+                                                  threads>>>(
+                d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
+        } else {
+            ffn_activation_batch_kernel<<<(act_total + threads - 1) / threads,
+                                          threads>>>(
+                d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
+        }
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm ffn activation failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        if (cuda_matmul_device_out(ctx, ctx->d_out, ffn_down, d_ffn_act, dim,
+                                   hidden_dim, n_tokens, ffn_down_type) != 0)
+            return -1;
+        residual_add_kernel<<<((int)dim_values + threads - 1) / threads,
+                               threads>>>(
+            ctx->d_out, d_ffn_residual, (int)dim_values);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm ffn residual failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        if (did_ffn)
+            *did_ffn = 1;
     }
 
     size_t out_bytes = dim_values * sizeof(float);
