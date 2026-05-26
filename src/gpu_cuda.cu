@@ -8402,7 +8402,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
                     (op->cols + 31) / 32, 32, 0, xq, in, op->cols);
-                if (enable_q4k_4warp && op->cols <= 4096) {
+                if (enable_q4k_4warp && op->cols <= 8192) {
                     BN_CUDA_LAUNCH(ctx, q4k_dot_matvec_4warp_kernel,
                         op->rows, 128, 0,
                         out, (const BnBlockQ4K *)w->data, xq, bias,
@@ -8763,7 +8763,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     (BnCudaBlockQ8_1 *)ctx->d_q8_1;
                 BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
                     (cols + 31) / 32, 32, 0, xq, in, cols);
-                if (enable_q4k_4warp && cols <= 4096) {
+                if (enable_q4k_4warp && cols <= 8192) {
                     BN_CUDA_LAUNCH(ctx,
                         q4k_dot_fused_gateup_silu_4warp_kernel,
                         gate_rows, 128, 0,
