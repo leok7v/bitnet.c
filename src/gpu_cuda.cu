@@ -8352,7 +8352,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     xq, in, op->cols, 1);
                 int q6_threads = 256;
                 int warps = q6_threads / 32;
-                if (op->cols <= 4096 &&
+                if ((op->cols <= 4096 ||
+                     (op->cols >= 5120 && op->cols <= 8192)) &&
                     getenv("BN_CUDA_DISABLE_Q6K_MATVEC4") == NULL) {
                     int blocks = (op->rows + warps * 4 - 1) / (warps * 4);
                     BN_CUDA_LAUNCH(ctx, q6k_dot_matvec4_kernel, blocks,
