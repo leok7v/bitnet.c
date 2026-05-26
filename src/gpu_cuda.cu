@@ -816,6 +816,35 @@ static __global__ void q4k_q8k_dot_matvec_kernel(float *out,
     }
 }
 
+static __global__ void q4k_q8k_dot_matvec_pair_kernel(
+        float *out0, float *out1,
+        const BnBlockQ4K *blocks0, const BnBlockQ4K *blocks1,
+        const BnBlockQ8K *xq, int rows, int cols) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    if (row >= rows) return;
+
+    int n_bpr = cols / BN_QK_K;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    const BnBlockQ4K *row_blocks0 = blocks0 + (size_t)row * n_bpr;
+    const BnBlockQ4K *row_blocks1 = blocks1 + (size_t)row * n_bpr;
+    for (int b = lane; b < n_bpr; b += 32) {
+        sum0 += cuda_vec_dot_q4k_q8k(&row_blocks0[b], xq + b);
+        sum1 += cuda_vec_dot_q4k_q8k(&row_blocks1[b], xq + b);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    if (lane == 0) {
+        out0[row] = sum0;
+        out1[row] = sum1;
+    }
+}
+
 static __device__ __forceinline__ int cuda_q5k_hbits4(const uint8_t *qh,
                                                        int offset,
                                                        int bit) {
@@ -8322,6 +8351,39 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     bias = (const float *)bw->data;
                 } else {
                     bias_idx = -1;
+                }
+            }
+            if (next && op->type == BN_GGUF_TENSOR_Q4_K &&
+                next->op_code == BN_GPU_CODE_MATVEC &&
+                next->type == BN_GGUF_TENSOR_Q4_K &&
+                next->buf_in == op->buf_in &&
+                next->rows == op->rows &&
+                next->cols == op->cols &&
+                op->p[5] == 0 && next->p[5] == 0 &&
+                op->p[6] && next->p[6] &&
+                bias == NULL && bias_idx < 0 &&
+                (op->cols % BN_QK_K) == 0 &&
+                enable_q4k_dot &&
+                getenv("BN_CUDA_DISABLE_Q4K_PAIR_MATVEC") == NULL) {
+                BnCudaBuffer *w1 = (BnCudaBuffer *)next->W_buf;
+                float *out1 = cuda_act(ctx, next->buf_out);
+                if (w1 && w1->data && out1) {
+                    if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0)
+                        BN_CUDA_EXEC_FAIL("q4k pair q8k scratch alloc failed");
+                    BnBlockQ8K *xq = (BnBlockQ8K *)ctx->d_q8_k;
+                    BN_CUDA_LAUNCH(ctx, quantize_q8k_batch_kernel,
+                        dim3(op->cols / BN_QK_K, 1, 1), BN_QK_K, 0,
+                        xq, in, op->cols, 1);
+                    int q4_threads = 256;
+                    int warps = q4_threads / 32;
+                    int blocks = (op->rows + warps - 1) / warps;
+                    BN_CUDA_LAUNCH(ctx, q4k_q8k_dot_matvec_pair_kernel,
+                        blocks, q4_threads, 0,
+                        out, out1, (const BnBlockQ4K *)w->data,
+                        (const BnBlockQ4K *)w1->data, xq, op->rows,
+                        op->cols);
+                    i++;
+                    break;
                 }
             }
             if (op->type == BN_GGUF_TENSOR_Q5_0 &&
