@@ -41,6 +41,7 @@ typedef struct {
     int exec_node_cursor;
     int exec_graph_ops;
     int kv_f16;
+    int has_moe_model;
     float *d_x;
     size_t d_x_bytes;
     float *d_out;
@@ -4994,6 +4995,7 @@ static int cuda_init_activations(void *vctx, const void *config_ptr) {
 
     cuda_free_activations(ctx);
     ctx->kv_f16 = c->kv_f16;
+    ctx->has_moe_model = c->n_experts > 0;
 
     int n_attn = (c->full_attn_interval > 0)
         ? c->n_layers / c->full_attn_interval
@@ -8169,6 +8171,18 @@ static int cuda_ops_have_mixed_quant_matvec(const BnGPUOp *ops, int n_ops) {
     return 0;
 }
 
+static int cuda_ops_have_moe(const BnGPUOp *ops, int n_ops) {
+    if (!ops) return 0;
+    for (int i = 0; i < n_ops; i++) {
+        const BnGPUOp *op = &ops[i];
+        if (cuda_op_mentions_buf(op, BN_GPU_VALUE_MOE_HB) ||
+            cuda_op_mentions_buf(op, BN_GPU_VALUE_MOE_HB2) ||
+            cuda_op_mentions_buf(op, BN_GPU_VALUE_MOE_OUT))
+            return 1;
+    }
+    return 0;
+}
+
 static int cuda_buf_unused_until_write(const BnGPUOp *ops, int n_ops,
                                        int start, int buf) {
     if (!ops || buf < 0) return 0;
@@ -8357,10 +8371,14 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
         getenv("BN_CUDA_ENABLE_MOE_FFN") == NULL &&
         cuda_ops_look_like_decode_graph(ops, n_ops, readback_buf,
                                         out_host, out_len);
-    int graph_exec = (enable_graph_exec_flag || default_graph_exec) &&
-                     n_ops > 10 && !profile;
     int q8_preq_logits_default =
         !disable_q8_preq_logits && cuda_ops_have_mixed_quant_matvec(ops, n_ops);
+    int moe_graph = cuda_ops_have_moe(ops, n_ops);
+    int moe_q4k_q8_dot_default =
+        ctx->has_moe_model &&
+        getenv("BN_CUDA_DISABLE_MOE_Q4K_Q8K_DOT") == NULL;
+    int graph_exec = (enable_graph_exec_flag || moe_graph ||
+                      default_graph_exec) && n_ops > 10 && !profile;
     int graph_building = 0;
     cudaGraphExec_t graph_instance = NULL;
     if (graph_exec) {
@@ -8619,6 +8637,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                        (op->cols % BN_QK_K) == 0 && enable_q4k_dot &&
                        (getenv("BN_CUDA_ENABLE_Q4K_Q8K_DOT") ||
                         getenv("BN_CUDA_ENABLE_UNSAFE_MOE_FFN") ||
+                        moe_q4k_q8_dot_default ||
                         op->p[6])) {
                 if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0)
                     BN_CUDA_EXEC_FAIL("q4k q8k scratch alloc failed");

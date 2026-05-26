@@ -170,7 +170,7 @@ int bn_gpu_moe_bridge_resolve_resources(BnGPUMoEResources *out,
         BnGPUMoEResolvedExpert *expert = &expert_storage[out->n_experts];
         if (bn_gpu_moe_bridge_get_expert(m, sess, lw, layer, eidx,
                                          temporaries, &expert->buffers) != 0)
-            continue;
+            return -1;
         expert->weight = ms->expert_weights[k];
         out->n_experts++;
     }
