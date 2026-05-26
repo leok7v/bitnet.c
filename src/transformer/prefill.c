@@ -475,7 +475,7 @@ static int prefill_ssm_layer_gpu(const BnModel *m,
                                  int *did_ffn) {
     BnGPUBackend *gpu = bn_model_gpu(m);
     const BnBackendModel *backend = bn_model_backend(m);
-    if (!gpu || !gpu->prefill_ssm_layer || !backend || !out || !lw || !X ||
+    if (!gpu || !gpu->prefill_ssm_layer || !backend || !lw ||
         !lw->ssm.wqkv.data || !lw->ssm.wz.data ||
         !lw->ssm.ssm_alpha.data || !lw->ssm.ssm_beta.data ||
         !lw->ssm.ssm_out.data || !lw->norm.attn_norm ||
@@ -551,6 +551,73 @@ static int prefill_ssm_layer_gpu(const BnModel *m,
         lw->ssm.ssm_alpha.type, lw->ssm.ssm_beta.type, lw->ssm.ssm_out.type,
         lw->ffn.ffn_down.cols, lw->ffn.ffn_gate.type, lw->ffn.ffn_up.type,
         lw->ffn.ffn_down.type, m->config.act_type, norm_eps, did_ffn);
+}
+
+static int prefill_ssm_layer_chain_ready(const BnModel *m,
+                                         const BnLayerWeights *lw,
+                                         int layer,
+                                         int n_tokens) {
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    const BnBackendModel *backend = bn_model_backend(m);
+    const BnConfig *c = &m->config;
+    if (!gpu || !gpu->prefill_ssm_layer || !backend ||
+        gpu->kind != BN_GPU_BACKEND_CUDA ||
+        getenv("BN_CUDA_DISABLE_PREFILL_SSM_LAYER") ||
+        n_tokens < prefill_dense_chain_min_tokens(c, gpu) ||
+        !lw || !lw->ssm.wqkv.data || !lw->ssm.wz.data ||
+        !lw->ssm.ssm_alpha.data || !lw->ssm.ssm_beta.data ||
+        !lw->ssm.ssm_out.data || !lw->norm.attn_norm ||
+        !lw->ssm.ssm_conv1d || !lw->ssm.ssm_dt_bias ||
+        !lw->ssm.ssm_a || !lw->ssm.ssm_norm ||
+        !lw->ffn.ffn_gate.data || !lw->ffn.ffn_up.data ||
+        !lw->ffn.ffn_down.data || !c->has_ffn_gate ||
+        lw->moe.router_weight || lw->norm.ffn_sub_norm ||
+        lw->norm.layer_output_scale ||
+        ((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
+         (lw->norm.attn_post_norm || lw->norm.ffn_post_norm)) ||
+        c->ssm_time_step_rank <= 0 || c->ssm_state_size <= 0 ||
+        c->ssm_inner_size <= 0 || c->ssm_group_count <= 0)
+        return 0;
+
+    void *wqkv_buf = prefill_qweight_backend_buf(backend, &lw->ssm.wqkv);
+    void *wz_buf = prefill_qweight_backend_buf(backend, &lw->ssm.wz);
+    void *alpha_buf = prefill_qweight_backend_buf(backend,
+                                                  &lw->ssm.ssm_alpha);
+    void *beta_buf = prefill_qweight_backend_buf(backend,
+                                                 &lw->ssm.ssm_beta);
+    void *out_buf = prefill_qweight_backend_buf(backend, &lw->ssm.ssm_out);
+    void *attn_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_ATTN_NORM);
+    void *conv1d_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_CONV1D);
+    void *dt_bias_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_DT_BIAS);
+    void *a_log_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_A_LOG);
+    void *ssm_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_SSM_NORM);
+    void *gateup_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_GATEUP_STACKED);
+    void *gate_buf = gateup_buf &&
+                     lw->ffn.ffn_gate.type == lw->ffn.ffn_up.type
+                         ? gateup_buf
+                         : prefill_qweight_backend_buf(backend,
+                                                       &lw->ffn.ffn_gate);
+    void *up_buf = gateup_buf &&
+                   lw->ffn.ffn_gate.type == lw->ffn.ffn_up.type
+                       ? NULL
+                       : prefill_qweight_backend_buf(backend, &lw->ffn.ffn_up);
+    void *down_buf = prefill_qweight_backend_buf(backend, &lw->ffn.ffn_down);
+    if (!down_buf)
+        down_buf = bn_backend_model_handle(
+            backend, layer, BN_BACKEND_HANDLE_FFN_DOWN_PREFILL);
+    void *ffn_norm_buf = bn_backend_model_handle(
+        backend, layer, BN_BACKEND_HANDLE_FFN_NORM);
+
+    return wqkv_buf && wz_buf && alpha_buf && beta_buf && out_buf &&
+           attn_norm_buf && conv1d_buf && dt_bias_buf && a_log_buf &&
+           ssm_norm_buf && gate_buf && (gateup_buf || up_buf) &&
+           down_buf && ffn_norm_buf;
 }
 
 #ifdef __AVX2__
@@ -1522,6 +1589,49 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
             int qkv_dim_ssm = key_dim_ssm * 2 + value_dim;
             int kern_ssm = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
             int ssm_idx = plan.ssm_idx;
+
+            if (!getenv("BN_CUDA_DISABLE_PREFILL_SSM_RUN_CHAIN") &&
+                cuda_hybrid_prefill &&
+                prefill_ssm_layer_chain_ready(m, lw, l, n_tokens)) {
+                int run_end = l + 1;
+                while (run_end < c->n_layers) {
+                    BnLayerWeights *rlw = &w->layers[run_end];
+                    BnLayerShapePlan rplan;
+                    bn_transformer_plan_layer_shape(
+                        &rplan, c, rlw, run_end,
+                        bn_model_tq_state(m) != NULL);
+                    if (rplan.is_attn ||
+                        !prefill_ssm_layer_chain_ready(
+                            m, rlw, run_end, n_tokens))
+                        break;
+                    run_end++;
+                }
+                if (run_end - l > 1) {
+                    for (int rl = l; rl < run_end; rl++) {
+                        BnLayerWeights *rlw = &w->layers[rl];
+                        BnLayerShapePlan rplan;
+                        bn_transformer_plan_layer_shape(
+                            &rplan, c, rlw, rl,
+                            bn_model_tq_state(m) != NULL);
+                        int r_did_ffn = 0;
+                        float *layer_out = (rl == run_end - 1) ? act : NULL;
+                        const float *layer_in = (rl == l) ? act : NULL;
+                        if (prefill_ssm_layer_gpu(
+                                m, layer_out, rlw, layer_in, n_tokens, dim,
+                                qkv_dim_ssm, value_dim, num_k_heads,
+                                head_k_dim, num_v_heads, head_v_dim,
+                                kern_ssm, rplan.ssm_idx, rl, 1,
+                                c->norm_eps, &r_did_ffn) != 0 ||
+                            !r_did_ffn) {
+                            sh_arena_free(pf_arena);
+                            return NULL;
+                        }
+                    }
+                    l = run_end - 1;
+                    goto prefill_layer_done;
+                }
+            }
+
             size_t state_per_layer = (size_t)num_v_heads * head_k_dim * head_v_dim;
             float *ssm_state = s->ssm_state + (size_t)ssm_idx * state_per_layer;
             size_t conv_per_layer = (size_t)(kern_ssm - 1) * qkv_dim_ssm;

@@ -7250,7 +7250,8 @@ static int cuda_prefill_ssm_layer(
         *did_ffn = 0;
     if (getenv("BN_CUDA_DISABLE_PREFILL_SSM_LAYER"))
         return -1;
-    if (!ctx || !out || !X || !wqkv || !wqkv->data || !wz || !wz->data ||
+    if (!ctx || (!X && !ctx->d_out) ||
+        !wqkv || !wqkv->data || !wz || !wz->data ||
         !alpha || !alpha->data || !beta || !beta->data ||
         !ssm_out || !ssm_out->data || !attn_norm || !attn_norm->data ||
         !conv1d || !conv1d->data || !dt_bias || !dt_bias->data ||
@@ -7352,8 +7353,14 @@ static int cuda_prefill_ssm_layer(
     if (cuda_ensure_prefill(ctx, total_values) != 0)
         return -1;
 
-    cudaError_t err = cudaMemcpy(ctx->d_x, X, dim_values * sizeof(float),
-                                 cudaMemcpyHostToDevice);
+    cudaError_t err = cudaSuccess;
+    if (X) {
+        err = cudaMemcpy(ctx->d_x, X, dim_values * sizeof(float),
+                         cudaMemcpyHostToDevice);
+    } else {
+        err = cudaMemcpy(ctx->d_x, ctx->d_out, dim_values * sizeof(float),
+                         cudaMemcpyDeviceToDevice);
+    }
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] prefill ssm input upload failed: %s\n",
                 cudaGetErrorString(err));
@@ -7671,17 +7678,19 @@ static int cuda_prefill_ssm_layer(
     }
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_FFN);
 
-    size_t out_bytes = dim_values * sizeof(float);
-    if (cuda_ensure_host_out(ctx, out_bytes) != 0)
-        return -1;
-    err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
-                     cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[bn:gpu:cuda] prefill ssm readback failed: %s\n",
-                cudaGetErrorString(err));
-        return -1;
+    if (out) {
+        size_t out_bytes = dim_values * sizeof(float);
+        if (cuda_ensure_host_out(ctx, out_bytes) != 0)
+            return -1;
+        err = cudaMemcpy(ctx->h_out, ctx->d_out, out_bytes,
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] prefill ssm readback failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        memcpy(out, ctx->h_out, out_bytes);
     }
-    memcpy(out, ctx->h_out, out_bytes);
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_READBACK);
     if (ssm_profile) {
         ssm_profile_layers++;
