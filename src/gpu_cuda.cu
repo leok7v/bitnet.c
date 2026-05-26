@@ -316,6 +316,7 @@ static __device__ uint16_t cuda_fp32_to_fp16_bits(float f) {
 }
 
 static __device__ float cuda_q4k_value(const BnBlockQ4K *blk, int i);
+static __device__ float cuda_q5k_value(const BnBlockQ5K *blk, int i);
 static __device__ float cuda_q6k_value(const BnBlockQ6K *blk, int i);
 
 static __global__ void f32_to_f16_kernel(__half *out, const float *in,
@@ -371,6 +372,19 @@ static __global__ void dequant_q4k_to_f16_kernel(
                                     col / BN_QK_K];
     float v = cuda_q4k_value(blk, col & (BN_QK_K - 1));
     out[i] = __float2half_rn(v);
+}
+
+static __global__ void dequant_q5k_to_f16_kernel(
+    __half *out, const BnBlockQ5K *blocks, int rows, int cols) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * (size_t)cols;
+    if (i >= n) return;
+    int row = (int)(i / (size_t)cols);
+    int col = (int)(i - (size_t)row * (size_t)cols);
+    int n_bpr = cols / BN_QK_K;
+    const BnBlockQ5K *blk = &blocks[(size_t)row * n_bpr +
+                                    col / BN_QK_K];
+    out[i] = __float2half_rn(cuda_q5k_value(blk, col & (BN_QK_K - 1)));
 }
 
 static __global__ void dequant_q6k_to_f32_kernel(
@@ -5008,6 +5022,7 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
     if (buf->type != BN_GGUF_TENSOR_Q8_0 &&
         buf->type != BN_GGUF_TENSOR_Q5_0 &&
         buf->type != BN_GGUF_TENSOR_Q4_K &&
+        buf->type != BN_GGUF_TENSOR_Q5_K &&
         buf->type != BN_GGUF_TENSOR_Q6_K)
         return 0;
     if (getenv("BN_CUDA_DISABLE_CUBLAS_MATMUL"))
@@ -5024,6 +5039,7 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
     if (max_env && *max_env) {
         max_mb = atoi(max_env);
     } else if (buf->type == BN_GGUF_TENSOR_Q4_K ||
+               buf->type == BN_GGUF_TENSOR_Q5_K ||
                buf->type == BN_GGUF_TENSOR_Q6_K) {
         max_mb = 512;
     }
@@ -5064,6 +5080,10 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
     } else if (buf->type == BN_GGUF_TENSOR_Q4_K) {
         dequant_q4k_to_f16_kernel<<<blocks, threads>>>(
             (__half *)buf->f16_data, (const BnBlockQ4K *)buf->data,
+            buf->rows, buf->cols);
+    } else if (buf->type == BN_GGUF_TENSOR_Q5_K) {
+        dequant_q5k_to_f16_kernel<<<blocks, threads>>>(
+            (__half *)buf->f16_data, (const BnBlockQ5K *)buf->data,
             buf->rows, buf->cols);
     } else if (buf->type == BN_GGUF_TENSOR_Q6_K && q6_as_f16) {
         dequant_q6k_to_f16_kernel<<<blocks, threads>>>(
@@ -7270,6 +7290,36 @@ static int cuda_prefill_ssm_layer(
         }
     }
 
+    const int ssm_profile = getenv("BN_CUDA_SSM_PROFILE") != NULL;
+    enum {
+        BN_CUDA_SSM_PROF_UPLOAD = 0,
+        BN_CUDA_SSM_PROF_NORM,
+        BN_CUDA_SSM_PROF_QKVZ,
+        BN_CUDA_SSM_PROF_AB,
+        BN_CUDA_SSM_PROF_SCAN,
+        BN_CUDA_SSM_PROF_OUT,
+        BN_CUDA_SSM_PROF_FFN,
+        BN_CUDA_SSM_PROF_READBACK,
+        BN_CUDA_SSM_PROF_MAX
+    };
+    static double ssm_profile_totals[BN_CUDA_SSM_PROF_MAX] = {0.0};
+    static unsigned long long ssm_profile_layers = 0;
+    double ssm_profile_t0 = ssm_profile ? cuda_wall_ms() : 0.0;
+#define BN_CUDA_SSM_PROFILE_STEP(code_) do {                          \
+        if (ssm_profile) {                                            \
+            cudaError_t profile_err__ = cudaDeviceSynchronize();      \
+            double profile_now__ = cuda_wall_ms();                    \
+            if (profile_err__ != cudaSuccess) {                       \
+                fprintf(stderr,                                       \
+                        "[bn:gpu:cuda] ssm profile sync failed: %s\n", \
+                        cudaGetErrorString(profile_err__));           \
+                return -1;                                            \
+            }                                                         \
+            ssm_profile_totals[(code_)] += profile_now__ - ssm_profile_t0; \
+            ssm_profile_t0 = profile_now__;                           \
+        }                                                             \
+    } while (0)
+
     int use_stacked_prefill = getenv("BN_CUDA_ENABLE_SSM_STACKED_PREFILL") != NULL;
     int use_qkvz = use_stacked_prefill &&
                    qkvz && qkvz->data && wqkv_type == wz_type &&
@@ -7309,6 +7359,7 @@ static int cuda_prefill_ssm_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_UPLOAD);
 
     float *d_norm = ctx->d_prefill;
     float *d_qkv = d_norm + dim_values;
@@ -7335,6 +7386,7 @@ static int cuda_prefill_ssm_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_NORM);
 
     if (use_qkvz) {
         if (cuda_matmul_device_out(ctx, d_qkvz, qkvz, d_norm,
@@ -7357,6 +7409,7 @@ static int cuda_prefill_ssm_layer(
                                       n_tokens, wz_type) != 0) {
         return -1;
     }
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_QKVZ);
 
     int ab_preactivated = 0;
     if (getenv("BN_CUDA_ENABLE_SSM_F32_AB_PREFILL") &&
@@ -7395,6 +7448,7 @@ static int cuda_prefill_ssm_layer(
                                       beta_type) != 0) {
         return -1;
     }
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_AB);
 
     float q_scale = 1.0f / sqrtf((float)head_k_dim);
     int key_dim = num_k_heads * head_k_dim;
@@ -7536,6 +7590,7 @@ static int cuda_prefill_ssm_layer(
             }
         }
     }
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_SCAN);
 
     if (cuda_matmul_device_out(ctx, ctx->d_out, ssm_out, d_ssm, dim,
                                inner_dim, n_tokens, out_type) != 0)
@@ -7549,6 +7604,7 @@ static int cuda_prefill_ssm_layer(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_OUT);
 
     if (fuse_ffn) {
         err = cudaMemcpy(d_ffn_residual, ctx->d_out,
@@ -7613,6 +7669,7 @@ static int cuda_prefill_ssm_layer(
         if (did_ffn)
             *did_ffn = 1;
     }
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_FFN);
 
     size_t out_bytes = dim_values * sizeof(float);
     if (cuda_ensure_host_out(ctx, out_bytes) != 0)
@@ -7625,6 +7682,26 @@ static int cuda_prefill_ssm_layer(
         return -1;
     }
     memcpy(out, ctx->h_out, out_bytes);
+    BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_READBACK);
+    if (ssm_profile) {
+        ssm_profile_layers++;
+        if ((ssm_profile_layers % 64u) == 0u) {
+            fprintf(stderr,
+                    "[bn:gpu:cuda:ssm_profile] layers=%llu tokens=%d upload=%.3f norm=%.3f qkvz=%.3f ab=%.3f scan=%.3f out=%.3f ffn=%.3f readback=%.3f\n",
+                    ssm_profile_layers, n_tokens,
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_UPLOAD],
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_NORM],
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_QKVZ],
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_AB],
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_SCAN],
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_OUT],
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_FFN],
+                    ssm_profile_totals[BN_CUDA_SSM_PROF_READBACK]);
+            for (int i = 0; i < BN_CUDA_SSM_PROF_MAX; i++)
+                ssm_profile_totals[i] = 0.0;
+        }
+    }
+#undef BN_CUDA_SSM_PROFILE_STEP
     return 0;
 }
 

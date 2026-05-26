@@ -506,7 +506,7 @@ static int prefill_ssm_layer_gpu(const BnModel *m,
     void *up_buf = NULL;
     void *down_buf = NULL;
     void *ffn_norm_buf = NULL;
-    if (fuse_ffn && getenv("BN_CUDA_ENABLE_SSM_FFN_FUSE") &&
+    if (fuse_ffn && !getenv("BN_CUDA_DISABLE_SSM_FFN_FUSE") &&
         lw->ffn.ffn_gate.data && lw->ffn.ffn_up.data &&
         lw->ffn.ffn_down.data && m->config.has_ffn_gate &&
         !lw->norm.ffn_sub_norm &&
