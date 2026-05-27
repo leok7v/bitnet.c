@@ -166,9 +166,32 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
     memset(all_weights, 0, sz_wts);
 
     t0 = bn_moe_time_ms();
-    moe_batch_route(batch_logits, all_indices, all_weights, Xb,
-                    lw->moe.router_weight, n_tokens, dim, n_experts, K,
-                    bn_model_pool(m));
+    int used_gpu_route = 0;
+    BnGPUBackend *route_gpu = bn_model_gpu(m);
+    BnBackendModel *route_backend = bn_model_backend(m);
+    if (n_experts > 2 && route_gpu &&
+        route_gpu->kind == BN_GPU_BACKEND_CUDA &&
+        route_gpu->moe_route_batch && route_backend) {
+        void *router_gpu = bn_backend_model_handle(
+            route_backend, l, BN_BACKEND_HANDLE_MOE_ROUTER);
+        int route_rc = router_gpu
+            ? route_gpu->moe_route_batch(route_gpu->ctx, all_indices,
+                                         all_weights, router_gpu, Xb,
+                                         n_tokens, dim, n_experts, K)
+            : -1;
+        if (route_rc == 0)
+            used_gpu_route = 1;
+        else if (getenv("BN_CUDA_DEBUG_MOE_ROUTE_BATCH"))
+            fprintf(stderr,
+                    "[bn:cuda:moe-route-batch] fallback layer=%d handle=%d rc=%d tokens=%d experts=%d k=%d dim=%d\n",
+                    l, router_gpu != NULL, route_rc, n_tokens, n_experts, K,
+                    dim);
+    }
+    if (!used_gpu_route) {
+        moe_batch_route(batch_logits, all_indices, all_weights, Xb,
+                        lw->moe.router_weight, n_tokens, dim, n_experts, K,
+                        bn_model_pool(m));
+    }
     ms->stats.route_time_ms += bn_moe_time_ms() - t0;
 
     // 3. Build token-expert grouping (two-pass)

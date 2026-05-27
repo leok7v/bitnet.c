@@ -174,6 +174,12 @@ struct BnGPUBackend {
                                 int gate_type, int up_type,
                                 int down_type, int act_type);
 
+    // Batched MoE routing for prompt processing. X is [n_tokens, dim].
+    // Returns indices/weights as [n_tokens, k] on the host.
+    int (*moe_route_batch)(void *ctx, int *indices, float *weights,
+                           void *router_buf, const float *X,
+                           int n_tokens, int dim, int n_experts, int k);
+
     // Batched causal attention for prompt processing:
     // out[n_tokens, n_heads * head_size] =
     // attention(Q[n_tokens, n_heads * head_size],

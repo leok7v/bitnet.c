@@ -3489,6 +3489,28 @@ static __global__ void moe_router_logits_warp_kernel(float *logits,
         logits[e] = sum;
 }
 
+static __global__ void moe_router_logits_batch_warp_kernel(
+    float *logits, const float *router, const float *x,
+    int n_tokens, int n_experts, int dim) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int task = blockIdx.x * warps_per_block + warp;
+    int total = n_tokens * n_experts;
+    if (task >= total) return;
+    int token = task / n_experts;
+    int e = task - token * n_experts;
+    const float *row = router + (size_t)e * (size_t)dim;
+    const float *xt = x + (size_t)token * (size_t)dim;
+    float sum = 0.0f;
+    for (int d = lane; d < dim; d += 32)
+        sum += row[d] * xt[d];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        logits[(size_t)token * (size_t)n_experts + (size_t)e] = sum;
+}
+
 static __global__ void moe_route_topk_kernel(float *route,
                                              const float *logits,
                                              int n_experts,
@@ -3537,6 +3559,75 @@ static __global__ void moe_route_topk_kernel(float *route,
     }
     for (int i = 0; i < k; i++)
         route[k + i] = (float)selected[i];
+}
+
+static __global__ void moe_route_topk_batch_warp_kernel(
+    int *indices, float *weights, const float *logits,
+    int n_tokens, int n_experts, int k) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int token = blockIdx.x * warps_per_block + warp;
+    if (token >= n_tokens) return;
+    if (n_experts <= 0 || k <= 0) return;
+    if (k > BN_MAX_MOE_K) k = BN_MAX_MOE_K;
+
+    const float *row = logits + (size_t)token * (size_t)n_experts;
+    int selected[BN_MAX_MOE_K];
+    float selected_logits[BN_MAX_MOE_K];
+    for (int i = 0; i < k; i++) {
+        int local_best = -1;
+        float local_best_val = -INFINITY;
+        for (int e = lane; e < n_experts; e += 32) {
+            int used = 0;
+            for (int j = 0; j < i; j++) {
+                if (selected[j] == e) {
+                    used = 1;
+                    break;
+                }
+            }
+            if (used) continue;
+            float v = row[e];
+            if (v > local_best_val) {
+                local_best_val = v;
+                local_best = e;
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_val =
+                __shfl_down_sync(0xffffffffu, local_best_val, offset);
+            int other =
+                __shfl_down_sync(0xffffffffu, local_best, offset);
+            if (other_val > local_best_val ||
+                (other_val == local_best_val &&
+                 other >= 0 && (local_best < 0 || other < local_best))) {
+                local_best_val = other_val;
+                local_best = other;
+            }
+        }
+        int best = __shfl_sync(0xffffffffu, local_best, 0);
+        float best_val = __shfl_sync(0xffffffffu, local_best_val, 0);
+        selected[i] = best < 0 ? 0 : best;
+        selected_logits[i] = best_val;
+    }
+
+    if (lane != 0) return;
+    float max_selected = selected_logits[0];
+    for (int i = 1; i < k; i++)
+        if (selected_logits[i] > max_selected)
+            max_selected = selected_logits[i];
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) {
+        float w = expf(selected_logits[i] - max_selected);
+        weights[(size_t)token * (size_t)k + (size_t)i] = w;
+        sum += w;
+    }
+    if (sum > 0.0f) {
+        for (int i = 0; i < k; i++)
+            weights[(size_t)token * (size_t)k + (size_t)i] /= sum;
+    }
+    for (int i = 0; i < k; i++)
+        indices[(size_t)token * (size_t)k + (size_t)i] = selected[i];
 }
 
 static __global__ void moe_route_topk_warp_kernel(float *route,
@@ -7871,6 +7962,71 @@ static int cuda_moe_ffn_batch(void *vctx, float *out,
     return 0;
 }
 
+static int cuda_moe_route_batch(void *vctx, int *indices, float *weights,
+                                void *router_buf, const float *X,
+                                int n_tokens, int dim, int n_experts,
+                                int k) {
+    BnCudaCtx *ctx = (BnCudaCtx *)vctx;
+    BnCudaBuffer *router = (BnCudaBuffer *)router_buf;
+    if (getenv("BN_CUDA_DISABLE_MOE_ROUTE_BATCH"))
+        return -1;
+    if (!ctx || !indices || !weights || !router || !router->data || !X ||
+        n_tokens <= 0 || dim <= 0 || n_experts <= 0 || k <= 0 ||
+        k > BN_MAX_MOE_K || router->type != BN_GGUF_TENSOR_F32 ||
+        router->rows < n_experts || router->cols < dim)
+        return -1;
+
+    size_t x_values = (size_t)n_tokens * (size_t)dim;
+    size_t logits_values = (size_t)n_tokens * (size_t)n_experts;
+    if (cuda_ensure_prefill(ctx, x_values + logits_values) != 0)
+        return -1;
+    size_t route_items = (size_t)n_tokens * (size_t)k;
+    size_t idx_bytes = route_items * sizeof(int);
+    size_t weight_bytes = route_items * sizeof(float);
+    if (cuda_ensure_ops(ctx, idx_bytes + weight_bytes) != 0)
+        return -1;
+
+    float *d_x = ctx->d_prefill;
+    float *d_logits = d_x + x_values;
+    int *d_indices = (int *)ctx->d_ops;
+    float *d_weights = (float *)((uint8_t *)ctx->d_ops + idx_bytes);
+
+    cudaError_t err = cudaMemcpy(d_x, X, x_values * sizeof(float),
+                                 cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] moe route batch upload failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    int threads = 256;
+    int warps = threads / 32;
+    int route_tasks = n_tokens * n_experts;
+    int route_blocks = (route_tasks + warps - 1) / warps;
+    moe_router_logits_batch_warp_kernel<<<route_blocks, threads, 0>>>(
+        d_logits, (const float *)router->data, d_x, n_tokens, n_experts, dim);
+    err = cudaGetLastError();
+    if (err == cudaSuccess) {
+        int topk_threads = 128;
+        int topk_warps = topk_threads / 32;
+        int topk_blocks = (n_tokens + topk_warps - 1) / topk_warps;
+        moe_route_topk_batch_warp_kernel<<<topk_blocks, topk_threads, 0>>>(
+            d_indices, d_weights, d_logits, n_tokens, n_experts, k);
+        err = cudaGetLastError();
+    }
+    if (err == cudaSuccess)
+        err = cudaMemcpy(indices, d_indices, idx_bytes, cudaMemcpyDeviceToHost);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(weights, d_weights, weight_bytes,
+                         cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] moe route batch failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
 static int cuda_moe_routed_ffn_batch(void *vctx, float *out,
                                      void *gate_all_buf, void *up_all_buf,
                                      void *down_all_buf,
@@ -11642,6 +11798,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->dense_ffn_batch_norm_resid = cuda_dense_ffn_batch_norm_resid;
     gpu->moe_ffn_batch = cuda_moe_ffn_batch;
     gpu->moe_routed_ffn_batch = cuda_moe_routed_ffn_batch;
+    gpu->moe_route_batch = cuda_moe_route_batch;
     gpu->prefill_attention = cuda_prefill_attention;
     gpu->prefill_attention_wo = cuda_prefill_attention_wo;
     gpu->prefill_qkv_attention_wo = cuda_prefill_qkv_attention_wo;
