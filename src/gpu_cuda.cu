@@ -3398,6 +3398,51 @@ static __global__ void weighted_add_sigmoid_residual_reduce_kernel(
     }
 }
 
+static __global__ void weighted_add_sigmoid_residual_rmsnorm_kernel(
+    float *resid, const float *x, const float *r, const float *gate,
+    const float *gate_in, float *out, const float *norm_weight,
+    int n, int dim, int reset, int complement, float eps) {
+    __shared__ float partial_dot[256];
+    __shared__ float partial_ss[256];
+    int tid = threadIdx.x;
+    float dot = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x)
+        dot += gate_in[d] * gate[d];
+    partial_dot[tid] = dot;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            partial_dot[tid] += partial_dot[tid + stride];
+        __syncthreads();
+    }
+
+    float weight = 1.0f / (1.0f + __expf(-partial_dot[0]));
+    if (complement)
+        weight = 1.0f - weight;
+
+    float ss = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = weight * r[i];
+        float combined = reset ? v : x[i] + v;
+        float rv = resid[i] + combined;
+        resid[i] = rv;
+        ss += rv * rv;
+    }
+    partial_ss[tid] = ss;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            partial_ss[tid] += partial_ss[tid + stride];
+        __syncthreads();
+    }
+
+    float scale = rsqrtf(partial_ss[0] / (float)n + eps);
+    for (int i = tid; i < n; i += blockDim.x)
+        out[i] = resid[i] * scale * norm_weight[i];
+}
+
 static __global__ void moe_router_logits_kernel(float *logits,
                                                 const float *router,
                                                 const float *x,
@@ -10585,6 +10630,23 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 n <= 0 || dim <= 0)
                 return -1;
             if (dim <= 8192 && next &&
+                getenv("BN_CUDA_DISABLE_WEIGHTED_ADD_SIGMOID_RESIDUAL_RMSNORM_FUSE") == NULL &&
+                next->op_code == BN_GPU_CODE_RESIDUAL_RMSNORM &&
+                next->buf_aux == op->buf_in &&
+                (int)next->p[0] == n) {
+                float *resid = cuda_act(ctx, next->buf_in);
+                float *norm_out = cuda_act(ctx, next->buf_out);
+                BnCudaBuffer *norm = (BnCudaBuffer *)next->W_buf;
+                if (!resid || !norm_out || !norm || !norm->data)
+                    return -1;
+                BN_CUDA_LAUNCH(ctx,
+                    weighted_add_sigmoid_residual_rmsnorm_kernel,
+                    1, 256, 0, resid, in, aux,
+                    (const float *)gate->data, gate_in, norm_out,
+                    (const float *)norm->data, n, dim, (int)op->p[2],
+                    (int)op->p[4], cuda_u32_to_f32(next->p[1]));
+                i++;
+            } else if (dim <= 8192 && next &&
                 getenv("BN_CUDA_DISABLE_WEIGHTED_ADD_SIGMOID_RESIDUAL_FUSE") == NULL &&
                 next->op_code == BN_GPU_CODE_RESIDUAL_ADD &&
                 next->buf_aux == op->buf_in &&
