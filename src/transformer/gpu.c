@@ -910,6 +910,8 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
             int gpu_route_all2 =
                 router_diff && c->n_experts == 2 &&
                 c->n_experts_active == 2 &&
+                !bn_backend_model_handle(
+                    backend, l, BN_BACKEND_HANDLE_MOE_GATE_ALL) &&
                 !getenv("BN_CUDA_DISABLE_MOE_ROUTER_GPU");
             if (gpu_route_all2) {
                 if (gpu_resolve_moe_all2_resources(

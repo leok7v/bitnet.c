@@ -120,7 +120,7 @@ static void *upload_moe_all_proj(BnModel *model,
     if ((size_t)n_experts > (size_t)INT_MAX / (size_t)rows)
         return NULL;
     void *(*create_buffer)(void *, const void *, size_t, int, int, int) =
-        (type == BN_GGUF_TENSOR_Q8_0 && gpu->buffer_create_quant_only)
+        gpu->buffer_create_quant_only
             ? gpu->buffer_create_quant_only
             : gpu->buffer_create;
     if (stride != expert_bytes) {
