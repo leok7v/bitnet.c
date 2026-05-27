@@ -82,6 +82,7 @@ typedef enum {
     BN_GPU_CODE_RELU2_ACT,
     BN_GPU_CODE_WEIGHTED_ADD_SIGMOID,
     BN_GPU_CODE_MOE_ROUTE_TOPK,
+    BN_GPU_CODE_MOE_ROUTED_FFN,
 } BnGPUOpCode;
 
 // A single backend shader command in the lowered forward pass.
@@ -89,7 +90,9 @@ typedef struct BnGPUOp {
     int op_kind;         // BnGPUOpKind semantic op; 0 = infer from op_code
     int op_code;         // BnGPUOpCode concrete shader operation
     int type;            // BN_GGUF_TENSOR_* (matvec only, -1 otherwise)
-    void *W_buf;         // weight buffer handle (matvec only, NULL otherwise)
+    void *W_buf;         // primary weight buffer handle
+    void *W_buf2;        // optional secondary weight buffer handle
+    void *W_buf3;        // optional tertiary weight buffer handle
     int buf_in;          // BN_GPU_VALUE_* primary input
     int buf_out;         // BN_GPU_VALUE_* output
     int buf_aux;         // secondary BN_GPU_VALUE_* (-1 if unused)
@@ -134,6 +137,7 @@ static inline BnGPUOpKind bn_gpu_op_kind_from_code(int code) {
             return BN_GPU_OP_COPY;
         case BN_GPU_CODE_FUSED_GATEUP_SILU:
         case BN_GPU_CODE_MOE_ROUTE_TOPK:
+        case BN_GPU_CODE_MOE_ROUTED_FFN:
             return BN_GPU_OP_FFN;
         case BN_GPU_CODE_SSM_CONV_SILU:
         case BN_GPU_CODE_SSM_L2NORM:

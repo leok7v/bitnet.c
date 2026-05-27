@@ -2,8 +2,10 @@
 #include "backend_layout.h"
 #include "backend_model.h"
 #include "gpu_backend.h"
+#include "moe_internal.h"
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 
 static int checked_mul_size(size_t a, size_t b, size_t *out) {
     if (a != 0 && b > SIZE_MAX / a) return -1;
@@ -67,6 +69,59 @@ static void *upload_moe_router_diff2(BnGPUBackend *gpu,
                                       BN_GGUF_TENSOR_F32, 1, dim);
     free(diff);
     return handle;
+}
+
+static void *upload_moe_all_proj(BnModel *model,
+                                 BnGPUBackend *gpu,
+                                 const BnMoEExpertMap *em,
+                                 int proj,
+                                 int n_experts) {
+    if (!model || !gpu || !em || n_experts <= 0)
+        return NULL;
+    size_t offset = 0;
+    size_t expert_bytes = 0;
+    if (bn_moe_proj_info(em, 0, proj, &offset, &expert_bytes) != 0 ||
+        expert_bytes == 0)
+        return NULL;
+    size_t stride = 0;
+    int type = 0;
+    int rows = 0;
+    int cols = 0;
+    switch (proj) {
+        case 0:
+            stride = em->gate_stride ? em->gate_stride : em->expert_gate_bytes;
+            type = em->gate_type;
+            rows = em->gate_rows;
+            cols = em->gate_cols;
+            break;
+        case 1:
+            stride = em->up_stride ? em->up_stride : em->expert_up_bytes;
+            type = em->up_type;
+            rows = em->up_rows;
+            cols = em->up_cols;
+            break;
+        case 2:
+            stride = em->down_stride ? em->down_stride : em->expert_down_bytes;
+            type = em->down_type;
+            rows = em->down_rows;
+            cols = em->down_cols;
+            break;
+        default:
+            return NULL;
+    }
+    if (stride != expert_bytes)
+        return NULL;
+    const uint8_t *base = bn_moe_mmap_base_for_proj(
+        bn_model_moe_io(model), em, proj);
+    if (!base)
+        return NULL;
+    size_t total_bytes = 0;
+    if (checked_mul_size(expert_bytes, (size_t)n_experts, &total_bytes) != 0)
+        return NULL;
+    if ((size_t)n_experts > (size_t)INT_MAX / (size_t)rows)
+        return NULL;
+    return gpu->buffer_create(gpu->ctx, base + offset, total_bytes,
+                              type, rows * n_experts, cols);
 }
 
 int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
@@ -144,6 +199,20 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
                 (size_t)c->n_experts * (size_t)c->dim * sizeof(float),
                 BN_GGUF_TENSOR_F32, c->n_experts, c->dim)
             : NULL;
+        int upload_moe_all = lw->moe.router_weight &&
+                             getenv("BN_CUDA_ENABLE_MOE_ROUTED_FFN");
+        void *moe_gate_all_gpu = upload_moe_all
+            ? upload_moe_all_proj(model, gpu, &lw->moe.expert_map, 0,
+                                  c->n_experts)
+            : NULL;
+        void *moe_up_all_gpu = upload_moe_all
+            ? upload_moe_all_proj(model, gpu, &lw->moe.expert_map, 1,
+                                  c->n_experts)
+            : NULL;
+        void *moe_down_all_gpu = upload_moe_all
+            ? upload_moe_all_proj(model, gpu, &lw->moe.expert_map, 2,
+                                  c->n_experts)
+            : NULL;
         void *shared_expert_gate_gpu = lw->shared.shared_expert_gate
             ? gpu->buffer_create(
                 gpu->ctx, lw->shared.shared_expert_gate,
@@ -158,6 +227,12 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
                                 moe_router_diff_gpu) != 0 ||
             register_gpu_handle(model, l, BN_BACKEND_HANDLE_MOE_ROUTER,
                                 moe_router_gpu) != 0 ||
+            register_gpu_handle(model, l, BN_BACKEND_HANDLE_MOE_GATE_ALL,
+                                moe_gate_all_gpu) != 0 ||
+            register_gpu_handle(model, l, BN_BACKEND_HANDLE_MOE_UP_ALL,
+                                moe_up_all_gpu) != 0 ||
+            register_gpu_handle(model, l, BN_BACKEND_HANDLE_MOE_DOWN_ALL,
+                                moe_down_all_gpu) != 0 ||
             register_gpu_handle(model, l, BN_BACKEND_HANDLE_SHARED_EXPERT_GATE,
                                 shared_expert_gate_gpu) != 0) {
             if (attn_norm_gpu) gpu->buffer_destroy(gpu->ctx, attn_norm_gpu);
@@ -166,6 +241,12 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
                 gpu->buffer_destroy(gpu->ctx, moe_router_diff_gpu);
             if (moe_router_gpu)
                 gpu->buffer_destroy(gpu->ctx, moe_router_gpu);
+            if (moe_gate_all_gpu)
+                gpu->buffer_destroy(gpu->ctx, moe_gate_all_gpu);
+            if (moe_up_all_gpu)
+                gpu->buffer_destroy(gpu->ctx, moe_up_all_gpu);
+            if (moe_down_all_gpu)
+                gpu->buffer_destroy(gpu->ctx, moe_down_all_gpu);
             if (shared_expert_gate_gpu)
                 gpu->buffer_destroy(gpu->ctx, shared_expert_gate_gpu);
             bn_model_release_gpu(model);

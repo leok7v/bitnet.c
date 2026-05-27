@@ -263,6 +263,21 @@ int bn_transformer_gpu_emit_context_moe_route_topk(
     int dim,
     int n_experts,
     int k);
+int bn_transformer_gpu_emit_context_moe_routed_ffn(
+    BnTransformerGPUEmitContext *ctx,
+    void *gate_all_buf,
+    void *up_all_buf,
+    void *down_all_buf,
+    int buf_in,
+    int route_buf,
+    int buf_mid,
+    int buf_out,
+    int gate_type,
+    int down_type,
+    int dim,
+    int hidden,
+    int n_experts,
+    int k);
 int bn_transformer_gpu_fallback_ssm_layer(
     BnTransformerGPUEmitContext *emit,
     const BnGPUBackend *gpu,

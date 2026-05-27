@@ -528,6 +528,49 @@ int bn_transformer_gpu_emit_context_moe_route_topk(
     return 0;
 }
 
+int bn_transformer_gpu_emit_context_moe_routed_ffn(
+    BnTransformerGPUEmitContext *ctx,
+    void *gate_all_buf,
+    void *up_all_buf,
+    void *down_all_buf,
+    int buf_in,
+    int route_buf,
+    int buf_mid,
+    int buf_out,
+    int gate_type,
+    int down_type,
+    int dim,
+    int hidden,
+    int n_experts,
+    int k) {
+    if (!ctx || !gate_all_buf || !up_all_buf || !down_all_buf ||
+        dim <= 0 || hidden <= 0 || n_experts <= 0 || k <= 0)
+        return -1;
+    if (bn_transformer_gpu_emit_context_lower_pending(ctx) != 0)
+        return -1;
+    if (!ctx->lowered_ops || ctx->n < 0 || ctx->n >= ctx->cap)
+        return -1;
+    BnGPUOp *op = &((BnGPUOp *)ctx->lowered_ops)[ctx->n++];
+    memset(op, 0, sizeof(*op));
+    op->op_kind = BN_GPU_OP_FFN;
+    op->op_code = BN_GPU_CODE_MOE_ROUTED_FFN;
+    op->type = gate_type;
+    op->W_buf = gate_all_buf;
+    op->W_buf2 = up_all_buf;
+    op->W_buf3 = down_all_buf;
+    op->buf_in = buf_in;
+    op->buf_out = buf_out;
+    op->buf_aux = route_buf;
+    op->rows = hidden;
+    op->cols = dim;
+    op->p[0] = (uint32_t)hidden;
+    op->p[1] = (uint32_t)n_experts;
+    op->p[2] = (uint32_t)k;
+    op->p[3] = (uint32_t)down_type;
+    op->p[4] = (uint32_t)buf_mid;
+    return 0;
+}
+
 static int emit_context_matvec_split(BnTransformerGPUEmitContext *ctx,
                                      int type,
                                      void *weight_buf,

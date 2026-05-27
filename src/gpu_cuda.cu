@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 
 typedef struct {
     void *data;
@@ -3444,6 +3445,87 @@ static __global__ void moe_route_topk_kernel(float *route,
         route[k + i] = (float)selected[i];
 }
 
+static __global__ void moe_q4k_gateup_routed_mid_kernel(
+    float *mid,
+    const BnBlockQ4K *gate,
+    const BnBlockQ4K *up,
+    const BnCudaBlockQ8_1 *xq,
+    const float *route,
+    int hidden,
+    int cols,
+    int n_experts,
+    int k) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int task = blockIdx.x * warps_per_block + warp;
+    if (task >= hidden * k) return;
+
+    int slot = task / hidden;
+    int row = task - slot * hidden;
+    int expert = (int)(route[k + slot] + 0.5f);
+    if (expert < 0) expert = 0;
+    if (expert >= n_experts) expert = n_experts - 1;
+    float route_weight = route[slot];
+
+    int n_bpr = cols / BN_QK_K;
+    int kbx = lane / 16;
+    int iqs = 2 * (lane & 15);
+    size_t expert_row = ((size_t)expert * (size_t)hidden + (size_t)row);
+    const BnBlockQ4K *gate_blocks = gate + expert_row * (size_t)n_bpr;
+    const BnBlockQ4K *up_blocks = up + expert_row * (size_t)n_bpr;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (int b = kbx; b < n_bpr; b += 2) {
+        const BnCudaBlockQ8_1 *xqb = xq + (size_t)b * 8;
+        gate_sum += cuda_vec_dot_q4k_q8_1(&gate_blocks[b], xqb, iqs);
+        up_sum += cuda_vec_dot_q4k_q8_1(&up_blocks[b], xqb, iqs);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate_sum += __shfl_down_sync(0xffffffffu, gate_sum, offset);
+        up_sum += __shfl_down_sync(0xffffffffu, up_sum, offset);
+    }
+    if (lane == 0) {
+        float silu = gate_sum / (1.0f + __expf(-gate_sum));
+        mid[(size_t)slot * (size_t)hidden + (size_t)row] =
+            route_weight * silu * up_sum;
+    }
+}
+
+static __global__ void moe_q6k_down_routed_q8k_accum_kernel(
+    float *out,
+    const BnBlockQ6K *down,
+    const BnBlockQ8K *mid_q,
+    const float *route,
+    int dim,
+    int hidden,
+    int n_experts,
+    int k) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    if (row >= dim) return;
+
+    int n_bpr = hidden / BN_QK_K;
+    float sum = 0.0f;
+    for (int slot = 0; slot < k; slot++) {
+        int expert = (int)(route[k + slot] + 0.5f);
+        if (expert < 0) expert = 0;
+        if (expert >= n_experts) expert = n_experts - 1;
+        const BnBlockQ6K *row_blocks =
+            down + (((size_t)expert * (size_t)dim + (size_t)row) *
+                    (size_t)n_bpr);
+        const BnBlockQ8K *slot_mid_q = mid_q + (size_t)slot * (size_t)n_bpr;
+        for (int b = lane; b < n_bpr; b += 32)
+            sum += cuda_vec_dot_q6k_q8k(&row_blocks[b], slot_mid_q + b);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        out[row] = sum;
+}
+
 static __device__ __forceinline__ float cuda_fast_exp(float x) {
     x = fminf(88.7f, fmaxf(-87.3f, x));
     float n_f = floorf(x * 1.4426950409f + 0.5f);
@@ -5173,6 +5255,10 @@ static int cuda_init_activations(void *vctx, const void *config_ptr) {
             moe_scratch = c->n_experts;
         if (2 * c->n_experts_active > moe_scratch)
             moe_scratch = 2 * c->n_experts_active;
+        if (c->n_experts_active > 0 &&
+            c->moe_intermediate_size <= INT_MAX / c->n_experts_active &&
+            c->moe_intermediate_size * c->n_experts_active > moe_scratch)
+            moe_scratch = c->moe_intermediate_size * c->n_experts_active;
         sizes[BN_GPU_VALUE_MOE_HB] =
             (size_t)moe_scratch * sizeof(float);
         sizes[BN_GPU_VALUE_MOE_HB2] =
@@ -8369,6 +8455,7 @@ static const char *cuda_op_name(int code) {
     case BN_GPU_CODE_SILU_ACT: return "silu_act";
     case BN_GPU_CODE_RELU2_ACT: return "relu2_act";
     case BN_GPU_CODE_MOE_ROUTE_TOPK: return "moe_route_topk";
+    case BN_GPU_CODE_MOE_ROUTED_FFN: return "moe_routed_ffn";
     case BN_GPU_CODE_ROPE: return "rope";
     case BN_GPU_CODE_ROPE_QK: return "rope_qk";
     case BN_GPU_CODE_GQA_SCORES: return "gqa_scores";
@@ -8434,6 +8521,7 @@ static int cuda_op_reads_buf(const BnGPUOp *op, int buf) {
     case BN_GPU_CODE_Q5K_MATVEC_SPLIT:
     case BN_GPU_CODE_FUSED_GATEUP_SILU:
     case BN_GPU_CODE_MOE_ROUTE_TOPK:
+    case BN_GPU_CODE_MOE_ROUTED_FFN:
     case BN_GPU_CODE_RMSNORM:
     case BN_GPU_CODE_PER_HEAD_RMSNORM:
     case BN_GPU_CODE_COPY:
@@ -9431,6 +9519,65 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 logits, (const float *)w->data, in, n_experts, dim);
             BN_CUDA_LAUNCH(ctx, moe_route_topk_kernel, 1, 1, 0,
                 route, logits, n_experts, k);
+            break;
+        }
+        case BN_GPU_CODE_MOE_ROUTED_FFN: {
+            BnCudaBuffer *gate = (BnCudaBuffer *)op->W_buf;
+            BnCudaBuffer *up = (BnCudaBuffer *)op->W_buf2;
+            BnCudaBuffer *down = (BnCudaBuffer *)op->W_buf3;
+            float *in = cuda_act(ctx, op->buf_in);
+            float *route = cuda_act(ctx, op->buf_aux);
+            int mid_buf = (int)op->p[4];
+            float *mid = cuda_act(ctx, mid_buf);
+            float *out = cuda_act(ctx, op->buf_out);
+            int hidden = (int)op->p[0];
+            int n_experts = (int)op->p[1];
+            int k = (int)op->p[2];
+            int down_type = (int)op->p[3];
+            int dim = op->cols;
+            if (!gate || !gate->data || !up || !up->data ||
+                !down || !down->data || !in || !route || !mid || !out ||
+                op->type != BN_GGUF_TENSOR_Q4_K ||
+                down_type != BN_GGUF_TENSOR_Q6_K ||
+                dim <= 0 || hidden <= 0 || n_experts <= 0 || k <= 0 ||
+                (dim % BN_QK_K) != 0 || (hidden % BN_QK_K) != 0 ||
+                gate->type != BN_GGUF_TENSOR_Q4_K ||
+                up->type != BN_GGUF_TENSOR_Q4_K ||
+                down->type != BN_GGUF_TENSOR_Q6_K ||
+                gate->rows < hidden * n_experts || gate->cols < dim ||
+                up->rows < hidden * n_experts || up->cols < dim ||
+                down->rows < dim * n_experts || down->cols < hidden ||
+                ctx->act_sizes[op->buf_aux] <
+                    (size_t)(2 * k) * sizeof(float) ||
+                ctx->act_sizes[mid_buf] <
+                    (size_t)k * (size_t)hidden * sizeof(float) ||
+                ctx->act_sizes[op->buf_out] < (size_t)dim * sizeof(float))
+                return -1;
+            if (cuda_ensure_q8_1(ctx, dim) != 0) return -1;
+            BnCudaBlockQ8_1 *xq = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
+            BN_CUDA_LAUNCH(ctx, quantize_q8_1_kernel,
+                (dim + 31) / 32, 32, 0, xq, in, dim);
+            {
+                int route_threads = 256;
+                int warps = route_threads / 32;
+                int gateup_tasks = hidden * k;
+                int gateup_blocks = (gateup_tasks + warps - 1) / warps;
+                BN_CUDA_LAUNCH(ctx, moe_q4k_gateup_routed_mid_kernel,
+                    gateup_blocks, route_threads, 0,
+                    mid, (const BnBlockQ4K *)gate->data,
+                    (const BnBlockQ4K *)up->data, xq, route, hidden, dim,
+                    n_experts, k);
+                if (cuda_ensure_q8_k(ctx, hidden, k) != 0) return -1;
+                BnBlockQ8K *mid_q = (BnBlockQ8K *)ctx->d_q8_k;
+                BN_CUDA_LAUNCH(ctx, quantize_q8k_batch_kernel,
+                    dim3(hidden / BN_QK_K, k, 1), BN_QK_K, 0,
+                    mid_q, mid, hidden, k);
+                int down_blocks = (dim + warps - 1) / warps;
+                BN_CUDA_LAUNCH(ctx, moe_q6k_down_routed_q8k_accum_kernel,
+                    down_blocks, route_threads, 0,
+                    out, (const BnBlockQ6K *)down->data, mid_q, route,
+                    dim, hidden, n_experts, k);
+            }
             break;
         }
         case BN_GPU_CODE_RMSNORM: {
