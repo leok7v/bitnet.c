@@ -6248,7 +6248,7 @@ static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
         return -1;
     if (!ctx || !out || !gate || !down || !X ||
         !gate->data || !down->data ||
-        n_tokens <= 1 || dim <= 0 || hidden_dim <= 0 || act_type != 0)
+        n_tokens <= 0 || dim <= 0 || hidden_dim <= 0 || act_type != 0)
         return -1;
     if ((!stacked_gateup &&
          (up == NULL || !up->data || up->rows != hidden_dim ||
