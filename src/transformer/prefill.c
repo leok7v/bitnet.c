@@ -889,9 +889,9 @@ static int prefill_prepare_q_for_gpu_attention(BnBatchedAttnCtx *b) {
 
 static int prefill_gpu_attention_min_tokens(void) {
     const char *env = getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS");
-    if (!env || !*env) return 64;
+    if (!env || !*env) return 16;
     int n = atoi(env);
-    return n > 0 ? n : 64;
+    return n > 0 ? n : 16;
 }
 
 static int prefill_dense_chain_min_tokens(const BnConfig *c,
@@ -899,7 +899,7 @@ static int prefill_dense_chain_min_tokens(const BnConfig *c,
     const char *env = getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS");
     if (env && *env)
         return prefill_gpu_attention_min_tokens();
-    if (gpu && gpu->kind == BN_GPU_BACKEND_CUDA && c && c->dim >= 2048)
+    if (gpu && gpu->kind == BN_GPU_BACKEND_CUDA && c)
         return 16;
     return prefill_gpu_attention_min_tokens();
 }

@@ -7677,7 +7677,7 @@ static int cuda_prefill_attention(void *vctx, float *out,
         n_heads <= 0 || n_kv_heads <= 0 || head_size <= 0 ||
         kv_mul <= 0 || kv_dim <= 0 || n_heads / kv_mul != n_kv_heads)
         return -1;
-    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64);
+    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 16);
     if (n_tokens < min_tokens)
         return -1;
     if (n_tokens > 2048)
@@ -7752,7 +7752,7 @@ static int cuda_prefill_attention_wo(void *vctx, float *out, void *wo_buf,
         wo_cols != n_heads * head_size || wo->rows != wo_rows ||
         wo->cols != wo_cols || !cuda_type_supported(wo_type))
         return -1;
-    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64);
+    int min_tokens = cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 16);
     if (n_tokens < min_tokens || n_tokens > 2048)
         return -1;
 
@@ -7949,7 +7949,7 @@ static int cuda_prefill_qkv_attention_wo_impl(
         return -1;
     int min_tokens = getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS")
         ? cuda_env_int("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", 64)
-        : (dim >= 2048 ? 16 : 64);
+        : 16;
     if (n_tokens < min_tokens || n_tokens > 2048)
         return -1;
 
@@ -11050,6 +11050,9 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
 }
 
 BnGPUBackend *bn_gpu_cuda_create(void) {
+    if (!getenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS"))
+        setenv("BN_CUDA_PREFILL_ATTN_MIN_TOKENS", "16", 0);
+
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev <= 0) {
         fprintf(stderr, "[bn:gpu:cuda] no CUDA device available\n");
