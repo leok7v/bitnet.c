@@ -9515,7 +9515,7 @@ static int cuda_prefill_dense_layer(
     BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_FFN_NORM);
     int ffn_act_ready = 0;
     if (stacked_gateup && gate_type == BN_GGUF_TENSOR_Q4_K &&
-        (dim % BN_QK_K) == 0 &&
+        !gate->f16_data && (dim % BN_QK_K) == 0 &&
         getenv("BN_CUDA_DISABLE_PREFILL_FUSED_Q4K_GATEUP_BATCH") == NULL) {
         int x_blocks = (dim + 31) / 32;
         if (cuda_ensure_q8_1(ctx, x_blocks * 32 * n_tokens) != 0)
