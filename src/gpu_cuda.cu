@@ -10716,6 +10716,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     op->rows, op->cols, out_offset);
             } else if (op->type == BN_GGUF_TENSOR_Q4_K &&
                        (op->cols % BN_QK_K) == 0 && enable_q4k_dot &&
+                       (op->cols > 8192 ||
+                        getenv("BN_CUDA_ENABLE_Q4K_Q8K_DOT") != NULL) &&
                        getenv("BN_CUDA_DISABLE_Q4K_Q8K_DOT") == NULL) {
                 if (cuda_ensure_q8_k(ctx, op->cols, 1) != 0)
                     BN_CUDA_EXEC_FAIL("q4k q8k scratch alloc failed");
@@ -11084,6 +11086,9 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     up_rows, cols);
             } else if (op->type == BN_GGUF_TENSOR_Q4_K &&
                        (cols % BN_QK_K) == 0 && enable_q4k_dot &&
+                       (cols > 8192 ||
+                        getenv("BN_CUDA_ENABLE_Q4K_GATEUP_Q8K_DOT") != NULL ||
+                        getenv("BN_CUDA_ENABLE_Q4K_Q8K_DOT") != NULL) &&
                        getenv("BN_CUDA_DISABLE_Q4K_Q8K_DOT") == NULL) {
                 if (cuda_ensure_q8_k(ctx, cols, 1) != 0) return -1;
                 BnBlockQ8K *xq = (BnBlockQ8K *)ctx->d_q8_k;
