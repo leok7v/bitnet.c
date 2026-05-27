@@ -3371,6 +3371,33 @@ static __global__ void weighted_add_sigmoid_reduce_kernel(
     }
 }
 
+static __global__ void weighted_add_sigmoid_residual_reduce_kernel(
+    float *resid, const float *x, const float *r, const float *gate,
+    const float *gate_in, int n, int dim, int reset, int complement) {
+    __shared__ float partial[256];
+    int tid = threadIdx.x;
+    float dot = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x)
+        dot += gate_in[d] * gate[d];
+    partial[tid] = dot;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+
+    float weight = 1.0f / (1.0f + __expf(-partial[0]));
+    if (complement)
+        weight = 1.0f - weight;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = weight * r[i];
+        float combined = reset ? v : x[i] + v;
+        resid[i] += combined;
+    }
+}
+
 static __global__ void moe_router_logits_kernel(float *logits,
                                                 const float *router,
                                                 const float *x,
@@ -10531,7 +10558,18 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             if (!in || !aux || !gate_in || !gate || !gate->data ||
                 n <= 0 || dim <= 0)
                 return -1;
-            if (dim <= 8192) {
+            if (dim <= 8192 && next &&
+                next->op_code == BN_GPU_CODE_RESIDUAL_ADD &&
+                next->buf_aux == op->buf_in &&
+                (int)next->p[0] == n) {
+                float *resid = cuda_act(ctx, next->buf_in);
+                if (!resid) return -1;
+                BN_CUDA_LAUNCH(ctx,
+                    weighted_add_sigmoid_residual_reduce_kernel,
+                    1, 256, 0, resid, in, aux, (const float *)gate->data,
+                    gate_in, n, dim, (int)op->p[2], (int)op->p[4]);
+                i++;
+            } else if (dim <= 8192) {
                 BN_CUDA_LAUNCH(ctx, weighted_add_sigmoid_reduce_kernel,
                     1, 256, 0, in, aux, (const float *)gate->data,
                     gate_in, n, dim, (int)op->p[2], (int)op->p[4]);
