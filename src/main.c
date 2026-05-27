@@ -431,11 +431,9 @@ static void maybe_create_gpu_moe_cache(BnModel *model,
         char resident[32], layers[32];
         snprintf(resident, sizeof(resident), "%d", routed_resident_layers);
         snprintf(layers, sizeof(layers), "%d", routed_moe_layers);
-        SH_LOG_INFO("GPU MoE cache skipped",
-                    "reason", "cuda_routed_ffn_resident",
+        SH_LOG_INFO("GPU MoE routed resident",
                     "resident_layers", resident,
                     "moe_layers", layers);
-        return;
     }
     size_t entry_bytes = model_moe_entry_bytes(model);
     if (entry_bytes == 0)
@@ -459,6 +457,8 @@ static void maybe_create_gpu_moe_cache(BnModel *model,
                         "entries", entries, "ms", ms);
         } else {
             SH_LOG_WARN("GPU MoE resident preload failed; using lazy cache");
+            bn_gpu_moe_cache_free(bn_model_gpu_moe_cache(model));
+            bn_model_set_gpu_moe_cache(model, NULL);
         }
     }
 }
