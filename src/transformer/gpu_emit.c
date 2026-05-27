@@ -497,6 +497,37 @@ int bn_transformer_gpu_emit_context_fused_gateup_silu(
     return 0;
 }
 
+int bn_transformer_gpu_emit_context_moe_route_topk(
+    BnTransformerGPUEmitContext *ctx,
+    void *router_buf,
+    int buf_in,
+    int logits_buf,
+    int route_buf,
+    int dim,
+    int n_experts,
+    int k) {
+    if (!ctx || !router_buf || dim <= 0 || n_experts <= 0 || k <= 0)
+        return -1;
+    if (bn_transformer_gpu_emit_context_lower_pending(ctx) != 0)
+        return -1;
+    if (!ctx->lowered_ops || ctx->n < 0 || ctx->n >= ctx->cap)
+        return -1;
+    BnGPUOp *op = &((BnGPUOp *)ctx->lowered_ops)[ctx->n++];
+    memset(op, 0, sizeof(*op));
+    op->op_kind = BN_GPU_OP_FFN;
+    op->op_code = BN_GPU_CODE_MOE_ROUTE_TOPK;
+    op->type = BN_GGUF_TENSOR_F32;
+    op->W_buf = router_buf;
+    op->buf_in = buf_in;
+    op->buf_out = route_buf;
+    op->buf_aux = logits_buf;
+    op->rows = n_experts;
+    op->cols = dim;
+    op->p[0] = (uint32_t)n_experts;
+    op->p[1] = (uint32_t)k;
+    return 0;
+}
+
 static int emit_context_matvec_split(BnTransformerGPUEmitContext *ctx,
                                      int type,
                                      void *weight_buf,

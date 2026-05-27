@@ -81,6 +81,7 @@ typedef enum {
     BN_GPU_CODE_SILU_ACT,
     BN_GPU_CODE_RELU2_ACT,
     BN_GPU_CODE_WEIGHTED_ADD_SIGMOID,
+    BN_GPU_CODE_MOE_ROUTE_TOPK,
 } BnGPUOpCode;
 
 // A single backend shader command in the lowered forward pass.
@@ -132,6 +133,7 @@ static inline BnGPUOpKind bn_gpu_op_kind_from_code(int code) {
         case BN_GPU_CODE_DEINTERLEAVE_Q:
             return BN_GPU_OP_COPY;
         case BN_GPU_CODE_FUSED_GATEUP_SILU:
+        case BN_GPU_CODE_MOE_ROUTE_TOPK:
             return BN_GPU_OP_FFN;
         case BN_GPU_CODE_SSM_CONV_SILU:
         case BN_GPU_CODE_SSM_L2NORM:

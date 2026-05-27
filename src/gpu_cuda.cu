@@ -4,6 +4,7 @@
 
 #include "gguf.h"
 #include "model_config.h"
+#include "moe_types.h"
 #include "quant.h"
 #include "gpu_shader.h"
 
@@ -3369,6 +3370,80 @@ static __global__ void weighted_add_sigmoid_reduce_kernel(
     }
 }
 
+static __global__ void moe_router_logits_kernel(float *logits,
+                                                const float *router,
+                                                const float *x,
+                                                int n_experts,
+                                                int dim) {
+    int e = blockIdx.x;
+    int tid = threadIdx.x;
+    if (e >= n_experts) return;
+    const float *row = router + (size_t)e * (size_t)dim;
+    float sum = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x)
+        sum += row[d] * x[d];
+    extern __shared__ float scratch[];
+    scratch[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0)
+        logits[e] = scratch[0];
+}
+
+static __global__ void moe_route_topk_kernel(float *route,
+                                             const float *logits,
+                                             int n_experts,
+                                             int k) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (n_experts <= 0 || k <= 0) return;
+    if (k > BN_MAX_MOE_K) k = BN_MAX_MOE_K;
+
+    int selected[BN_MAX_MOE_K];
+    float selected_logits[BN_MAX_MOE_K];
+    for (int i = 0; i < k; i++) {
+        int best = -1;
+        float best_val = -INFINITY;
+        for (int e = 0; e < n_experts; e++) {
+            int used = 0;
+            for (int j = 0; j < i; j++) {
+                if (selected[j] == e) {
+                    used = 1;
+                    break;
+                }
+            }
+            if (used) continue;
+            float v = logits[e];
+            if (v > best_val) {
+                best_val = v;
+                best = e;
+            }
+        }
+        selected[i] = best < 0 ? 0 : best;
+        selected_logits[i] = best_val;
+    }
+
+    float max_selected = selected_logits[0];
+    for (int i = 1; i < k; i++)
+        if (selected_logits[i] > max_selected)
+            max_selected = selected_logits[i];
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) {
+        float w = expf(selected_logits[i] - max_selected);
+        route[i] = w;
+        sum += w;
+    }
+    if (sum > 0.0f) {
+        for (int i = 0; i < k; i++)
+            route[i] /= sum;
+    }
+    for (int i = 0; i < k; i++)
+        route[k + i] = (float)selected[i];
+}
+
 static __device__ __forceinline__ float cuda_fast_exp(float x) {
     x = fminf(88.7f, fmaxf(-87.3f, x));
     float n_f = floorf(x * 1.4426950409f + 0.5f);
@@ -5093,10 +5168,15 @@ static int cuda_init_activations(void *vctx, const void *config_ptr) {
             : gated_q_size;
     }
     if (c->moe_intermediate_size > 0) {
+        int moe_scratch = c->moe_intermediate_size;
+        if (c->n_experts > moe_scratch)
+            moe_scratch = c->n_experts;
+        if (2 * c->n_experts_active > moe_scratch)
+            moe_scratch = 2 * c->n_experts_active;
         sizes[BN_GPU_VALUE_MOE_HB] =
-            (size_t)c->moe_intermediate_size * sizeof(float);
+            (size_t)moe_scratch * sizeof(float);
         sizes[BN_GPU_VALUE_MOE_HB2] =
-            (size_t)c->moe_intermediate_size * sizeof(float);
+            (size_t)moe_scratch * sizeof(float);
         sizes[BN_GPU_VALUE_MOE_OUT] =
             (size_t)c->dim * sizeof(float);
     }
@@ -8288,6 +8368,7 @@ static const char *cuda_op_name(int code) {
     case BN_GPU_CODE_SIGMOID_GATE: return "sigmoid_gate";
     case BN_GPU_CODE_SILU_ACT: return "silu_act";
     case BN_GPU_CODE_RELU2_ACT: return "relu2_act";
+    case BN_GPU_CODE_MOE_ROUTE_TOPK: return "moe_route_topk";
     case BN_GPU_CODE_ROPE: return "rope";
     case BN_GPU_CODE_ROPE_QK: return "rope_qk";
     case BN_GPU_CODE_GQA_SCORES: return "gqa_scores";
@@ -8352,6 +8433,7 @@ static int cuda_op_reads_buf(const BnGPUOp *op, int buf) {
     case BN_GPU_CODE_Q8_MATVEC_SPLIT:
     case BN_GPU_CODE_Q5K_MATVEC_SPLIT:
     case BN_GPU_CODE_FUSED_GATEUP_SILU:
+    case BN_GPU_CODE_MOE_ROUTE_TOPK:
     case BN_GPU_CODE_RMSNORM:
     case BN_GPU_CODE_PER_HEAD_RMSNORM:
     case BN_GPU_CODE_COPY:
@@ -9325,6 +9407,30 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     threads, (size_t)threads * sizeof(float) * 2,
                     out, w->data, in, gate_rows, up_rows, cols, op->type);
             }
+            break;
+        }
+        case BN_GPU_CODE_MOE_ROUTE_TOPK: {
+            BnCudaBuffer *w = (BnCudaBuffer *)op->W_buf;
+            float *in = cuda_act(ctx, op->buf_in);
+            float *route = cuda_act(ctx, op->buf_out);
+            float *logits = cuda_act(ctx, op->buf_aux);
+            int n_experts = (int)op->p[0];
+            int k = (int)op->p[1];
+            int dim = op->cols;
+            if (!w || !w->data || !in || !route || !logits ||
+                n_experts <= 0 || k <= 0 || dim <= 0 ||
+                w->type != BN_GGUF_TENSOR_F32 ||
+                w->rows < n_experts || w->cols < dim ||
+                ctx->act_sizes[op->buf_aux] <
+                    (size_t)n_experts * sizeof(float) ||
+                ctx->act_sizes[op->buf_out] <
+                    (size_t)(2 * k) * sizeof(float))
+                return -1;
+            BN_CUDA_LAUNCH(ctx, moe_router_logits_kernel, n_experts,
+                threads, (size_t)threads * sizeof(float),
+                logits, (const float *)w->data, in, n_experts, dim);
+            BN_CUDA_LAUNCH(ctx, moe_route_topk_kernel, 1, 1, 0,
+                route, logits, n_experts, k);
             break;
         }
         case BN_GPU_CODE_RMSNORM: {

@@ -138,6 +138,12 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
             (c->n_experts == 2 && c->n_experts_active == 2)
                 ? upload_moe_router_diff2(gpu, lw->moe.router_weight, c->dim)
                 : NULL;
+        void *moe_router_gpu = lw->moe.router_weight
+            ? gpu->buffer_create(
+                gpu->ctx, lw->moe.router_weight,
+                (size_t)c->n_experts * (size_t)c->dim * sizeof(float),
+                BN_GGUF_TENSOR_F32, c->n_experts, c->dim)
+            : NULL;
         void *shared_expert_gate_gpu = lw->shared.shared_expert_gate
             ? gpu->buffer_create(
                 gpu->ctx, lw->shared.shared_expert_gate,
@@ -150,12 +156,16 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
                                 ffn_norm_gpu) != 0 ||
             register_gpu_handle(model, l, BN_BACKEND_HANDLE_MOE_ROUTER_DIFF,
                                 moe_router_diff_gpu) != 0 ||
+            register_gpu_handle(model, l, BN_BACKEND_HANDLE_MOE_ROUTER,
+                                moe_router_gpu) != 0 ||
             register_gpu_handle(model, l, BN_BACKEND_HANDLE_SHARED_EXPERT_GATE,
                                 shared_expert_gate_gpu) != 0) {
             if (attn_norm_gpu) gpu->buffer_destroy(gpu->ctx, attn_norm_gpu);
             if (ffn_norm_gpu) gpu->buffer_destroy(gpu->ctx, ffn_norm_gpu);
             if (moe_router_diff_gpu)
                 gpu->buffer_destroy(gpu->ctx, moe_router_diff_gpu);
+            if (moe_router_gpu)
+                gpu->buffer_destroy(gpu->ctx, moe_router_gpu);
             if (shared_expert_gate_gpu)
                 gpu->buffer_destroy(gpu->ctx, shared_expert_gate_gpu);
             bn_model_release_gpu(model);

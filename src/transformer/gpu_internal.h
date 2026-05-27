@@ -254,6 +254,15 @@ int bn_transformer_gpu_emit_context_fused_gateup_silu(
     int up_rows,
     int cols,
     int use_q4_q8);
+int bn_transformer_gpu_emit_context_moe_route_topk(
+    BnTransformerGPUEmitContext *ctx,
+    void *router_buf,
+    int buf_in,
+    int logits_buf,
+    int route_buf,
+    int dim,
+    int n_experts,
+    int k);
 int bn_transformer_gpu_fallback_ssm_layer(
     BnTransformerGPUEmitContext *emit,
     const BnGPUBackend *gpu,
