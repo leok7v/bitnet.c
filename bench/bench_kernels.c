@@ -24,6 +24,7 @@
 #ifdef BN_ENABLE_CUDA
 #include "gpu_cuda.h"
 #include "gpu_moe_cache.h"
+#include "gpu_moe_bridge.h"
 #endif
 #if defined(__wasm_relaxed_simd__)
 #include <wasm_simd128.h>
@@ -33,6 +34,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+static size_t bench_env_mb_or_default(const char *name, int default_mb) {
+    const char *s = getenv(name);
+    if (!s || !*s)
+        return default_mb > 0 ? (size_t)default_mb : 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (!end || *end != '\0' || v <= 0)
+        return 0;
+    return (size_t)v;
+}
 
 static const char *type_name(int type) {
     switch (type) {
@@ -910,21 +922,50 @@ int main(int argc, char **argv) {
                 gpu_cache_mb = atoi(cache_env);
             if (gpu_cache_mb > 0) {
                 size_t entry_bytes = 0;
+                int moe_layers = 0;
                 for (int l = 0; l < model.config.n_layers; l++) {
                     BnMoEExpertMap *em =
                         &model.weights.layers[l].moe.expert_map;
-                    entry_bytes = em->expert_gate_bytes +
-                                  em->expert_up_bytes +
-                                  em->expert_down_bytes;
-                    if (entry_bytes > 0)
-                        break;
+                    size_t layer_entry_bytes = em->expert_gate_bytes +
+                                               em->expert_up_bytes +
+                                               em->expert_down_bytes;
+                    if (layer_entry_bytes == 0)
+                        continue;
+                    moe_layers++;
+                    if (entry_bytes == 0)
+                        entry_bytes = layer_entry_bytes;
                 }
                 if (entry_bytes > 0) {
+                    size_t budget_bytes =
+                        (size_t)gpu_cache_mb * 1024u * 1024u;
+                    int auto_resident = 0;
+                    if (!cache_env && cuda_gpu->memory_info && moe_layers > 0) {
+                        size_t all_experts =
+                            entry_bytes * (size_t)moe_layers *
+                            (size_t)model.config.n_experts;
+                        size_t free_bytes = 0;
+                        size_t total_bytes = 0;
+                        size_t reserve_mb = bench_env_mb_or_default(
+                            "BN_GPU_MOE_CACHE_RESERVE_MB", 4096);
+                        size_t reserve = reserve_mb * 1024u * 1024u;
+                        if (cuda_gpu->memory_info(cuda_gpu->ctx, &free_bytes,
+                                                  &total_bytes) == 0 &&
+                            all_experts > 0 &&
+                            free_bytes > all_experts + reserve) {
+                            budget_bytes = all_experts;
+                            auto_resident = 1;
+                            (void)total_bytes;
+                        }
+                    }
                     bn_model_set_gpu_moe_cache(
                         &model,
-                        bn_gpu_moe_cache_create(
-                            (size_t)gpu_cache_mb * 1024u * 1024u,
-                            entry_bytes, cuda_gpu));
+                        bn_gpu_moe_cache_create(budget_bytes, entry_bytes,
+                                                cuda_gpu));
+                    if (auto_resident && bn_model_gpu_moe_cache(&model)) {
+                        if (bn_gpu_moe_bridge_preload_all(&model) < 0)
+                            fprintf(stderr,
+                                    "WARN: GPU MoE preload failed; using lazy cache\n");
+                    }
                 }
             }
         }

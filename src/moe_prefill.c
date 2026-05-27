@@ -6,9 +6,9 @@
 
 static int moe_cuda_prefill_min_tokens(void) {
     const char *env = getenv("BN_CUDA_MOE_PREFILL_MIN_TOKENS");
-    if (!env || !*env) return 4;
+    if (!env || !*env) return 1;
     int v = atoi(env);
-    return v > 0 ? v : 4;
+    return v > 0 ? v : 1;
 }
 
 typedef struct {
