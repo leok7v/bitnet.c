@@ -3539,6 +3539,72 @@ static __global__ void moe_route_topk_kernel(float *route,
         route[k + i] = (float)selected[i];
 }
 
+static __global__ void moe_route_topk_warp_kernel(float *route,
+                                                  const float *logits,
+                                                  int n_experts,
+                                                  int k) {
+    int lane = threadIdx.x & 31;
+    if (blockIdx.x != 0 || threadIdx.x >= 32) return;
+    if (n_experts <= 0 || k <= 0) return;
+    if (k > BN_MAX_MOE_K) k = BN_MAX_MOE_K;
+
+    int selected[BN_MAX_MOE_K];
+    float selected_logits[BN_MAX_MOE_K];
+    for (int i = 0; i < k; i++) {
+        int local_best = -1;
+        float local_best_val = -INFINITY;
+        for (int e = lane; e < n_experts; e += 32) {
+            int used = 0;
+            for (int j = 0; j < i; j++) {
+                if (selected[j] == e) {
+                    used = 1;
+                    break;
+                }
+            }
+            if (used) continue;
+            float v = logits[e];
+            if (v > local_best_val) {
+                local_best_val = v;
+                local_best = e;
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_val =
+                __shfl_down_sync(0xffffffffu, local_best_val, offset);
+            int other =
+                __shfl_down_sync(0xffffffffu, local_best, offset);
+            if (other_val > local_best_val ||
+                (other_val == local_best_val &&
+                 other >= 0 && (local_best < 0 || other < local_best))) {
+                local_best_val = other_val;
+                local_best = other;
+            }
+        }
+        int best = __shfl_sync(0xffffffffu, local_best, 0);
+        float best_val = __shfl_sync(0xffffffffu, local_best_val, 0);
+        selected[i] = best < 0 ? 0 : best;
+        selected_logits[i] = best_val;
+    }
+
+    if (lane != 0) return;
+    float max_selected = selected_logits[0];
+    for (int i = 1; i < k; i++)
+        if (selected_logits[i] > max_selected)
+            max_selected = selected_logits[i];
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) {
+        float w = expf(selected_logits[i] - max_selected);
+        route[i] = w;
+        sum += w;
+    }
+    if (sum > 0.0f) {
+        for (int i = 0; i < k; i++)
+            route[i] /= sum;
+    }
+    for (int i = 0; i < k; i++)
+        route[k + i] = (float)selected[i];
+}
+
 static __global__ void moe_route_diff2_kernel(float *route,
                                               const float *router_diff,
                                               const float *x,
@@ -10479,8 +10545,14 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 BN_CUDA_LAUNCH(ctx, moe_router_logits_warp_kernel, blocks,
                     threads, 0, logits, (const float *)w->data, in,
                     n_experts, dim);
-                BN_CUDA_LAUNCH(ctx, moe_route_topk_kernel, 1, 1, 0,
-                    route, logits, n_experts, k);
+                if (n_experts <= 256 &&
+                    !getenv("BN_CUDA_DISABLE_MOE_ROUTER_WARP_TOPK")) {
+                    BN_CUDA_LAUNCH(ctx, moe_route_topk_warp_kernel, 1, 32, 0,
+                        route, logits, n_experts, k);
+                } else {
+                    BN_CUDA_LAUNCH(ctx, moe_route_topk_kernel, 1, 1, 0,
+                        route, logits, n_experts, k);
+                }
             }
             break;
         }
