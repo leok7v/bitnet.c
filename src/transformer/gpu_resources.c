@@ -168,10 +168,12 @@ BnTransformerGPUSSMResources bn_transformer_gpu_resolve_ssm_resources(
 
 BnTransformerGPUMoESharedResources
 bn_transformer_gpu_resolve_moe_shared_resources(
+    const BnGPUBackend *gpu,
     const BnBackendModel *backend,
     const BnLayerWeights *lw,
     int layer) {
     return (BnTransformerGPUMoESharedResources){
+        .gpu = gpu,
         .shared_gate = qweight_backend_buf(backend, &lw->shared.shared_gate),
         .shared_up = qweight_backend_buf(backend, &lw->shared.shared_up),
         .shared_down = qweight_backend_buf(backend, &lw->shared.shared_down),

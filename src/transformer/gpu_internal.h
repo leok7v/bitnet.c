@@ -73,6 +73,7 @@ typedef struct {
 } BnTransformerGPUSSMResources;
 
 typedef struct {
+    const BnGPUBackend *gpu;
     void *shared_gate;
     void *shared_up;
     void *shared_down;
@@ -164,6 +165,7 @@ BnTransformerGPUSSMResources bn_transformer_gpu_resolve_ssm_resources(
     int layer);
 BnTransformerGPUMoESharedResources
 bn_transformer_gpu_resolve_moe_shared_resources(
+    const BnGPUBackend *gpu,
     const BnBackendModel *backend,
     const BnLayerWeights *lw,
     int layer);
