@@ -1601,6 +1601,7 @@ void bn_transformer_gpu_emit_context_moe(BnTransformerGPUEmitContext *ctx,
         memcpy(&u_ew, &expert->weight, 4);
 
         int use_fused_gateup =
+            !getenv("BN_GPU_DISABLE_FUSED_GATEUP") &&
             shared && expert->buffers.use_gateup_split &&
             bn_transformer_gpu_can_fused_gateup_silu(
                 shared->gpu, em->gate_type, 0);
@@ -1659,6 +1660,7 @@ void bn_transformer_gpu_emit_context_moe(BnTransformerGPUEmitContext *ctx,
 
     if (lw->shared.shared_gate.data && shared && shared->shared_gate) {
         int use_shared_fused_gateup =
+            !getenv("BN_GPU_DISABLE_FUSED_GATEUP") &&
             shared->shared_gateup_stacked &&
             lw->shared.shared_gate.type == lw->shared.shared_up.type &&
             lw->shared.shared_gate.rows == lw->shared.shared_up.rows &&

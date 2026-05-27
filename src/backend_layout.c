@@ -80,6 +80,17 @@ static void prepared_qweight_prepare_layer(BnBackendModel *backend,
     prepared_qweight_prepare_one(backend, &lw->ffn.ffn_down, arena);
 }
 
+static void *upload_stacked_quant_layout(BnGPUBackend *gpu,
+                                         const void *data, size_t size,
+                                         int type, int rows, int cols) {
+    if (!gpu || !data || size == 0)
+        return NULL;
+    if (gpu->buffer_create_quant_only)
+        return gpu->buffer_create_quant_only(gpu->ctx, data, size,
+                                             type, rows, cols);
+    return gpu->buffer_create(gpu->ctx, data, size, type, rows, cols);
+}
+
 const char *bn_backend_layout_reason_string(BnBackendLayoutReason reason) {
     switch (reason) {
         case BN_BACKEND_LAYOUT_OK: return "ok";
@@ -183,8 +194,9 @@ void *bn_backend_layout_upload_stacked2(BnGPUBackend *gpu,
     memcpy(combined, a->data, a_sz);
     memcpy(combined + a_sz, b->data, b_sz);
 
-    void *buf = gpu->buffer_create(gpu->ctx, combined, combined_sz,
-                                   a->type, a->rows + b->rows, a->cols);
+    void *buf = upload_stacked_quant_layout(gpu, combined, combined_sz,
+                                            a->type, a->rows + b->rows,
+                                            a->cols);
     free(combined);
     return buf;
 }
@@ -262,8 +274,8 @@ void *bn_backend_layout_upload_stacked3_qkv(BnGPUBackend *gpu,
                                               v->data, v_sz,
                                               q->type, total_rows, q->cols);
         } else {
-            buf = gpu->buffer_create(gpu->ctx, combined, combined_sz,
-                                     q->type, total_rows, q->cols);
+            buf = upload_stacked_quant_layout(gpu, combined, combined_sz,
+                                              q->type, total_rows, q->cols);
         }
     }
 

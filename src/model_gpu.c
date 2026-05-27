@@ -190,6 +190,56 @@ static size_t env_mb_or_default(const char *name, size_t def) {
     return (size_t)v;
 }
 
+static int optional_layout_fits_memory(BnGPUBackend *gpu, size_t bytes,
+                                       int layer, const char *name) {
+    if (bytes == 0)
+        return 0;
+    if (!gpu || !gpu->memory_info)
+        return 1;
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (gpu->memory_info(gpu->ctx, &free_bytes, &total_bytes) != 0)
+        return 1;
+    size_t reserve_mb = env_mb_or_default("BN_CUDA_LAYOUT_RESERVE_MB", 4096);
+    size_t reserve = reserve_mb > SIZE_MAX / (1024u * 1024u)
+        ? SIZE_MAX
+        : reserve_mb * 1024u * 1024u;
+    if (free_bytes > bytes && free_bytes - bytes >= reserve)
+        return 1;
+
+    static int skipped_logs = 0;
+    if (skipped_logs < 8) {
+        fprintf(stderr,
+                "[bn:gpu] skipping optional CUDA layout %s layer=%d: "
+                "need=%.1f MiB free=%.1f MiB total=%.1f MiB "
+                "reserve=%.1f MiB\n",
+                name ? name : "unknown", layer, bytes / 1048576.0,
+                free_bytes / 1048576.0, total_bytes / 1048576.0,
+                reserve / 1048576.0);
+        skipped_logs++;
+    }
+    return 0;
+}
+
+static size_t qweight_pair_bytes(const BnQWeight *a, const BnQWeight *b) {
+    if (!a || !b)
+        return 0;
+    size_t a_sz = bn_qweight_data_size(a);
+    size_t b_sz = bn_qweight_data_size(b);
+    if (a_sz > SIZE_MAX - b_sz)
+        return SIZE_MAX;
+    return a_sz + b_sz;
+}
+
+static size_t qweight_triple_bytes(const BnQWeight *a, const BnQWeight *b,
+                                   const BnQWeight *c) {
+    size_t ab = qweight_pair_bytes(a, b);
+    size_t c_sz = c ? bn_qweight_data_size(c) : 0;
+    if (ab > SIZE_MAX - c_sz)
+        return SIZE_MAX;
+    return ab + c_sz;
+}
+
 static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
                                           const BnWeights *w) {
     if (!c || !w || c->n_experts <= 0)
@@ -438,12 +488,18 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
             return -1;
         }
 
-        void *qkv_stacked_gpu = bn_backend_layout_upload_stacked3_qkv(
-            gpu, &lw->attn.wq, &lw->attn.wk, &lw->attn.wv,
-            lw->attn.q_bias, lw->attn.k_bias, lw->attn.v_bias,
-            lw->attn.q_bias && !q_bias_gpu,
-            lw->attn.k_bias && !k_bias_gpu,
-            lw->attn.v_bias && !v_bias_gpu);
+        void *qkv_stacked_gpu = NULL;
+        if (optional_layout_fits_memory(
+                gpu, qweight_triple_bytes(&lw->attn.wq, &lw->attn.wk,
+                                          &lw->attn.wv),
+                l, "qkv_stacked")) {
+            qkv_stacked_gpu = bn_backend_layout_upload_stacked3_qkv(
+                gpu, &lw->attn.wq, &lw->attn.wk, &lw->attn.wv,
+                lw->attn.q_bias, lw->attn.k_bias, lw->attn.v_bias,
+                lw->attn.q_bias && !q_bias_gpu,
+                lw->attn.k_bias && !k_bias_gpu,
+                lw->attn.v_bias && !v_bias_gpu);
+        }
         if (register_gpu_handle(model, l, BN_BACKEND_HANDLE_QKV_STACKED,
                                 qkv_stacked_gpu) != 0) {
             if (qkv_stacked_gpu) gpu->buffer_destroy(gpu->ctx, qkv_stacked_gpu);
@@ -451,8 +507,14 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
             return -1;
         }
 
-        void *qk_stacked_gpu =
-            bn_backend_layout_upload_stacked2(gpu, &lw->attn.wq, &lw->attn.wk);
+        void *qk_stacked_gpu = NULL;
+        if (optional_layout_fits_memory(
+                gpu, qweight_pair_bytes(&lw->attn.wq, &lw->attn.wk),
+                l, "qk_stacked")) {
+            qk_stacked_gpu =
+                bn_backend_layout_upload_stacked2(gpu, &lw->attn.wq,
+                                                  &lw->attn.wk);
+        }
         if (register_gpu_handle(model, l, BN_BACKEND_HANDLE_QK_STACKED,
                                 qk_stacked_gpu) != 0) {
             if (qk_stacked_gpu) gpu->buffer_destroy(gpu->ctx, qk_stacked_gpu);
@@ -460,8 +522,14 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
             return -1;
         }
 
-        void *gateup_stacked_gpu =
-            bn_backend_layout_upload_stacked2(gpu, &lw->ffn.ffn_gate, &lw->ffn.ffn_up);
+        void *gateup_stacked_gpu = NULL;
+        if (optional_layout_fits_memory(
+                gpu, qweight_pair_bytes(&lw->ffn.ffn_gate, &lw->ffn.ffn_up),
+                l, "gateup_stacked")) {
+            gateup_stacked_gpu =
+                bn_backend_layout_upload_stacked2(gpu, &lw->ffn.ffn_gate,
+                                                  &lw->ffn.ffn_up);
+        }
         if (register_gpu_handle(model, l, BN_BACKEND_HANDLE_GATEUP_STACKED,
                                 gateup_stacked_gpu) != 0) {
             if (gateup_stacked_gpu) gpu->buffer_destroy(gpu->ctx, gateup_stacked_gpu);
@@ -469,9 +537,15 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
             return -1;
         }
 
-        void *shared_gateup_stacked_gpu =
-            bn_backend_layout_upload_stacked2(
-                gpu, &lw->shared.shared_gate, &lw->shared.shared_up);
+        void *shared_gateup_stacked_gpu = NULL;
+        if (optional_layout_fits_memory(
+                gpu, qweight_pair_bytes(&lw->shared.shared_gate,
+                                        &lw->shared.shared_up),
+                l, "shared_gateup_stacked")) {
+            shared_gateup_stacked_gpu =
+                bn_backend_layout_upload_stacked2(
+                    gpu, &lw->shared.shared_gate, &lw->shared.shared_up);
+        }
         if (register_gpu_handle(model, l,
                                 BN_BACKEND_HANDLE_SHARED_GATEUP_STACKED,
                                 shared_gateup_stacked_gpu) != 0) {
@@ -481,8 +555,14 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
             return -1;
         }
 
-        void *ssm_qkvz_stacked_gpu =
-            bn_backend_layout_upload_stacked2(gpu, &lw->ssm.wqkv, &lw->ssm.wz);
+        void *ssm_qkvz_stacked_gpu = NULL;
+        if (optional_layout_fits_memory(
+                gpu, qweight_pair_bytes(&lw->ssm.wqkv, &lw->ssm.wz),
+                l, "ssm_qkvz_stacked")) {
+            ssm_qkvz_stacked_gpu =
+                bn_backend_layout_upload_stacked2(gpu, &lw->ssm.wqkv,
+                                                  &lw->ssm.wz);
+        }
         if (register_gpu_handle(model, l, BN_BACKEND_HANDLE_SSM_QKVZ_STACKED,
                                 ssm_qkvz_stacked_gpu) != 0) {
             if (ssm_qkvz_stacked_gpu) gpu->buffer_destroy(gpu->ctx, ssm_qkvz_stacked_gpu);
@@ -490,8 +570,15 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
             return -1;
         }
 
-        void *ssm_ab_stacked_gpu =
-            bn_backend_layout_upload_stacked2(gpu, &lw->ssm.ssm_alpha, &lw->ssm.ssm_beta);
+        void *ssm_ab_stacked_gpu = NULL;
+        if (optional_layout_fits_memory(
+                gpu, qweight_pair_bytes(&lw->ssm.ssm_alpha,
+                                        &lw->ssm.ssm_beta),
+                l, "ssm_ab_stacked")) {
+            ssm_ab_stacked_gpu =
+                bn_backend_layout_upload_stacked2(gpu, &lw->ssm.ssm_alpha,
+                                                  &lw->ssm.ssm_beta);
+        }
         if (register_gpu_handle(model, l, BN_BACKEND_HANDLE_SSM_AB_STACKED,
                                 ssm_ab_stacked_gpu) != 0) {
             if (ssm_ab_stacked_gpu) gpu->buffer_destroy(gpu->ctx, ssm_ab_stacked_gpu);
