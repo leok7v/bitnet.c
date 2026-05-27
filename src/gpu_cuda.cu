@@ -9528,8 +9528,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
     int moe_q4k_q8_dot_default =
         ctx->has_moe_model &&
         getenv("BN_CUDA_DISABLE_MOE_Q4K_Q8K_DOT") == NULL;
-    int graph_exec = (enable_graph_exec_flag ||
-                      (!moe_graph && default_graph_exec)) &&
+    int graph_exec = (enable_graph_exec_flag || default_graph_exec) &&
                      n_ops > 10 && !profile;
     int graph_building = 0;
     cudaGraphExec_t graph_instance = NULL;
