@@ -1582,7 +1582,7 @@ void bn_transformer_gpu_emit_context_moe(BnTransformerGPUEmitContext *ctx,
     const BnMoEExpertMap *em = moe->expert_map;
     int moe_hidden = moe->moe_hidden;
 
-    for (int k = 0; k < moe->n_experts; k++) {
+    for (int k = 0; moe->experts && k < moe->n_experts; k++) {
         const BnGPUMoEResolvedExpert *expert = &moe->experts[k];
         uint32_t u_ew;
         memcpy(&u_ew, &expert->weight, 4);

@@ -119,6 +119,10 @@ static void *upload_moe_all_proj(BnModel *model,
         return NULL;
     if ((size_t)n_experts > (size_t)INT_MAX / (size_t)rows)
         return NULL;
+    void *(*create_buffer)(void *, const void *, size_t, int, int, int) =
+        (type == BN_GGUF_TENSOR_Q8_0 && gpu->buffer_create_quant_only)
+            ? gpu->buffer_create_quant_only
+            : gpu->buffer_create;
     if (stride != expert_bytes) {
         uint8_t *packed = (uint8_t *)malloc(total_bytes);
         if (!packed)
@@ -128,13 +132,13 @@ static void *upload_moe_all_proj(BnModel *model,
                    base + offset + (size_t)e * stride,
                    expert_bytes);
         }
-        void *handle = gpu->buffer_create(gpu->ctx, packed, total_bytes,
-                                           type, rows * n_experts, cols);
+        void *handle = create_buffer(gpu->ctx, packed, total_bytes,
+                                     type, rows * n_experts, cols);
         free(packed);
         return handle;
     }
-    return gpu->buffer_create(gpu->ctx, base + offset, total_bytes,
-                              type, rows * n_experts, cols);
+    return create_buffer(gpu->ctx, base + offset, total_bytes,
+                         type, rows * n_experts, cols);
 }
 
 static int can_use_cuda_moe_routed_ffn(const BnConfig *c,
@@ -142,12 +146,14 @@ static int can_use_cuda_moe_routed_ffn(const BnConfig *c,
     if (!c || !lw || !lw->moe.router_weight)
         return 0;
     const BnMoEExpertMap *em = &lw->moe.expert_map;
-    int down_supported = em->down_type == BN_GGUF_TENSOR_Q6_K ||
-                         em->down_type == BN_GGUF_TENSOR_Q4_K;
-    return !c->has_shared_expert &&
-           em->gate_type == BN_GGUF_TENSOR_Q4_K &&
-           em->up_type == BN_GGUF_TENSOR_Q4_K &&
-           down_supported &&
+    int is_q4 = em->gate_type == BN_GGUF_TENSOR_Q4_K &&
+                em->up_type == BN_GGUF_TENSOR_Q4_K &&
+                (em->down_type == BN_GGUF_TENSOR_Q6_K ||
+                 em->down_type == BN_GGUF_TENSOR_Q4_K);
+    int is_q8 = em->gate_type == BN_GGUF_TENSOR_Q8_0 &&
+                em->up_type == BN_GGUF_TENSOR_Q8_0 &&
+                em->down_type == BN_GGUF_TENSOR_Q8_0;
+    return (is_q4 || is_q8) &&
            em->gate_rows == c->moe_intermediate_size &&
            em->up_rows == c->moe_intermediate_size &&
            em->gate_cols == c->dim &&

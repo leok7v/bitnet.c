@@ -435,6 +435,9 @@ static void maybe_create_gpu_moe_cache(BnModel *model,
                     "resident_layers", resident,
                     "moe_layers", layers);
     }
+    if (!args->gpu_cache_mb_set && routed_moe_layers > 0 &&
+        routed_resident_layers == routed_moe_layers)
+        return;
     size_t entry_bytes = model_moe_entry_bytes(model);
     if (entry_bytes == 0)
         return;

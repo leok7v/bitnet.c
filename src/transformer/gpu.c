@@ -945,13 +945,18 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 backend, l, BN_BACKEND_HANDLE_MOE_UP_ALL);
             void *moe_down_all = bn_backend_model_handle(
                 backend, l, BN_BACKEND_HANDLE_MOE_DOWN_ALL);
-            int gpu_routed_ffn =
-                gpu_route_topk && moe_gate_all && moe_up_all && moe_down_all &&
-                !c->has_shared_expert &&
+            int moe_routed_q4 =
                 lw->moe.expert_map.gate_type == BN_GGUF_TENSOR_Q4_K &&
                 lw->moe.expert_map.up_type == BN_GGUF_TENSOR_Q4_K &&
                 (lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q6_K ||
-                 lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q4_K) &&
+                 lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q4_K);
+            int moe_routed_q8 =
+                lw->moe.expert_map.gate_type == BN_GGUF_TENSOR_Q8_0 &&
+                lw->moe.expert_map.up_type == BN_GGUF_TENSOR_Q8_0 &&
+                lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q8_0;
+            int gpu_routed_ffn =
+                gpu_route_topk && moe_gate_all && moe_up_all && moe_down_all &&
+                (moe_routed_q4 || moe_routed_q8) &&
                 lw->moe.expert_map.gate_rows == c->moe_intermediate_size &&
                 lw->moe.expert_map.up_rows == c->moe_intermediate_size &&
                 lw->moe.expert_map.gate_cols == dim &&
@@ -976,11 +981,24 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                         c->n_experts_active) != 0)
                     return bn_transformer_gpu_reject_forward(
                         &emit, "gpu moe routed ffn emit failed");
-                bn_transformer_gpu_emit_context_residual_add(
-                    &emit, BN_GPU_VALUE_X, BN_GPU_VALUE_MOE_OUT, dim);
-                bn_transformer_gpu_emit_context_rmsnorm(
-                    &emit, next_norm, BN_GPU_VALUE_X, BN_GPU_VALUE_XB, dim,
-                    u_eps);
+                if (c->has_shared_expert && lw->shared.shared_gate.data) {
+                    BnTransformerGPUMoESharedResources moe_shared =
+                        bn_transformer_gpu_resolve_moe_shared_resources(
+                            gpu, backend, lw, l);
+                    BnGPUMoEResources shared_only = {
+                        &lw->moe.expert_map, NULL, 1,
+                        c->moe_intermediate_size
+                    };
+                    bn_transformer_gpu_emit_context_moe(
+                        &emit, &shared_only, &moe_shared, lw, dim, u_eps,
+                        next_norm);
+                } else {
+                    bn_transformer_gpu_emit_context_residual_add(
+                        &emit, BN_GPU_VALUE_X, BN_GPU_VALUE_MOE_OUT, dim);
+                    bn_transformer_gpu_emit_context_rmsnorm(
+                        &emit, next_norm, BN_GPU_VALUE_X, BN_GPU_VALUE_XB,
+                        dim, u_eps);
+                }
                 continue;
             }
             int did_gpu_route_topk = 0;

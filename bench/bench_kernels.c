@@ -35,6 +35,37 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef BN_ENABLE_CUDA
+static int bench_cuda_routed_moe_resident_layers(const BnModel *model,
+                                                 int *moe_layers_out) {
+    if (moe_layers_out)
+        *moe_layers_out = 0;
+    if (!model || getenv("BN_CUDA_DISABLE_MOE_ROUTED_FFN"))
+        return 0;
+    const BnBackendModel *backend = bn_model_backend(model);
+    if (!backend)
+        return 0;
+    int moe_layers = 0;
+    int resident_layers = 0;
+    for (int l = 0; l < model->config.n_layers; l++) {
+        const BnLayerWeights *lw = &model->weights.layers[l];
+        if (!lw->moe.router_weight)
+            continue;
+        moe_layers++;
+        if (bn_backend_model_handle(backend, l,
+                                    BN_BACKEND_HANDLE_MOE_GATE_ALL) &&
+            bn_backend_model_handle(backend, l,
+                                    BN_BACKEND_HANDLE_MOE_UP_ALL) &&
+            bn_backend_model_handle(backend, l,
+                                    BN_BACKEND_HANDLE_MOE_DOWN_ALL))
+            resident_layers++;
+    }
+    if (moe_layers_out)
+        *moe_layers_out = moe_layers;
+    return resident_layers;
+}
+#endif
+
 static size_t bench_env_mb_or_default(const char *name, int default_mb) {
     const char *s = getenv(name);
     if (!s || !*s)
@@ -920,6 +951,13 @@ int main(int argc, char **argv) {
             const char *cache_env = getenv("BN_GPU_CACHE_MB");
             if (cache_env && *cache_env)
                 gpu_cache_mb = atoi(cache_env);
+            int routed_moe_layers = 0;
+            int routed_resident_layers =
+                bench_cuda_routed_moe_resident_layers(&model,
+                                                      &routed_moe_layers);
+            if (!cache_env && routed_moe_layers > 0 &&
+                routed_resident_layers == routed_moe_layers)
+                gpu_cache_mb = 0;
             if (gpu_cache_mb > 0) {
                 size_t entry_bytes = 0;
                 int moe_layers = 0;
