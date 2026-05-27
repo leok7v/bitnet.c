@@ -43,6 +43,12 @@ struct BnGPUBackend {
     // caches. Optional; callers use this for memory-sensitive resident caches.
     void *(*buffer_create_quant_only)(void *ctx, const void *data, size_t size,
                                       int type, int rows, int cols);
+    // Upload quantized Q6_K data and request an FP32 auxiliary cache when the
+    // backend can fit it. Optional; callers use this for CUDA MoE down paths
+    // that are faster with resident dequantized weights.
+    void *(*buffer_create_q6_f32_cache)(void *ctx, const void *data,
+                                        size_t size, int type,
+                                        int rows, int cols);
     void  (*buffer_destroy)(void *ctx, void *buffer);
 
     // Upload quantized weight data with fused bias. Returns opaque buffer handle.

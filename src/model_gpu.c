@@ -120,10 +120,17 @@ static void *upload_moe_all_proj(BnModel *model,
         return NULL;
     if ((size_t)n_experts > (size_t)INT_MAX / (size_t)rows)
         return NULL;
-    int force_full_buffer =
+    int prefer_q6_f32_cache =
         proj == 2 && type == BN_GGUF_TENSOR_Q6_K &&
-        getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE");
+        gpu->buffer_create_q6_f32_cache &&
+        getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
+    int force_full_buffer =
+        prefer_q6_f32_cache ||
+        (proj == 2 && type == BN_GGUF_TENSOR_Q6_K &&
+         getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE"));
     void *(*create_buffer)(void *, const void *, size_t, int, int, int) =
+        prefer_q6_f32_cache
+            ? gpu->buffer_create_q6_f32_cache :
         (!force_full_buffer && gpu->buffer_create_quant_only)
             ? gpu->buffer_create_quant_only
             : gpu->buffer_create;

@@ -6091,7 +6091,8 @@ static int cuda_read_activation(void *vctx, int buf_idx, void *out,
     return err == cudaSuccess ? 0 : -1;
 }
 
-static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
+static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf,
+                                        int force_q6_f32) {
     if (!buf || !buf->data || buf->rows <= 0 || buf->cols <= 0 ||
         (buf->cols & 31) != 0)
         return 0;
@@ -6105,6 +6106,7 @@ static int cuda_buffer_create_f16_cache(BnCudaBuffer *buf) {
         return 0;
 
     int q6_as_f16 = buf->type == BN_GGUF_TENSOR_Q6_K &&
+                    !force_q6_f32 &&
                     getenv("BN_CUDA_DISABLE_Q6K_CUBLAS_F16") == NULL &&
                     getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
     size_t n = (size_t)buf->rows * (size_t)buf->cols;
@@ -6224,7 +6226,7 @@ static void *cuda_buffer_create_impl(void *vctx, const void *data, size_t size,
         return NULL;
     }
     if (create_aux_cache)
-        cuda_buffer_create_f16_cache(buf);
+        cuda_buffer_create_f16_cache(buf, create_aux_cache == 2);
     return buf;
 }
 
@@ -6237,6 +6239,12 @@ static void *cuda_buffer_create_quant_only(void *vctx, const void *data,
                                            size_t size, int type, int rows,
                                            int cols) {
     return cuda_buffer_create_impl(vctx, data, size, type, rows, cols, 0);
+}
+
+static void *cuda_buffer_create_q6_f32_cache(void *vctx, const void *data,
+                                             size_t size, int type, int rows,
+                                             int cols) {
+    return cuda_buffer_create_impl(vctx, data, size, type, rows, cols, 2);
 }
 
 static void cuda_buffer_destroy(void *vctx, void *buffer) {
@@ -9396,13 +9404,17 @@ enum {
     BN_CUDA_PROFILE_QKV_MIXED = 64,
     BN_CUDA_PROFILE_READBACK = 65,
     BN_CUDA_PROFILE_LOGITS = 66,
-    BN_CUDA_PROFILE_MAX = 67
+    BN_CUDA_PROFILE_MOE_GATEUP = 67,
+    BN_CUDA_PROFILE_MOE_DOWN = 68,
+    BN_CUDA_PROFILE_MAX = 69
 };
 
 static const char *cuda_profile_name(int code) {
     if (code == BN_CUDA_PROFILE_QKV_MIXED) return "qkv_mixed";
     if (code == BN_CUDA_PROFILE_READBACK) return "readback";
     if (code == BN_CUDA_PROFILE_LOGITS) return "logits";
+    if (code == BN_CUDA_PROFILE_MOE_GATEUP) return "moe_gateup";
+    if (code == BN_CUDA_PROFILE_MOE_DOWN) return "moe_down";
     return cuda_op_name(code);
 }
 
@@ -10509,6 +10521,15 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 } else {
                     int use_q4k_q8k_dot =
                         getenv("BN_CUDA_DISABLE_MOE_Q4K_Q8K_DOT") == NULL;
+                    int profile_moe_internal =
+                        profile && getenv("BN_CUDA_PROFILE_MOE_INTERNAL");
+                    cudaEvent_t moe_ev_start = NULL;
+                    cudaEvent_t moe_ev_stop = NULL;
+                    if (profile_moe_internal) {
+                        cudaEventCreate(&moe_ev_start);
+                        cudaEventCreate(&moe_ev_stop);
+                        cudaEventRecord(moe_ev_start, ctx->exec_stream);
+                    }
                     if (use_q4k_q8k_dot) {
                         if (cuda_ensure_q8_k(ctx, dim, 1) != 0) return -1;
                         BnBlockQ8K *xq = (BnBlockQ8K *)ctx->d_q8_k;
@@ -10534,11 +10555,20 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                             (const BnBlockQ4K *)up->data, xq, route, hidden,
                             dim, n_experts, k);
                     }
+                    if (profile_moe_internal) {
+                        cudaEventRecord(moe_ev_stop, ctx->exec_stream);
+                        cudaEventSynchronize(moe_ev_stop);
+                        float ms = 0.0f;
+                        cudaEventElapsedTime(&ms, moe_ev_start, moe_ev_stop);
+                        profile_ops[BN_CUDA_PROFILE_MOE_GATEUP]++;
+                        profile_ms[BN_CUDA_PROFILE_MOE_GATEUP] += (double)ms;
+                        cudaEventRecord(moe_ev_start, ctx->exec_stream);
+                    }
                     if (down_type == BN_GGUF_TENSOR_Q6_K) {
                         int use_q6_float_down =
                             getenv("BN_CUDA_DISABLE_Q6K_FLOAT_MOE_DOWN") == NULL;
-                        if (getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE") &&
-                            down->f32_data) {
+                        if (down->f32_data &&
+                            getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL) {
                             BN_CUDA_LAUNCH(ctx,
                                 moe_q6k_down_routed_f32_cache_warp_kernel,
                                 down_blocks, route_threads, 0,
@@ -10573,6 +10603,16 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                             down_blocks, route_threads, 0,
                             out, (const BnBlockQ4K *)down->data, mid_q,
                             route, dim, hidden, n_experts, k);
+                    }
+                    if (profile_moe_internal) {
+                        cudaEventRecord(moe_ev_stop, ctx->exec_stream);
+                        cudaEventSynchronize(moe_ev_stop);
+                        float ms = 0.0f;
+                        cudaEventElapsedTime(&ms, moe_ev_start, moe_ev_stop);
+                        profile_ops[BN_CUDA_PROFILE_MOE_DOWN]++;
+                        profile_ms[BN_CUDA_PROFILE_MOE_DOWN] += (double)ms;
+                        cudaEventDestroy(moe_ev_start);
+                        cudaEventDestroy(moe_ev_stop);
                     }
                 }
             }
@@ -11453,6 +11493,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     (void)cublasSetMathMode(ctx->cublas, CUBLAS_TENSOR_OP_MATH);
     gpu->buffer_create = cuda_buffer_create;
     gpu->buffer_create_quant_only = cuda_buffer_create_quant_only;
+    gpu->buffer_create_q6_f32_cache = cuda_buffer_create_q6_f32_cache;
     gpu->buffer_destroy = cuda_buffer_destroy;
     gpu->matvec = cuda_matvec;
     gpu->matmul = cuda_matmul;
