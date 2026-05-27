@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 static int checked_mul_size(size_t a, size_t b, size_t *out) {
@@ -178,6 +179,75 @@ static int can_use_cuda_moe_routed_ffn_model(const BnConfig *c,
     return moe_layers > 0;
 }
 
+static size_t env_mb_or_default(const char *name, size_t def) {
+    const char *s = getenv(name);
+    if (!s || !*s)
+        return def;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (!end || *end != '\0')
+        return def;
+    return (size_t)v;
+}
+
+static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
+                                          const BnWeights *w) {
+    if (!c || !w || c->n_experts <= 0)
+        return 0;
+    size_t total = 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        const BnMoEExpertMap *em = &w->layers[l].moe.expert_map;
+        size_t layer = 0;
+        size_t proj = 0;
+        if (checked_mul_size(em->expert_gate_bytes,
+                             (size_t)c->n_experts, &proj) != 0 ||
+            checked_mul_size(em->expert_up_bytes,
+                             (size_t)c->n_experts, &layer) != 0)
+            return SIZE_MAX;
+        if (proj > SIZE_MAX - layer)
+            return SIZE_MAX;
+        layer += proj;
+        if (checked_mul_size(em->expert_down_bytes,
+                             (size_t)c->n_experts, &proj) != 0 ||
+            proj > SIZE_MAX - layer)
+            return SIZE_MAX;
+        layer += proj;
+        if (layer > SIZE_MAX - total)
+            return SIZE_MAX;
+        total += layer;
+    }
+    return total;
+}
+
+static int cuda_moe_all_fits_memory(BnGPUBackend *gpu,
+                                    const BnConfig *c,
+                                    const BnWeights *w) {
+    if (!gpu || !gpu->memory_info)
+        return 1;
+    size_t need = estimate_cuda_moe_all_bytes(c, w);
+    if (need == 0)
+        return 0;
+    if (need == SIZE_MAX)
+        return 0;
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (gpu->memory_info(gpu->ctx, &free_bytes, &total_bytes) != 0)
+        return 1;
+    size_t reserve_mb = env_mb_or_default("BN_CUDA_MOE_FULL_RESERVE_MB", 4096);
+    size_t reserve = reserve_mb > SIZE_MAX / (1024u * 1024u)
+        ? SIZE_MAX
+        : reserve_mb * 1024u * 1024u;
+    if (free_bytes > need && free_bytes - need >= reserve)
+        return 1;
+    fprintf(stderr,
+            "[bn:gpu] skipping full CUDA MoE residency: need=%.1f GiB "
+            "free=%.1f GiB total=%.1f GiB reserve=%.1f GiB "
+            "(using lazy GPU expert cache)\n",
+            need / 1073741824.0, free_bytes / 1073741824.0,
+            total_bytes / 1073741824.0, reserve / 1073741824.0);
+    return 0;
+}
+
 int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
     if (!model || !gpu || !gpu->buffer_create) return -1;
     if (bn_model_ensure_backend(model) != 0) return -1;
@@ -189,6 +259,8 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
     int n_layers = c->n_layers;
     int upload_moe_all_model = !getenv("BN_CUDA_DISABLE_MOE_ROUTED_FFN") &&
                                can_use_cuda_moe_routed_ffn_model(c, w);
+    if (upload_moe_all_model && !cuda_moe_all_fits_memory(gpu, c, w))
+        upload_moe_all_model = 0;
 
     if (w->output_weight.data) {
         void *output_weight_gpu = upload_qweight(gpu, &w->output_weight);
