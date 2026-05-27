@@ -229,6 +229,14 @@ int bn_transformer_gpu_emit_context_residual_add(
     int buf_in,
     int buf_aux,
     int count);
+int bn_transformer_gpu_emit_context_residual_rmsnorm(
+    BnTransformerGPUEmitContext *ctx,
+    int x_buf,
+    int residual_buf,
+    int out_buf,
+    int dim,
+    uint32_t u_eps,
+    void *norm_weight);
 int bn_transformer_gpu_emit_context_activation(
     BnTransformerGPUEmitContext *ctx,
     int buf_in,

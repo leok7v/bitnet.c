@@ -358,19 +358,20 @@ int bn_transformer_gpu_emit_context_residual_add(
     return 0;
 }
 
-static void emit_context_residual_rmsnorm(BnTransformerGPUEmitContext *ctx,
-                                          int x_buf,
-                                          int residual_buf,
-                                          int out_buf,
-                                          int dim,
-                                          uint32_t u_eps,
-                                          void *norm_weight) {
+int bn_transformer_gpu_emit_context_residual_rmsnorm(
+    BnTransformerGPUEmitContext *ctx,
+    int x_buf,
+    int residual_buf,
+    int out_buf,
+    int dim,
+    uint32_t u_eps,
+    void *norm_weight) {
+    if (!ctx) return -1;
     if (getenv("BN_GPU_SPLIT_RESIDUAL_RMSNORM")) {
         bn_transformer_gpu_emit_context_residual_add(
             ctx, x_buf, residual_buf, dim);
-        bn_transformer_gpu_emit_context_rmsnorm(
+        return bn_transformer_gpu_emit_context_rmsnorm(
             ctx, norm_weight, x_buf, out_buf, dim, u_eps);
-        return;
     }
 
     uint32_t residual_norm_params[8] = {
@@ -379,6 +380,18 @@ static void emit_context_residual_rmsnorm(BnTransformerGPUEmitContext *ctx,
     emit_context_utility(ctx, BN_GPU_IR_UTILITY_RESIDUAL_RMSNORM,
                          x_buf, residual_buf, out_buf, 0, norm_weight,
                          residual_norm_params);
+    return 0;
+}
+
+static void emit_context_residual_rmsnorm(BnTransformerGPUEmitContext *ctx,
+                                          int x_buf,
+                                          int residual_buf,
+                                          int out_buf,
+                                          int dim,
+                                          uint32_t u_eps,
+                                          void *norm_weight) {
+    (void)bn_transformer_gpu_emit_context_residual_rmsnorm(
+        ctx, x_buf, residual_buf, out_buf, dim, u_eps, norm_weight);
 }
 
 int bn_transformer_gpu_emit_context_activation(
@@ -1718,8 +1731,7 @@ void bn_transformer_gpu_emit_context_moe(BnTransformerGPUEmitContext *ctx,
         }
     }
 
-    bn_transformer_gpu_emit_context_residual_add(
-        ctx, BN_GPU_VALUE_X, BN_GPU_VALUE_MOE_OUT, dim);
-    bn_transformer_gpu_emit_context_rmsnorm(
-        ctx, next_norm, BN_GPU_VALUE_X, BN_GPU_VALUE_XB, dim, u_eps);
+    bn_transformer_gpu_emit_context_residual_rmsnorm(
+        ctx, BN_GPU_VALUE_X, BN_GPU_VALUE_MOE_OUT, BN_GPU_VALUE_XB,
+        dim, u_eps, next_norm);
 }

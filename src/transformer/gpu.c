@@ -999,11 +999,9 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                         &emit, &shared_only, &moe_shared, lw, dim, u_eps,
                         next_norm);
                 } else {
-                    bn_transformer_gpu_emit_context_residual_add(
-                        &emit, BN_GPU_VALUE_X, BN_GPU_VALUE_MOE_OUT, dim);
-                    bn_transformer_gpu_emit_context_rmsnorm(
-                        &emit, next_norm, BN_GPU_VALUE_X, BN_GPU_VALUE_XB,
-                        dim, u_eps);
+                    bn_transformer_gpu_emit_context_residual_rmsnorm(
+                        &emit, BN_GPU_VALUE_X, BN_GPU_VALUE_MOE_OUT,
+                        BN_GPU_VALUE_XB, dim, u_eps, next_norm);
                 }
                 continue;
             }
