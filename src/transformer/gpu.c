@@ -947,11 +947,11 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 backend, l, BN_BACKEND_HANDLE_MOE_DOWN_ALL);
             int gpu_routed_ffn =
                 gpu_route_topk && moe_gate_all && moe_up_all && moe_down_all &&
-                getenv("BN_CUDA_ENABLE_MOE_ROUTED_FFN") &&
                 !c->has_shared_expert &&
                 lw->moe.expert_map.gate_type == BN_GGUF_TENSOR_Q4_K &&
                 lw->moe.expert_map.up_type == BN_GGUF_TENSOR_Q4_K &&
-                lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q6_K &&
+                (lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q6_K ||
+                 lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q4_K) &&
                 lw->moe.expert_map.gate_rows == c->moe_intermediate_size &&
                 lw->moe.expert_map.up_rows == c->moe_intermediate_size &&
                 lw->moe.expert_map.gate_cols == dim &&

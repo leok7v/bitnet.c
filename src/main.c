@@ -349,7 +349,7 @@ static int model_count_cuda_routed_moe_resident(const BnModel *model,
                                                 int *moe_layers_out) {
     if (moe_layers_out)
         *moe_layers_out = 0;
-    if (!model || !getenv("BN_CUDA_ENABLE_MOE_ROUTED_FFN"))
+    if (!model || getenv("BN_CUDA_DISABLE_MOE_ROUTED_FFN"))
         return 0;
     const BnBackendModel *backend = bn_model_backend(model);
     if (!backend)

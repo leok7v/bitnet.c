@@ -3526,6 +3526,40 @@ static __global__ void moe_q6k_down_routed_q8k_accum_kernel(
         out[row] = sum;
 }
 
+static __global__ void moe_q4k_down_routed_q8k_accum_kernel(
+    float *out,
+    const BnBlockQ4K *down,
+    const BnBlockQ8K *mid_q,
+    const float *route,
+    int dim,
+    int hidden,
+    int n_experts,
+    int k) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    if (row >= dim) return;
+
+    int n_bpr = hidden / BN_QK_K;
+    float sum = 0.0f;
+    for (int slot = 0; slot < k; slot++) {
+        int expert = (int)(route[k + slot] + 0.5f);
+        if (expert < 0) expert = 0;
+        if (expert >= n_experts) expert = n_experts - 1;
+        const BnBlockQ4K *row_blocks =
+            down + (((size_t)expert * (size_t)dim + (size_t)row) *
+                    (size_t)n_bpr);
+        const BnBlockQ8K *slot_mid_q = mid_q + (size_t)slot * (size_t)n_bpr;
+        for (int b = lane; b < n_bpr; b += 32)
+            sum += cuda_vec_dot_q4k_q8k(&row_blocks[b], slot_mid_q + b);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        out[row] = sum;
+}
+
 static __device__ __forceinline__ float cuda_fast_exp(float x) {
     x = fminf(88.7f, fmaxf(-87.3f, x));
     float n_f = floorf(x * 1.4426950409f + 0.5f);
@@ -9538,12 +9572,13 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
             if (!gate || !gate->data || !up || !up->data ||
                 !down || !down->data || !in || !route || !mid || !out ||
                 op->type != BN_GGUF_TENSOR_Q4_K ||
-                down_type != BN_GGUF_TENSOR_Q6_K ||
+                (down_type != BN_GGUF_TENSOR_Q6_K &&
+                 down_type != BN_GGUF_TENSOR_Q4_K) ||
                 dim <= 0 || hidden <= 0 || n_experts <= 0 || k <= 0 ||
                 (dim % BN_QK_K) != 0 || (hidden % BN_QK_K) != 0 ||
                 gate->type != BN_GGUF_TENSOR_Q4_K ||
                 up->type != BN_GGUF_TENSOR_Q4_K ||
-                down->type != BN_GGUF_TENSOR_Q6_K ||
+                down->type != down_type ||
                 gate->rows < hidden * n_experts || gate->cols < dim ||
                 up->rows < hidden * n_experts || up->cols < dim ||
                 down->rows < dim * n_experts || down->cols < hidden ||
@@ -9573,10 +9608,17 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     dim3(hidden / BN_QK_K, k, 1), BN_QK_K, 0,
                     mid_q, mid, hidden, k);
                 int down_blocks = (dim + warps - 1) / warps;
-                BN_CUDA_LAUNCH(ctx, moe_q6k_down_routed_q8k_accum_kernel,
-                    down_blocks, route_threads, 0,
-                    out, (const BnBlockQ6K *)down->data, mid_q, route,
-                    dim, hidden, n_experts, k);
+                if (down_type == BN_GGUF_TENSOR_Q6_K) {
+                    BN_CUDA_LAUNCH(ctx, moe_q6k_down_routed_q8k_accum_kernel,
+                        down_blocks, route_threads, 0,
+                        out, (const BnBlockQ6K *)down->data, mid_q, route,
+                        dim, hidden, n_experts, k);
+                } else {
+                    BN_CUDA_LAUNCH(ctx, moe_q4k_down_routed_q8k_accum_kernel,
+                        down_blocks, route_threads, 0,
+                        out, (const BnBlockQ4K *)down->data, mid_q, route,
+                        dim, hidden, n_experts, k);
+                }
             }
             break;
         }

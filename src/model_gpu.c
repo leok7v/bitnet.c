@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
+#include <string.h>
 
 static int checked_mul_size(size_t a, size_t b, size_t *out) {
     if (a != 0 && b > SIZE_MAX / a) return -1;
@@ -109,8 +110,6 @@ static void *upload_moe_all_proj(BnModel *model,
         default:
             return NULL;
     }
-    if (stride != expert_bytes)
-        return NULL;
     const uint8_t *base = bn_moe_mmap_base_for_proj(
         bn_model_moe_io(model), em, proj);
     if (!base)
@@ -120,6 +119,20 @@ static void *upload_moe_all_proj(BnModel *model,
         return NULL;
     if ((size_t)n_experts > (size_t)INT_MAX / (size_t)rows)
         return NULL;
+    if (stride != expert_bytes) {
+        uint8_t *packed = (uint8_t *)malloc(total_bytes);
+        if (!packed)
+            return NULL;
+        for (int e = 0; e < n_experts; e++) {
+            memcpy(packed + (size_t)e * expert_bytes,
+                   base + offset + (size_t)e * stride,
+                   expert_bytes);
+        }
+        void *handle = gpu->buffer_create(gpu->ctx, packed, total_bytes,
+                                           type, rows * n_experts, cols);
+        free(packed);
+        return handle;
+    }
     return gpu->buffer_create(gpu->ctx, base + offset, total_bytes,
                               type, rows * n_experts, cols);
 }
@@ -129,10 +142,12 @@ static int can_use_cuda_moe_routed_ffn(const BnConfig *c,
     if (!c || !lw || !lw->moe.router_weight)
         return 0;
     const BnMoEExpertMap *em = &lw->moe.expert_map;
+    int down_supported = em->down_type == BN_GGUF_TENSOR_Q6_K ||
+                         em->down_type == BN_GGUF_TENSOR_Q4_K;
     return !c->has_shared_expert &&
            em->gate_type == BN_GGUF_TENSOR_Q4_K &&
            em->up_type == BN_GGUF_TENSOR_Q4_K &&
-           em->down_type == BN_GGUF_TENSOR_Q6_K &&
+           down_supported &&
            em->gate_rows == c->moe_intermediate_size &&
            em->up_rows == c->moe_intermediate_size &&
            em->gate_cols == c->dim &&
@@ -166,7 +181,7 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
     BnWeights *w = &model->weights;
     BnConfig *c = &model->config;
     int n_layers = c->n_layers;
-    int upload_moe_all_model = getenv("BN_CUDA_ENABLE_MOE_ROUTED_FFN") &&
+    int upload_moe_all_model = !getenv("BN_CUDA_DISABLE_MOE_ROUTED_FFN") &&
                                can_use_cuda_moe_routed_ffn_model(c, w);
 
     if (w->output_weight.data) {
