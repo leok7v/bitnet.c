@@ -6648,6 +6648,45 @@ static void *cuda_buffer_create_q6_f32_cache(void *vctx, const void *data,
     return cuda_buffer_create_impl(vctx, data, size, type, rows, cols, 2);
 }
 
+static void *cuda_buffer_create_stacked2(void *vctx,
+                                         const void *data0, size_t size0,
+                                         const void *data1, size_t size1,
+                                         int type, int rows, int cols) {
+    if (!data0 || !data1 || size0 == 0 || size1 == 0)
+        return NULL;
+    size_t size = size0 + size1;
+    uint8_t *combined = (uint8_t *)malloc(size);
+    if (!combined)
+        return NULL;
+    memcpy(combined, data0, size0);
+    memcpy(combined + size0, data1, size1);
+    void *buf = cuda_buffer_create_impl(vctx, combined, size, type, rows,
+                                        cols, 1);
+    free(combined);
+    return buf;
+}
+
+static void *cuda_buffer_create_stacked3(void *vctx,
+                                         const void *data0, size_t size0,
+                                         const void *data1, size_t size1,
+                                         const void *data2, size_t size2,
+                                         int type, int rows, int cols) {
+    if (!data0 || !data1 || !data2 || size0 == 0 || size1 == 0 ||
+        size2 == 0)
+        return NULL;
+    size_t size = size0 + size1 + size2;
+    uint8_t *combined = (uint8_t *)malloc(size);
+    if (!combined)
+        return NULL;
+    memcpy(combined, data0, size0);
+    memcpy(combined + size0, data1, size1);
+    memcpy(combined + size0 + size1, data2, size2);
+    void *buf = cuda_buffer_create_impl(vctx, combined, size, type, rows,
+                                        cols, 1);
+    free(combined);
+    return buf;
+}
+
 static void cuda_buffer_destroy(void *vctx, void *buffer) {
     BnCudaCtx *ctx = (BnCudaCtx *)vctx;
     if (cuda_ctx_set_device(ctx) != 0) return;
@@ -12265,6 +12304,8 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->buffer_create = cuda_buffer_create;
     gpu->buffer_create_quant_only = cuda_buffer_create_quant_only;
     gpu->buffer_create_q6_f32_cache = cuda_buffer_create_q6_f32_cache;
+    gpu->buffer_create_stacked2 = cuda_buffer_create_stacked2;
+    gpu->buffer_create_stacked3 = cuda_buffer_create_stacked3;
     gpu->buffer_destroy = cuda_buffer_destroy;
     gpu->matvec = cuda_matvec;
     gpu->matmul = cuda_matmul;
