@@ -971,6 +971,45 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 lw->moe.expert_map.down_cols == c->moe_intermediate_size &&
                 !getenv("BN_CUDA_DISABLE_MOE_ROUTED_FFN");
             if (gpu_routed_ffn) {
+                int compare_moe = 0;
+                const char *compare_moe_env =
+                    getenv("BN_GPU_COMPARE_MOE_LAYER");
+                if (compare_moe_env) {
+                    int compare_layer = atoi(compare_moe_env);
+                    const char *compare_pos_env =
+                        getenv("BN_GPU_COMPARE_MOE_POS");
+                    int compare_pos = compare_pos_env ? atoi(compare_pos_env) : -1;
+                    compare_moe = compare_layer == l &&
+                                  (compare_pos < 0 || compare_pos == pos);
+                }
+                float *moe_cpu_x = NULL;
+                float *moe_gpu_x = NULL;
+                if (compare_moe) {
+                    moe_cpu_x = (float *)malloc((size_t)dim * sizeof(float));
+                    moe_gpu_x = (float *)malloc((size_t)dim * sizeof(float));
+                    if (!moe_cpu_x || !moe_gpu_x ||
+                        bn_transformer_gpu_emit_context_flush(&emit, gpu) != 0 ||
+                        bn_transformer_gpu_read_x(gpu, s->x,
+                                                  (size_t)dim * sizeof(float)) != 0 ||
+                        bn_transformer_gpu_read_xb(gpu, s->xb,
+                                                   (size_t)dim * sizeof(float)) != 0) {
+                        free(moe_cpu_x);
+                        free(moe_gpu_x);
+                        return bn_transformer_gpu_reject_forward(
+                            &emit, "gpu routed moe compare setup failed");
+                    }
+                    bn_moe_route(sess->moe_state, s->xb,
+                                 lw->moe.router_weight, dim,
+                                 c->n_experts, c->n_experts_active,
+                                 bn_model_pool(m));
+                    if (gpu_debug_compute_moe_cpu_from_xb(
+                            m, sess, lw, dim, s->x, s->xb, moe_cpu_x) != 0) {
+                        free(moe_cpu_x);
+                        free(moe_gpu_x);
+                        return bn_transformer_gpu_reject_forward(
+                            &emit, "gpu routed moe compare setup failed");
+                    }
+                }
                 if (bn_transformer_gpu_emit_context_moe_route_topk(
                         &emit, moe_router, BN_GPU_VALUE_XB,
                         BN_GPU_VALUE_MOE_HB, BN_GPU_VALUE_MOE_HB2,
@@ -1002,6 +1041,21 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                     bn_transformer_gpu_emit_context_residual_rmsnorm(
                         &emit, BN_GPU_VALUE_X, BN_GPU_VALUE_MOE_OUT,
                         BN_GPU_VALUE_XB, dim, u_eps, next_norm);
+                }
+                if (compare_moe) {
+                    if (bn_transformer_gpu_emit_context_flush(&emit, gpu) != 0 ||
+                        bn_transformer_gpu_read_x(gpu, moe_gpu_x,
+                                                  (size_t)dim * sizeof(float)) != 0) {
+                        free(moe_cpu_x);
+                        free(moe_gpu_x);
+                        return bn_transformer_gpu_reject_forward(
+                            &emit, "gpu routed moe compare readback failed");
+                    }
+                    gpu_debug_compare_vec_local("moe_routed_state_compare",
+                                                l, pos, moe_cpu_x, moe_gpu_x,
+                                                dim);
+                    free(moe_cpu_x);
+                    free(moe_gpu_x);
                 }
                 continue;
             }
