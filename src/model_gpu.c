@@ -250,11 +250,33 @@ static size_t qweight_triple_bytes(const BnQWeight *a, const BnQWeight *b,
     return ab + c_sz;
 }
 
+static int add_size_checked(size_t *total, size_t add) {
+    if (!total || *total > SIZE_MAX - add)
+        return -1;
+    *total += add;
+    return 0;
+}
+
+static int mul3_size(size_t a, size_t b, size_t c, size_t *out) {
+    size_t ab = 0;
+    if (checked_mul_size(a, b, &ab) != 0 ||
+        checked_mul_size(ab, c, out) != 0)
+        return -1;
+    return 0;
+}
+
+static int cuda_moe_down_q6_f32_cache_enabled(const BnGPUBackend *gpu) {
+    return gpu && gpu->buffer_create_q6_f32_cache &&
+           getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
+}
+
 static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
-                                          const BnWeights *w) {
+                                          const BnWeights *w,
+                                          const BnGPUBackend *gpu) {
     if (!c || !w || c->n_experts <= 0)
         return 0;
     size_t total = 0;
+    int q6_f32_cache = cuda_moe_down_q6_f32_cache_enabled(gpu);
     for (int l = 0; l < c->n_layers; l++) {
         const BnMoEExpertMap *em = &w->layers[l].moe.expert_map;
         size_t layer = 0;
@@ -272,9 +294,17 @@ static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
             proj > SIZE_MAX - layer)
             return SIZE_MAX;
         layer += proj;
-        if (layer > SIZE_MAX - total)
+        if (q6_f32_cache && em->down_type == BN_GGUF_TENSOR_Q6_K) {
+            size_t aux = 0;
+            if (mul3_size((size_t)c->n_experts,
+                          (size_t)em->down_rows,
+                          (size_t)em->down_cols, &aux) != 0 ||
+                checked_mul_size(aux, sizeof(float), &aux) != 0 ||
+                add_size_checked(&layer, aux) != 0)
+                return SIZE_MAX;
+        }
+        if (add_size_checked(&total, layer) != 0)
             return SIZE_MAX;
-        total += layer;
     }
     return total;
 }
@@ -284,7 +314,7 @@ static int cuda_moe_all_fits_memory(BnGPUBackend *gpu,
                                     const BnWeights *w) {
     if (!gpu || !gpu->memory_info)
         return 1;
-    size_t need = estimate_cuda_moe_all_bytes(c, w);
+    size_t need = estimate_cuda_moe_all_bytes(c, w, gpu);
     if (need == 0)
         return 0;
     if (need == SIZE_MAX)

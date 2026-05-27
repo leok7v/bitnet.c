@@ -321,7 +321,8 @@ static size_t env_mb_or_default(const char *name, int default_mb) {
     return (size_t)v;
 }
 
-static size_t model_moe_entry_bytes(const BnModel *model) {
+static size_t model_moe_entry_bytes(const BnModel *model,
+                                    const BnGPUBackend *gpu) {
     if (!model || model->config.n_layers <= 0)
         return 0;
     for (int l = 0; l < model->config.n_layers; l++) {
@@ -329,8 +330,22 @@ static size_t model_moe_entry_bytes(const BnModel *model) {
         if (!lw->moe.router_weight)
             continue;
         const BnMoEExpertMap *em = &lw->moe.expert_map;
-        return em->expert_gate_bytes + em->expert_up_bytes +
-               em->expert_down_bytes;
+        size_t entry = em->expert_gate_bytes + em->expert_up_bytes +
+                       em->expert_down_bytes;
+        if (gpu && gpu->kind == BN_GPU_BACKEND_CUDA &&
+            em->down_type == BN_GGUF_TENSOR_Q6_K &&
+            getenv("BN_CUDA_DISABLE_CUBLAS_MATMUL") == NULL) {
+            size_t elems = (size_t)em->down_rows * (size_t)em->down_cols;
+            size_t elem_size =
+                (getenv("BN_CUDA_DISABLE_Q6K_CUBLAS_F16") ||
+                 getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE"))
+                    ? sizeof(float) : sizeof(uint16_t);
+            if (elems <= (SIZE_MAX - entry) / elem_size)
+                entry += elems * elem_size;
+            else
+                return 0;
+        }
+        return entry;
     }
     return 0;
 }
@@ -442,7 +457,7 @@ static void maybe_create_gpu_moe_cache(BnModel *model,
     if (!args->gpu_cache_mb_set && !prefer_cache_prefill &&
         routed_moe_layers > 0 && routed_resident_layers == routed_moe_layers)
         return;
-    size_t entry_bytes = model_moe_entry_bytes(model);
+    size_t entry_bytes = model_moe_entry_bytes(model, gpu);
     if (entry_bytes == 0)
         return;
     int auto_resident = 0;
