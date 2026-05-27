@@ -130,7 +130,6 @@ static void moe_batch_route(float *logits, int *all_indices, float *all_weights,
 int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
                           struct BnLayerWeights *lw, int l,
                           float *act, float *Xb, int n_tokens) {
-    (void)l;  // reserved for pread cache keying in future
     double t_compute = bn_moe_time_ms();
     double t0;
     BnConfig *c = &m->config;
@@ -265,7 +264,66 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
     memset(moe_out, 0, sz_mout);
 
     // 5. Per-expert batch compute
-    for (int e = 0; e < n_experts; e++) {
+    int used_gpu_moe_batch = 0;
+    BnGPUBackend *gpu_batch = bn_model_gpu(m);
+    if (gpu_batch && gpu_batch->kind == BN_GPU_BACKEND_CUDA &&
+        gpu_batch->moe_ffn_batch) {
+        BnGPUMoEPrefillExpert *gpu_experts =
+            (BnGPUMoEPrefillExpert *)bn_malloc(
+                &a, (size_t)n_experts * sizeof(BnGPUMoEPrefillExpert));
+        BnGPUMoETemporaryBuffers *temps =
+            (BnGPUMoETemporaryBuffers *)bn_malloc(
+                &a, (size_t)n_experts * sizeof(BnGPUMoETemporaryBuffers));
+        if (gpu_experts && temps) {
+            memset(gpu_experts, 0,
+                   (size_t)n_experts * sizeof(BnGPUMoEPrefillExpert));
+            memset(temps, 0,
+                   (size_t)n_experts * sizeof(BnGPUMoETemporaryBuffers));
+            int all_resident = 1;
+            for (int e = 0; e < n_experts; e++) {
+                if (expert_counts[e] <= 0)
+                    continue;
+                BnGPUMoEExpertBuffers expert_gpu;
+                memset(&expert_gpu, 0, sizeof(expert_gpu));
+                if (bn_gpu_moe_bridge_get_expert(
+                        m, sess, lw, l, e, &temps[e], &expert_gpu) != 0 ||
+                    temps[e].n_buffers != 0 ||
+                    !expert_gpu.gate || !expert_gpu.down ||
+                    (!expert_gpu.up && !expert_gpu.use_gateup_split)) {
+                    all_resident = 0;
+                    break;
+                }
+                gpu_experts[e].gate_buf = expert_gpu.gate;
+                gpu_experts[e].up_buf = expert_gpu.up;
+                gpu_experts[e].down_buf = expert_gpu.down;
+                gpu_experts[e].use_gateup_split =
+                    expert_gpu.use_gateup_split;
+            }
+            if (all_resident) {
+                t0 = bn_moe_time_ms();
+                if (gpu_batch->moe_ffn_batch(
+                        gpu_batch->ctx, moe_out, gpu_experts, n_experts,
+                        expert_offsets, expert_counts, group_token_ids,
+                        group_weights, Xb, n_tokens, dim, moe_hidden,
+                        map->gate_type, map->up_type, map->down_type,
+                        c->act_type) == 0) {
+                    used_gpu_moe_batch = 1;
+                    ms->stats.gate_up_time_ms += bn_moe_time_ms() - t0;
+                }
+            }
+            for (int e = 0; e < n_experts; e++)
+                if (temps[e].n_buffers > 0)
+                    bn_gpu_moe_bridge_release_temporaries(m, &temps[e]);
+        }
+        if (gpu_experts)
+            bn_free(&a, gpu_experts,
+                    (size_t)n_experts * sizeof(BnGPUMoEPrefillExpert));
+        if (temps)
+            bn_free(&a, temps,
+                    (size_t)n_experts * sizeof(BnGPUMoETemporaryBuffers));
+    }
+
+    if (!used_gpu_moe_batch) for (int e = 0; e < n_experts; e++) {
         int T = expert_counts[e];
         if (T == 0) continue;
         int off = expert_offsets[e];

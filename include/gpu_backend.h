@@ -18,6 +18,13 @@ typedef struct {
     int rows, cols, type;
 } BnGPUMatvecOp;
 
+typedef struct {
+    void *gate_buf;
+    void *up_buf;
+    void *down_buf;
+    int use_gateup_split;
+} BnGPUMoEPrefillExpert;
+
 // GPU compute backend vtable. The caller (e.g., Hull) fills this in
 // with their GPU API. bitnet.c calls it for matvec dispatch.
 // All function pointers may be NULL (graceful fallback to CPU SIMD).
@@ -126,6 +133,22 @@ struct BnGPUBackend {
                                       int gate_type, int up_type,
                                       int down_type, int act_type,
                                       float norm_eps);
+
+    // Batched routed MoE FFN for prompt processing. X is the expert input
+    // token batch [n_tokens, dim]. expert_offsets/counts describe flat
+    // token_ids/weights assignments for each expert. Expert buffers must be
+    // resident backend handles. Returns weighted sum in out[n_tokens, dim].
+    int (*moe_ffn_batch)(void *ctx, float *out,
+                         const BnGPUMoEPrefillExpert *experts,
+                         int n_experts,
+                         const int *expert_offsets,
+                         const int *expert_counts,
+                         const int *token_ids,
+                         const float *weights,
+                         const float *X,
+                         int n_tokens, int dim, int hidden_dim,
+                         int gate_type, int up_type, int down_type,
+                         int act_type);
 
     // Batched causal attention for prompt processing:
     // out[n_tokens, n_heads * head_size] =

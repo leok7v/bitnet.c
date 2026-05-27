@@ -4746,6 +4746,38 @@ static __global__ void ffn_activation_batch_stacked_kernel(
     }
 }
 
+static __global__ void moe_gather_kernel(float *dst, const float *src,
+                                         const int *token_ids,
+                                         int offset, int n_assignments,
+                                         int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_assignments * dim;
+    if (idx >= total) return;
+    int row = idx / dim;
+    int col = idx - row * dim;
+    int token = token_ids[offset + row];
+    dst[(size_t)row * dim + col] = src[(size_t)token * dim + col];
+}
+
+static __global__ void moe_scatter_add_kernel(float *dst,
+                                              const float *src,
+                                              const int *token_ids,
+                                              const float *weights,
+                                              int offset,
+                                              int n_assignments,
+                                              int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_assignments * dim;
+    if (idx >= total) return;
+    int row = idx / dim;
+    int col = idx - row * dim;
+    int flat = offset + row;
+    int token = token_ids[flat];
+    float w = weights[flat];
+    atomicAdd(dst + (size_t)token * dim + col,
+              w * src[(size_t)row * dim + col]);
+}
+
 static int cuda_type_supported(int type) {
     static int init = 0;
     static int disable_matvec = 0;
@@ -6229,6 +6261,68 @@ static int cuda_dense_ffn(void *vctx, float *out,
     return 0;
 }
 
+static int cuda_dense_ffn_batch_device(BnCudaCtx *ctx, float *d_out,
+                                       BnCudaBuffer *gate, BnCudaBuffer *up,
+                                       BnCudaBuffer *down, const float *d_X,
+                                       int n_tokens, int dim, int hidden_dim,
+                                       int gate_type, int up_type,
+                                       int down_type, int act_type) {
+    int stacked_gateup = up == NULL;
+    if (!ctx || !d_out || !gate || !down || !d_X ||
+        !gate->data || !down->data ||
+        n_tokens <= 0 || dim <= 0 || hidden_dim <= 0 || act_type != 0)
+        return -1;
+    if ((!stacked_gateup &&
+         (up == NULL || !up->data || up->rows != hidden_dim ||
+          up->cols != dim || gate->rows != hidden_dim)) ||
+        (stacked_gateup &&
+         (gate->rows != hidden_dim * 2 || gate->cols != dim ||
+          gate_type != up_type)) ||
+        gate->cols != dim ||
+        down->rows != dim || down->cols != hidden_dim)
+        return -1;
+    if (!cuda_type_supported(gate_type) ||
+        (!stacked_gateup && !cuda_type_supported(up_type)) ||
+        !cuda_type_supported(down_type))
+        return -1;
+
+    if (stacked_gateup) {
+        if (cuda_matmul_device_out(ctx, ctx->d_out, gate, d_X,
+                                   hidden_dim * 2, dim, n_tokens,
+                                   gate_type) != 0)
+            return -1;
+    } else {
+        if (cuda_matmul_device_out(ctx, ctx->d_out, gate, d_X,
+                                   hidden_dim, dim, n_tokens,
+                                   gate_type) != 0)
+            return -1;
+        if (cuda_matmul_device_out(
+                ctx, ctx->d_out + (size_t)n_tokens * hidden_dim,
+                up, d_X, hidden_dim, dim, n_tokens, up_type) != 0)
+            return -1;
+    }
+
+    int threads = 256;
+    int act_total = n_tokens * hidden_dim;
+    int act_blocks = (act_total + threads - 1) / threads;
+    if (stacked_gateup) {
+        ffn_activation_batch_stacked_kernel<<<act_blocks, threads>>>(
+            ctx->d_x, ctx->d_out, hidden_dim, n_tokens, act_type);
+    } else {
+        ffn_activation_batch_kernel<<<act_blocks, threads>>>(
+            ctx->d_x, ctx->d_out, hidden_dim, n_tokens, act_type);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] dense ffn device activation failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    return cuda_matmul_device_out(ctx, d_out, down, ctx->d_x,
+                                  dim, hidden_dim, n_tokens, down_type);
+}
+
 static int cuda_dense_ffn_batch_impl(void *vctx, float *out,
                                      void *gate_buf, void *up_buf,
                                      void *down_buf, void *norm_buf,
@@ -6636,6 +6730,138 @@ static int cuda_dense_ffn_batch_norm_resid(void *vctx, float *out,
     return cuda_dense_ffn_batch_impl(
         vctx, out, gate_buf, up_buf, down_buf, norm_buf, X, n_tokens, dim,
         hidden_dim, gate_type, up_type, down_type, act_type, norm_eps, 1);
+}
+
+static int cuda_moe_ffn_batch(void *vctx, float *out,
+                              const BnGPUMoEPrefillExpert *experts,
+                              int n_experts,
+                              const int *expert_offsets,
+                              const int *expert_counts,
+                              const int *token_ids,
+                              const float *weights,
+                              const float *X,
+                              int n_tokens, int dim, int hidden_dim,
+                              int gate_type, int up_type, int down_type,
+                              int act_type) {
+    BnCudaCtx *ctx = (BnCudaCtx *)vctx;
+    if (getenv("BN_CUDA_DISABLE_MOE_FFN_BATCH"))
+        return -1;
+    if (!ctx || !out || !experts || !expert_offsets || !expert_counts ||
+        !token_ids || !weights || !X || n_experts <= 0 || n_tokens <= 0 ||
+        dim <= 0 || hidden_dim <= 0 || act_type != 0)
+        return -1;
+
+    int total_assignments = 0;
+    int max_count = 0;
+    for (int e = 0; e < n_experts; e++) {
+        if (expert_counts[e] < 0 || expert_offsets[e] < 0)
+            return -1;
+        total_assignments += expert_counts[e];
+        if (expert_counts[e] > max_count)
+            max_count = expert_counts[e];
+    }
+    if (total_assignments <= 0 || max_count <= 0)
+        return -1;
+
+    size_t full_values = (size_t)n_tokens * dim;
+    size_t full_bytes = full_values * sizeof(float);
+    size_t gather_bytes = (size_t)max_count * dim * sizeof(float);
+    size_t hidden_bytes = (size_t)max_count * hidden_dim * sizeof(float);
+    size_t gateup_bytes = hidden_bytes * 2u;
+    size_t scratch_x = gather_bytes > hidden_bytes ? gather_bytes : hidden_bytes;
+    size_t scratch_out = gateup_bytes > gather_bytes ? gateup_bytes : gather_bytes;
+    if (cuda_ensure_scratch(ctx, scratch_x, scratch_out) != 0)
+        return -1;
+    if (cuda_ensure_prefill(ctx, full_values * 2u) != 0)
+        return -1;
+
+    float *d_full_x = ctx->d_prefill;
+    float *d_full_out = d_full_x + full_values;
+    cudaError_t err = cudaMemcpy(d_full_x, X, full_bytes,
+                                 cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] moe ffn input upload failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    err = cudaMemset(d_full_out, 0, full_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] moe ffn output clear failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    size_t assignment_int_bytes = (size_t)total_assignments * sizeof(int);
+    size_t assignment_float_bytes =
+        (size_t)total_assignments * sizeof(float);
+    if (cuda_ensure_ops(ctx, assignment_int_bytes + assignment_float_bytes) != 0)
+        return -1;
+    int *d_token_ids = (int *)ctx->d_ops;
+    float *d_weights = (float *)((uint8_t *)ctx->d_ops +
+                                 assignment_int_bytes);
+    err = cudaMemcpy(d_token_ids, token_ids, assignment_int_bytes,
+                     cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(d_weights, weights, assignment_float_bytes,
+                         cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] moe ffn assignment upload failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    int threads = 256;
+    for (int e = 0; e < n_experts; e++) {
+        int count = expert_counts[e];
+        if (count <= 0)
+            continue;
+        BnCudaBuffer *gate = (BnCudaBuffer *)experts[e].gate_buf;
+        BnCudaBuffer *up = experts[e].use_gateup_split
+            ? NULL : (BnCudaBuffer *)experts[e].up_buf;
+        BnCudaBuffer *down = (BnCudaBuffer *)experts[e].down_buf;
+        if (!gate || !down || (!experts[e].use_gateup_split && !up)) {
+            return -1;
+        }
+
+        int gather_total = count * dim;
+        moe_gather_kernel<<<(gather_total + threads - 1) / threads,
+                            threads>>>(
+            ctx->d_x, d_full_x, d_token_ids, expert_offsets[e], count, dim);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] moe ffn gather failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+        if (cuda_dense_ffn_batch_device(ctx, ctx->d_out, gate, up, down,
+                                        ctx->d_x, count, dim, hidden_dim,
+                                        gate_type, up_type, down_type,
+                                        act_type) != 0) {
+            return -1;
+        }
+        moe_scatter_add_kernel<<<(gather_total + threads - 1) / threads,
+                                 threads>>>(
+            d_full_out, ctx->d_out, d_token_ids, d_weights,
+            expert_offsets[e], count, dim);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[bn:gpu:cuda] moe ffn scatter failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+    }
+
+    if (cuda_ensure_host_out(ctx, full_bytes) != 0)
+        return -1;
+    err = cudaMemcpy(ctx->h_out, d_full_out, full_bytes,
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[bn:gpu:cuda] moe ffn output readback failed: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    memcpy(out, ctx->h_out, full_bytes);
+    return 0;
 }
 
 static int cuda_prefill_attention(void *vctx, float *out,
@@ -9952,6 +10178,7 @@ BnGPUBackend *bn_gpu_cuda_create(void) {
     gpu->dense_ffn_batch = cuda_dense_ffn_batch;
     gpu->dense_ffn_batch_norm = cuda_dense_ffn_batch_norm;
     gpu->dense_ffn_batch_norm_resid = cuda_dense_ffn_batch_norm_resid;
+    gpu->moe_ffn_batch = cuda_moe_ffn_batch;
     gpu->prefill_attention = cuda_prefill_attention;
     gpu->prefill_attention_wo = cuda_prefill_attention_wo;
     gpu->prefill_qkv_attention_wo = cuda_prefill_qkv_attention_wo;
