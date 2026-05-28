@@ -164,7 +164,12 @@ struct BnGPUBackend {
                          const float *X,
                          int n_tokens, int dim, int hidden_dim,
                          int gate_type, int up_type, int down_type,
-                         int act_type);
+                         int act_type,
+                         void *shared_gate_buf, void *shared_up_buf,
+                         void *shared_down_buf, void *shared_gate_weight_buf,
+                         int shared_hidden_dim,
+                         int shared_gate_type, int shared_up_type,
+                         int shared_down_type);
 
     // Batched routed MoE FFN using monolithic all-expert resident handles.
     // indices/weights are [n_tokens, k] route results. Returns weighted sum

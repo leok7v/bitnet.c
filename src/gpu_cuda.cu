@@ -3836,6 +3836,34 @@ static __global__ void weighted_add_sigmoid_reduce_kernel(
     }
 }
 
+static __global__ void shared_expert_add_sigmoid_batch_kernel(
+    float *out, const float *shared, const float *gate, const float *x,
+    int n_tokens, int dim) {
+    __shared__ float partial[256];
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    if (t >= n_tokens)
+        return;
+    const float *x_t = x + (size_t)t * dim;
+    float dot = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x)
+        dot += x_t[d] * gate[d];
+    partial[tid] = dot;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+
+    float weight = 1.0f / (1.0f + __expf(-partial[0]));
+    float *out_t = out + (size_t)t * dim;
+    const float *shared_t = shared + (size_t)t * dim;
+    for (int d = tid; d < dim; d += blockDim.x)
+        out_t[d] += weight * shared_t[d];
+}
+
 static __global__ void weighted_add_sigmoid_residual_reduce_kernel(
     float *resid, const float *x, const float *r, const float *gate,
     const float *gate_in, int n, int dim, int reset, int complement) {
@@ -9465,14 +9493,47 @@ static int cuda_moe_ffn_batch(void *vctx, float *out,
                               const float *X,
                               int n_tokens, int dim, int hidden_dim,
                               int gate_type, int up_type, int down_type,
-                              int act_type) {
+                              int act_type,
+                              void *shared_gate_buf, void *shared_up_buf,
+                              void *shared_down_buf,
+                              void *shared_gate_weight_buf,
+                              int shared_hidden_dim,
+                              int shared_gate_type, int shared_up_type,
+                              int shared_down_type) {
     BnCudaCtx *ctx = (BnCudaCtx *)vctx;
+    BnCudaBuffer *shared_gate = (BnCudaBuffer *)shared_gate_buf;
+    BnCudaBuffer *shared_up = (BnCudaBuffer *)shared_up_buf;
+    BnCudaBuffer *shared_down = (BnCudaBuffer *)shared_down_buf;
+    BnCudaBuffer *shared_gate_weight =
+        (BnCudaBuffer *)shared_gate_weight_buf;
     if (getenv("BN_CUDA_DISABLE_MOE_FFN_BATCH"))
         return -1;
     if (!ctx || !out || !experts || !expert_offsets || !expert_counts ||
         !token_ids || !weights || !X || n_experts <= 0 || n_tokens <= 0 ||
         dim <= 0 || hidden_dim <= 0 || act_type != 0)
         return -1;
+    int has_shared = shared_gate || shared_up || shared_down ||
+                     shared_gate_weight || shared_hidden_dim > 0;
+    if (has_shared) {
+        if (!shared_gate || !shared_up || !shared_down ||
+            !shared_gate->data || !shared_up->data || !shared_down->data ||
+            shared_hidden_dim <= 0 ||
+            shared_gate->rows != shared_hidden_dim ||
+            shared_gate->cols != dim ||
+            shared_up->rows != shared_hidden_dim ||
+            shared_up->cols != dim ||
+            shared_down->rows != dim ||
+            shared_down->cols != shared_hidden_dim ||
+            !cuda_type_supported(shared_gate_type) ||
+            !cuda_type_supported(shared_up_type) ||
+            !cuda_type_supported(shared_down_type))
+            return -1;
+        if (shared_gate_weight &&
+            (!shared_gate_weight->data ||
+             shared_gate_weight->type != BN_GGUF_TENSOR_F32 ||
+             shared_gate_weight->rows * shared_gate_weight->cols < dim))
+            return -1;
+    }
 
     int total_assignments = 0;
     int max_count = 0;
@@ -9489,7 +9550,14 @@ static int cuda_moe_ffn_batch(void *vctx, float *out,
     size_t full_values = (size_t)n_tokens * dim;
     size_t full_bytes = full_values * sizeof(float);
     size_t gather_bytes = (size_t)max_count * dim * sizeof(float);
-    size_t hidden_bytes = (size_t)max_count * hidden_dim * sizeof(float);
+    int scratch_tokens = max_count;
+    int scratch_hidden = hidden_dim;
+    if (has_shared && n_tokens > scratch_tokens)
+        scratch_tokens = n_tokens;
+    if (has_shared && shared_hidden_dim > scratch_hidden)
+        scratch_hidden = shared_hidden_dim;
+    size_t hidden_bytes =
+        (size_t)scratch_tokens * (size_t)scratch_hidden * sizeof(float);
     size_t gateup_bytes = hidden_bytes * 2u;
     size_t scratch_x = gather_bytes > hidden_bytes ? gather_bytes : hidden_bytes;
     size_t scratch_out = gateup_bytes > gather_bytes ? gateup_bytes : gather_bytes;
@@ -9583,6 +9651,33 @@ static int cuda_moe_ffn_batch(void *vctx, float *out,
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "[bn:gpu:cuda] moe ffn scatter failed: %s\n",
+                    cudaGetErrorString(err));
+            return -1;
+        }
+    }
+
+    if (has_shared) {
+        if (cuda_dense_ffn_batch_device(
+                ctx, ctx->d_out, shared_gate, shared_up, shared_down,
+                d_full_x, n_tokens, dim, shared_hidden_dim,
+                shared_gate_type, shared_up_type, shared_down_type,
+                act_type) != 0) {
+            return -1;
+        }
+        int total = n_tokens * dim;
+        if (shared_gate_weight) {
+            shared_expert_add_sigmoid_batch_kernel<<<n_tokens, threads>>>(
+                d_full_out, ctx->d_out,
+                (const float *)shared_gate_weight->data, d_full_x,
+                n_tokens, dim);
+        } else {
+            residual_add_kernel<<<(total + threads - 1) / threads, threads>>>(
+                d_full_out, ctx->d_out, total);
+        }
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "[bn:gpu:cuda] moe shared expert add failed: %s\n",
                     cudaGetErrorString(err));
             return -1;
         }

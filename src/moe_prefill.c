@@ -373,6 +373,7 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
 
     // 5. Per-expert batch compute
     int used_gpu_moe_batch = 0;
+    int used_gpu_shared_batch = 0;
     BnGPUBackend *gpu_batch = bn_model_gpu(m);
     int prefer_cached_expert_batch =
         bn_model_gpu_moe_cache(m) != NULL &&
@@ -435,14 +436,51 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
                     expert_gpu.use_gateup_split;
             }
             if (all_resident) {
+                const BnBackendModel *backend = bn_model_backend(m);
+                void *shared_gate = NULL;
+                void *shared_up = NULL;
+                void *shared_down = NULL;
+                void *shared_gate_weight = NULL;
+                int shared_hidden = 0;
+                int shared_gate_type = 0;
+                int shared_up_type = 0;
+                int shared_down_type = 0;
+                int can_fuse_shared =
+                    c->has_shared_expert && lw->shared.shared_gate.data;
+                if (can_fuse_shared && backend &&
+                    getenv("BN_CUDA_DISABLE_MOE_PREFILL_SHARED_FUSE") == NULL) {
+                    shared_gate = bn_backend_model_qweight_buf(
+                        backend, &lw->shared.shared_gate);
+                    shared_up = bn_backend_model_qweight_buf(
+                        backend, &lw->shared.shared_up);
+                    shared_down = bn_backend_model_qweight_buf(
+                        backend, &lw->shared.shared_down);
+                    shared_gate_weight = bn_backend_model_handle(
+                        backend, l, BN_BACKEND_HANDLE_SHARED_EXPERT_GATE);
+                    if (shared_gate && shared_up && shared_down) {
+                        shared_hidden = c->shared_expert_intermediate_size;
+                        shared_gate_type = lw->shared.shared_gate.type;
+                        shared_up_type = lw->shared.shared_up.type;
+                        shared_down_type = lw->shared.shared_down.type;
+                    } else {
+                        shared_gate = NULL;
+                        shared_up = NULL;
+                        shared_down = NULL;
+                        shared_gate_weight = NULL;
+                    }
+                }
                 t0 = bn_moe_time_ms();
                 if (gpu_batch->moe_ffn_batch(
                         gpu_batch->ctx, moe_out, gpu_experts, n_experts,
                         expert_offsets, expert_counts, group_token_ids,
                         group_weights, Xb, n_tokens, dim, moe_hidden,
                         map->gate_type, map->up_type, map->down_type,
-                        c->act_type) == 0) {
+                        c->act_type, shared_gate, shared_up, shared_down,
+                        shared_gate_weight, shared_hidden, shared_gate_type,
+                        shared_up_type, shared_down_type) == 0) {
                     used_gpu_moe_batch = 1;
+                    used_gpu_shared_batch = shared_gate && shared_up &&
+                                            shared_down;
                     ms->stats.gate_up_time_ms += bn_moe_time_ms() - t0;
                 }
             }
@@ -568,7 +606,8 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
     }
 
     // 6. Shared expert (if present) — batch matmul across all tokens
-    if (c->has_shared_expert && lw->shared.shared_gate.data) {
+    if (!used_gpu_shared_batch &&
+        c->has_shared_expert && lw->shared.shared_gate.data) {
         t0 = bn_moe_time_ms();
         int shared_hidden = c->shared_expert_intermediate_size;
         float *sh_gate = gate_buf;  // reuse (T_max >= 1, shared_hidden <= moe_hidden usually)
