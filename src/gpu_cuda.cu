@@ -13320,10 +13320,10 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                             route, dim, hidden, n_experts, k);
                     }
                 } else {
-                    /* Q8_1 is faster for small routed experts; large-hidden
-                       MoE needs Q8_K to keep generation coherent. */
+                    /* Q8_1 is faster for small routed inputs; large hidden
+                       alone does not amortize Q8_K quantization overhead. */
                     int use_q4k_q8k_dot =
-                        (hidden > 2048 ||
+                        ((hidden > 2048 && dim > 2048) ||
                          getenv("BN_CUDA_ENABLE_MOE_Q4K_Q8K_DOT") != NULL) &&
                         getenv("BN_CUDA_DISABLE_MOE_Q4K_Q8K_DOT") == NULL;
                     int profile_moe_internal =
