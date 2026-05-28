@@ -13930,7 +13930,6 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     (size_t)threads * sizeof(float),
                     route, (const float *)w->data, in, dim);
             } else if ((op->flags & BN_GPU_OP_FLAG_MOE_ROUTE_BLOCK) ||
-                       q8_moe_graph ||
                        getenv("BN_CUDA_DISABLE_MOE_ROUTER_WARP")) {
                 BN_CUDA_LAUNCH(ctx, moe_router_logits_kernel, n_experts,
                     threads, (size_t)threads * sizeof(float),

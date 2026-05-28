@@ -1026,9 +1026,7 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 lw->moe.expert_map.gate_type == BN_GGUF_TENSOR_Q8_0 &&
                 lw->moe.expert_map.up_type == BN_GGUF_TENSOR_Q8_0 &&
                 lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q8_0;
-            uint32_t moe_route_flags =
-                moe_routed_q8 && c->n_experts > 2
-                    ? BN_GPU_OP_FLAG_MOE_ROUTE_BLOCK : 0u;
+            uint32_t moe_route_flags = 0u;
             int cpu_route_resident_ffn =
                 !gpu_route_topk && moe_routed_q8 && c->n_experts > 2 &&
                 !getenv("BN_CUDA_DISABLE_Q8_MOE_CPU_ROUTE_RESIDENT");
