@@ -576,7 +576,8 @@ static int bench_use_gpu_batch_prefill(const BnModel *m) {
     return c->dim <= 2560;
 }
 
-static void bench_prefill(BnModel *m, int n_prompt, int n_iters) {
+static void bench_prefill(BnModel *m, int n_prompt, int n_iters,
+                          int no_logits) {
     if (n_prompt <= 1 || n_iters <= 0)
         return;
 
@@ -607,6 +608,10 @@ static void bench_prefill(BnModel *m, int n_prompt, int n_iters) {
             }
             if (bench_sync_gpu_prompt(m) != 0)
                 goto done;
+        } else if (no_logits) {
+            if (bn_transformer_prefill_no_logits(m, session, tokens,
+                                                 n_prompt, 0) != 0)
+                goto done;
         } else {
             float *logits = bn_transformer_prefill(m, session, tokens,
                                                    n_prompt, 0);
@@ -632,6 +637,10 @@ static void bench_prefill(BnModel *m, int n_prompt, int n_iters) {
             }
             if (bench_sync_gpu_prompt(m) != 0)
                 goto done;
+        } else if (no_logits) {
+            if (bn_transformer_prefill_no_logits(m, session, tokens,
+                                                 n_prompt, 0) != 0)
+                goto done;
         } else {
             float *logits = bn_transformer_prefill(m, session, tokens,
                                                    n_prompt, 0);
@@ -649,7 +658,8 @@ static void bench_prefill(BnModel *m, int n_prompt, int n_iters) {
     double elapsed = bn_platform_time_ms() - t0;
     double toks_per_sec = ((double)n_prompt * n_iters) / (elapsed / 1000.0);
 
-    printf("\nPrefill: %.1f tok/s  (%d tokens x %d in %.0f ms)\n",
+    printf("\nPrefill%s: %.1f tok/s  (%d tokens x %d in %.0f ms)\n",
+           no_logits ? " (no logits)" : "",
            toks_per_sec, n_prompt, n_iters, elapsed);
     if (session && session->moe_state)
         bn_moe_print_stats(session->moe_state, n_prompt * n_iters);
@@ -717,7 +727,7 @@ static void bench_toks(BnModel *m, BnSession *s, int n_gen, int random_gen) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s model.gguf [--iters N] [--threads T] [--toks N] [--prefill-toks N] [--prefill-iters N] [--kv16] [--flash] [--random-gen] [--q4-expand] [--webgpu] [--metal] [--metal-enable-q6-q8k] [--metal-disable-q4-q8] [--q4-q8-disable-gateup] [--q4-q8-disable-ffn-down] [--shader-dir DIR]\n", argv[0]);
+        fprintf(stderr, "Usage: %s model.gguf [--iters N] [--threads T] [--toks N] [--prefill-toks N] [--prefill-iters N] [--prefill-no-logits] [--kv16] [--flash] [--random-gen] [--q4-expand] [--webgpu] [--metal] [--metal-enable-q6-q8k] [--metal-disable-q4-q8] [--q4-q8-disable-gateup] [--q4-q8-disable-ffn-down] [--shader-dir DIR]\n", argv[0]);
         return 1;
     }
 
@@ -727,6 +737,7 @@ int main(int argc, char **argv) {
     int n_toks = 32;
     int n_prefill = 512;
     int n_prefill_iters = 3;
+    int prefill_no_logits = 0;
     int kv_f16 = 0;
     int flash_attn = 0;
     int random_gen = 0;
@@ -753,6 +764,8 @@ int main(int argc, char **argv) {
             n_prefill = (int)strtol(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--prefill-iters") == 0 && i + 1 < argc)
             n_prefill_iters = (int)strtol(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--prefill-no-logits") == 0)
+            prefill_no_logits = 1;
         else if (strcmp(argv[i], "--kv16") == 0)
             kv_f16 = 1;
         else if (strcmp(argv[i], "--flash") == 0)
@@ -1121,7 +1134,7 @@ int main(int argc, char **argv) {
 
     // Tok/s benchmark (forward pass)
     bn_model_set_thread_pool(&model, pool, 0);
-    bench_prefill(&model, n_prefill, n_prefill_iters);
+    bench_prefill(&model, n_prefill, n_prefill_iters, prefill_no_logits);
     BnSession *session = bn_session_create(&model, NULL);
     if (session) {
         bench_toks(&model, session, n_toks, random_gen);

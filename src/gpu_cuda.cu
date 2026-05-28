@@ -11316,8 +11316,16 @@ static int cuda_prefill_ssm_layer(
         err = cudaMemcpy(ctx->d_x, X, dim_values * sizeof(float),
                          cudaMemcpyHostToDevice);
     } else {
-        err = cudaMemcpy(ctx->d_x, ctx->d_out, dim_values * sizeof(float),
-                         cudaMemcpyDeviceToDevice);
+        /*
+         * Keep chained SSM prefill GPU-resident.  A synchronous D2D memcpy
+         * here forces the host to wait once per SSM layer, which is visible on
+         * small prompt batches even though the copied buffer is tiny.
+         */
+        err = cudaMemcpyAsync(ctx->d_x, ctx->d_out,
+                              dim_values * sizeof(float),
+                              cudaMemcpyDeviceToDevice,
+                              ctx->exec_stream ? ctx->exec_stream
+                                               : (cudaStream_t)0);
     }
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] prefill ssm input upload failed: %s\n",
@@ -11625,7 +11633,33 @@ static int cuda_prefill_ssm_layer(
             cuda_convert_f32_to_f16(ctx, d_ffn_norm, dim_values) == 0) {
             ffn_norm_f16 = ctx->d_x_f16;
         }
-        if (stacked_ffn_gateup) {
+        int ffn_act_ready = 0;
+        if (stacked_ffn_gateup &&
+            ffn_gate_type == BN_GGUF_TENSOR_Q4_K &&
+            (dim % BN_QK_K) == 0 &&
+            getenv("BN_CUDA_ENABLE_PREFILL_SSM_FUSED_Q4K_GATEUP_BATCH") != NULL &&
+            getenv("BN_CUDA_DISABLE_PREFILL_SSM_FUSED_Q4K_GATEUP_BATCH") == NULL) {
+            int x_blocks = (dim + 31) / 32;
+            if (cuda_ensure_q8_1(ctx, x_blocks * 32 * n_tokens) != 0)
+                return -1;
+            BnCudaBlockQ8_1 *xq = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
+            quantize_q8_1_batch_kernel<<<dim3(x_blocks, n_tokens, 1),
+                                          32, 0>>>(
+                xq, d_ffn_norm, dim, n_tokens);
+            dim3 grid((hidden_dim + warps - 1) / warps,
+                      (n_tokens + 3) / 4, 1);
+            q4k_dot_fused_gateup_silu_batch4_token_kernel<<<grid, threads,
+                                                             0>>>(
+                d_ffn_act, (const BnBlockQ4K *)ffn_gate->data, xq,
+                hidden_dim, hidden_dim, dim, n_tokens);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[bn:gpu:cuda] prefill ssm fused gate/up failed: %s\n",
+                        cudaGetErrorString(err));
+                return -1;
+            }
+            ffn_act_ready = 1;
+        } else if (stacked_ffn_gateup) {
             if (cuda_matmul_device_out_preconverted_f16(
                     ctx, d_gateup, ffn_gate, d_ffn_norm, ffn_norm_f16,
                     hidden_dim * 2, dim, n_tokens, ffn_gate_type) != 0)
@@ -11642,23 +11676,23 @@ static int cuda_prefill_ssm_layer(
         }
         BN_CUDA_SSM_FFN_PROFILE_STEP(ssm_ffn_profile_gateup);
         int act_total = n_tokens * hidden_dim;
-        int act_to_f16 = ffn_down->f16_data &&
+        int act_to_f16 = !ffn_act_ready && ffn_down->f16_data &&
                          cuda_ensure_x_f16(ctx, hidden_values) == 0;
-        if (act_to_f16 && stacked_ffn_gateup) {
+        if (!ffn_act_ready && act_to_f16 && stacked_ffn_gateup) {
             ffn_activation_batch_stacked_to_f16_kernel<<<
                 (act_total + threads - 1) / threads, threads>>>(
                 (__half *)ctx->d_x_f16, d_gateup, hidden_dim, n_tokens,
                 act_type);
-        } else if (act_to_f16) {
+        } else if (!ffn_act_ready && act_to_f16) {
             ffn_activation_batch_to_f16_kernel<<<
                 (act_total + threads - 1) / threads, threads>>>(
                 (__half *)ctx->d_x_f16, d_gateup, hidden_dim, n_tokens,
                 act_type);
-        } else if (stacked_ffn_gateup) {
+        } else if (!ffn_act_ready && stacked_ffn_gateup) {
             ffn_activation_batch_stacked_kernel<<<
                 (act_total + threads - 1) / threads, threads>>>(
                 d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
-        } else {
+        } else if (!ffn_act_ready) {
             ffn_activation_batch_kernel<<<
                 (act_total + threads - 1) / threads, threads>>>(
                 d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
