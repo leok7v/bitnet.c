@@ -13291,7 +13291,16 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                             getenv("BN_CUDA_DISABLE_Q6K_FLOAT_MOE_DOWN") == NULL;
                         int use_q6_pair_down =
                             getenv("BN_CUDA_DISABLE_MOE_Q6K_PAIR_DOWN") == NULL;
-                        if (use_q6_pair_down) {
+                        int prefer_q6_f32_down =
+                            down->f32_data && hidden >= 4096 &&
+                            getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
+                        if (prefer_q6_f32_down) {
+                            BN_CUDA_LAUNCH(ctx,
+                                moe_q6k_down_routed_f32_cache_warp_kernel,
+                                down_blocks, route_threads, 0,
+                                out, (const float *)down->f32_data, mid,
+                                route, dim, hidden, n_experts, k);
+                        } else if (use_q6_pair_down) {
                             if (cuda_ensure_q8_k(ctx, hidden, k) != 0 ||
                                 cuda_ensure_prefill(ctx,
                                     (size_t)k * (size_t)dim) != 0)
