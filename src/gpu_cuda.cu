@@ -4710,6 +4710,53 @@ static __global__ void moe_q6k_down_routed_q8k_accum_8row_batch_kernel(
         out[(size_t)token * (size_t)dim + (size_t)row] = sum;
 }
 
+static __global__ void moe_q6k_down_routed_q8k_scatter_8row_batch_kernel(
+    float *out,
+    const BnBlockQ6K *down,
+    const BnBlockQ8K *mid_q,
+    const int *indices,
+    const float *weights,
+    int dim,
+    int hidden,
+    int n_experts,
+    int k,
+    int n_tokens) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int lane_group = lane >> 2;
+    int sublane = lane & 3;
+    int task = (blockIdx.x * warps_per_block + warp) * 8 + lane_group;
+    int total_tasks = n_tokens * k * dim;
+    if (task >= total_tasks) return;
+
+    int row = task % dim;
+    int slot_task = task / dim;
+    int slot = slot_task % k;
+    int token = slot_task / k;
+    int expert = indices[token * k + slot];
+    if (expert < 0) expert = 0;
+    if (expert >= n_experts) expert = n_experts - 1;
+
+    int n_bpr = hidden / BN_QK_K;
+    const BnBlockQ6K *row_blocks =
+        down + (((size_t)expert * (size_t)dim + (size_t)row) *
+                (size_t)n_bpr);
+    const BnBlockQ8K *slot_mid_q =
+        mid_q + ((size_t)token * (size_t)k + (size_t)slot) *
+            (size_t)n_bpr;
+    float sum = 0.0f;
+    for (int b = sublane; b < n_bpr; b += 4)
+        sum += cuda_vec_dot_q6k_q8k(&row_blocks[b], slot_mid_q + b);
+    unsigned mask = 0x0fu << (lane_group * 4);
+    sum += __shfl_down_sync(mask, sum, 2);
+    sum += __shfl_down_sync(mask, sum, 1);
+    if (sublane == 0) {
+        float w = weights[token * k + slot];
+        atomicAdd(out + (size_t)token * (size_t)dim + (size_t)row, w * sum);
+    }
+}
+
 static __global__ void moe_q4k_down_routed_q8k_accum_kernel(
     float *out,
     const BnBlockQ4K *down,
@@ -8977,8 +9024,16 @@ static int cuda_moe_routed_ffn_batch(void *vctx, float *out,
                 hidden_dim <= 1024 &&
                 getenv("BN_CUDA_DISABLE_MOE_DOWN_8ROW") == NULL;
             if (use_down_8row) {
-                int down8_blocks = (down4_tasks + warps * 8 - 1) / (warps * 8);
-                if (down_type == BN_GGUF_TENSOR_Q6_K) {
+                int use_scatter =
+                    down_type == BN_GGUF_TENSOR_Q6_K &&
+                    getenv("BN_CUDA_DISABLE_MOE_DOWN_SCATTER") == NULL;
+                int down8_tasks = use_scatter ? n_tokens * k * dim : down4_tasks;
+                int down8_blocks = (down8_tasks + warps * 8 - 1) / (warps * 8);
+                if (use_scatter) {
+                    moe_q6k_down_routed_q8k_scatter_8row_batch_kernel<<<down8_blocks, threads, 0>>>(
+                        d_full_out, (const BnBlockQ6K *)down->data, mid_q,
+                        d_indices, d_weights, dim, hidden_dim, n_experts, k, n_tokens);
+                } else if (down_type == BN_GGUF_TENSOR_Q6_K) {
                     moe_q6k_down_routed_q8k_accum_8row_batch_kernel<<<down8_blocks, threads, 0>>>(
                         d_full_out, (const BnBlockQ6K *)down->data, mid_q,
                         d_indices, d_weights, dim, hidden_dim, n_experts, k, n_tokens);
@@ -9083,6 +9138,20 @@ static int cuda_moe_route_routed_ffn_batch(
     float *d_mid = ctx->d_out;
     int *d_indices = (int *)ctx->d_ops;
     float *d_weights = (float *)((uint8_t *)ctx->d_ops + idx_bytes);
+    int profile_prefill_moe =
+        getenv("BN_CUDA_PROFILE_MOE_PREFILL_INTERNAL") != NULL;
+    static double profile_totals[7] = {0.0};
+    static unsigned long long profile_calls = 0;
+    double profile_t0 = profile_prefill_moe ? cuda_wall_ms() : 0.0;
+#define BN_CUDA_MOE_PREFILL_PROFILE_STEP(code_) do {                 \
+    if (profile_prefill_moe) {                                       \
+        cudaError_t profile_err_ = cudaDeviceSynchronize();           \
+        if (profile_err_ != cudaSuccess) return -1;                  \
+        double profile_t1_ = cuda_wall_ms();                         \
+        profile_totals[(code_)] += profile_t1_ - profile_t0;         \
+        profile_t0 = profile_t1_;                                    \
+    }                                                                \
+} while (0)
 
     cudaError_t err = cudaMemcpy(d_full_x, X, full_bytes,
                                  cudaMemcpyHostToDevice);
@@ -9093,6 +9162,7 @@ static int cuda_moe_route_routed_ffn_batch(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_MOE_PREFILL_PROFILE_STEP(0);
 
     int threads = 256;
     int warps = threads / 32;
@@ -9115,6 +9185,7 @@ static int cuda_moe_route_routed_ffn_batch(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_MOE_PREFILL_PROFILE_STEP(1);
 
     int gateup_tasks = n_tokens * k * hidden_dim;
     int gateup_blocks = (gateup_tasks + warps - 1) / warps;
@@ -9132,6 +9203,7 @@ static int cuda_moe_route_routed_ffn_batch(
                                                   n_tokens);
         err = cudaGetLastError();
         if (err != cudaSuccess) return -1;
+        BN_CUDA_MOE_PREFILL_PROFILE_STEP(2);
             int use_gateup_8row =
                 dim <= 2048 &&
                 getenv("BN_CUDA_ENABLE_MOE_GATEUP_8ROW") != NULL;
@@ -9160,6 +9232,7 @@ static int cuda_moe_route_routed_ffn_batch(
             xq, d_full_x, dim, n_tokens);
         err = cudaGetLastError();
         if (err != cudaSuccess) return -1;
+        BN_CUDA_MOE_PREFILL_PROFILE_STEP(2);
         moe_q4k_gateup_routed_mid_batch_kernel<<<gateup_blocks, threads, 0>>>(
             d_mid, (const BnBlockQ4K *)gate->data,
             (const BnBlockQ4K *)up->data, xq, d_indices, d_weights,
@@ -9171,6 +9244,7 @@ static int cuda_moe_route_routed_ffn_batch(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_MOE_PREFILL_PROFILE_STEP(3);
 
     int down_tasks = n_tokens * dim;
     int down_blocks = (down_tasks + warps - 1) / warps;
@@ -9188,6 +9262,7 @@ static int cuda_moe_route_routed_ffn_batch(
                                                n_mid);
         err = cudaGetLastError();
         if (err != cudaSuccess) return -1;
+        BN_CUDA_MOE_PREFILL_PROFILE_STEP(4);
         int use_down_4row =
             hidden_dim <= 1024 &&
             getenv("BN_CUDA_DISABLE_MOE_DOWN_4ROW") == NULL;
@@ -9198,8 +9273,16 @@ static int cuda_moe_route_routed_ffn_batch(
                 hidden_dim <= 1024 &&
                 getenv("BN_CUDA_DISABLE_MOE_DOWN_8ROW") == NULL;
             if (use_down_8row) {
-                int down8_blocks = (down4_tasks + warps * 8 - 1) / (warps * 8);
-                if (down_type == BN_GGUF_TENSOR_Q6_K) {
+                int use_scatter =
+                    down_type == BN_GGUF_TENSOR_Q6_K &&
+                    getenv("BN_CUDA_DISABLE_MOE_DOWN_SCATTER") == NULL;
+                int down8_tasks = use_scatter ? n_tokens * k * dim : down4_tasks;
+                int down8_blocks = (down8_tasks + warps * 8 - 1) / (warps * 8);
+                if (use_scatter) {
+                    moe_q6k_down_routed_q8k_scatter_8row_batch_kernel<<<down8_blocks, threads, 0>>>(
+                        d_full_out, (const BnBlockQ6K *)down->data, mid_q,
+                        d_indices, d_weights, dim, hidden_dim, n_experts, k, n_tokens);
+                } else if (down_type == BN_GGUF_TENSOR_Q6_K) {
                     moe_q6k_down_routed_q8k_accum_8row_batch_kernel<<<down8_blocks, threads, 0>>>(
                         d_full_out, (const BnBlockQ6K *)down->data, mid_q,
                         d_indices, d_weights, dim, hidden_dim, n_experts, k, n_tokens);
@@ -9228,6 +9311,7 @@ static int cuda_moe_route_routed_ffn_batch(
         }
     }
     err = cudaGetLastError();
+    BN_CUDA_MOE_PREFILL_PROFILE_STEP(5);
     if (err == cudaSuccess)
         err = cudaMemcpy(out, d_full_out, full_bytes, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
@@ -9235,6 +9319,24 @@ static int cuda_moe_route_routed_ffn_batch(
                 cudaGetErrorString(err));
         return -1;
     }
+    BN_CUDA_MOE_PREFILL_PROFILE_STEP(6);
+    if (profile_prefill_moe) {
+        profile_calls++;
+        int every = cuda_env_int("BN_CUDA_PROFILE_MOE_PREFILL_EVERY", 48);
+        if (every <= 0) every = 48;
+        if ((profile_calls % (unsigned long long)every) == 0) {
+            double total = 0.0;
+            for (int i = 0; i < 7; i++) total += profile_totals[i];
+            fprintf(stderr,
+                    "[bn:gpu:cuda:moe-prefill] calls=%llu total=%.3fms upload=%.3f route=%.3f x_quant=%.3f gateup=%.3f mid_quant=%.3f down=%.3f readback=%.3f\n",
+                    profile_calls, total, profile_totals[0],
+                    profile_totals[1], profile_totals[2],
+                    profile_totals[3], profile_totals[4],
+                    profile_totals[5], profile_totals[6]);
+            for (int i = 0; i < 7; i++) profile_totals[i] = 0.0;
+        }
+    }
+#undef BN_CUDA_MOE_PREFILL_PROFILE_STEP
     return 0;
 }
 
