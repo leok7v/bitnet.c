@@ -10394,7 +10394,7 @@ static int cuda_moe_routed_ffn_batch(void *vctx, float *out,
         routed_q8 && getenv("BN_CUDA_DISABLE_Q8_MOE_BATCH_Q8_1") == NULL;
     if (use_q8_q8_1_batch) {
         int x_blocks = dim / 32;
-        if (cuda_ensure_q8_1(ctx, x_blocks * n_tokens) != 0)
+        if (cuda_ensure_q8_1(ctx, x_blocks * 32 * n_tokens) != 0)
             return -1;
         BnCudaBlockQ8_1 *xq = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
         quantize_q8_1_batch_kernel<<<dim3(x_blocks, n_tokens, 1), 32, 0>>>(
@@ -10476,7 +10476,7 @@ static int cuda_moe_routed_ffn_batch(void *vctx, float *out,
     if (use_q8_q8_1_batch) {
         int n_mid = n_tokens * k;
         int mid_blocks = hidden_dim / 32;
-        if (cuda_ensure_q8_1(ctx, mid_blocks * n_mid) != 0)
+        if (cuda_ensure_q8_1(ctx, mid_blocks * 32 * n_mid) != 0)
             return -1;
         BnCudaBlockQ8_1 *mid_q = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
         quantize_q8_1_batch_kernel<<<dim3(mid_blocks, n_mid, 1), 32, 0>>>(
@@ -10819,7 +10819,7 @@ static int cuda_moe_route_routed_ffn_batch(
 
     if (use_q8_q8_1_batch) {
         int x_blocks = dim / 32;
-        if (cuda_ensure_q8_1(ctx, x_blocks * n_tokens) != 0)
+        if (cuda_ensure_q8_1(ctx, x_blocks * 32 * n_tokens) != 0)
             return -1;
         BnCudaBlockQ8_1 *xq = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
         quantize_q8_1_batch_kernel<<<dim3(x_blocks, n_tokens, 1), 32, 0>>>(
@@ -10898,7 +10898,7 @@ static int cuda_moe_route_routed_ffn_batch(
     if (use_q8_q8_1_batch) {
         int n_mid = n_tokens * k;
         int mid_blocks = hidden_dim / 32;
-        if (cuda_ensure_q8_1(ctx, mid_blocks * n_mid) != 0)
+        if (cuda_ensure_q8_1(ctx, mid_blocks * 32 * n_mid) != 0)
             return -1;
         BnCudaBlockQ8_1 *mid_q = (BnCudaBlockQ8_1 *)ctx->d_q8_1;
         quantize_q8_1_batch_kernel<<<dim3(mid_blocks, n_mid, 1), 32, 0>>>(
