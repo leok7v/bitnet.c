@@ -722,10 +722,17 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         policy.has_moe &&
         !getenv("BN_CUDA_DISABLE_MOE_DECODE_CACHE") &&
         gpu_cuda_moe_decode_cacheable(c, w, backend);
+    int gpu_logits_need_cpu =
+        bn_transformer_gpu_logits_needs_cpu_fallback(gpu, logit_res);
+    int use_matvec_argmax =
+        argmax_token && !need_logits && gpu->matvec_argmax_activation &&
+        !getenv("BN_GPU_CPU_LOGITS") && !gpu_logits_need_cpu &&
+        getenv("BN_CUDA_ENABLE_LOGITS_ARGMAX") &&
+        logit_res->type == BN_GGUF_TENSOR_Q6_K;
     int cacheable_decode =
         (!emit_logits || argmax_token ||
          (getenv("BN_CUDA_ENABLE_LOGITS_CACHE") &&
-          !bn_transformer_gpu_logits_needs_cpu_fallback(gpu, logit_res))) &&
+          !gpu_logits_need_cpu)) &&
         gpu->kind == BN_GPU_BACKEND_CUDA &&
         (!policy.has_moe || cacheable_resident_moe ||
          getenv("BN_CUDA_ENABLE_MOE_DECODE_CACHE")) &&
@@ -743,10 +750,13 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         ? bn_backend_session_gpu_cached_op_count(sess->backend)
         : 0;
     if (argmax_token && cached_n > 0 &&
-        !bn_backend_session_gpu_cached_has_logits(sess->backend)) {
+        !bn_backend_session_gpu_cached_has_logits(sess->backend) &&
+        !use_matvec_argmax) {
         bn_backend_session_clear_gpu_cached_ops(sess->backend);
         cached_n = 0;
     }
+    int cached_has_logits = cached_n > 0 &&
+        bn_backend_session_gpu_cached_has_logits(sess->backend);
     if (cached_n > 0 && cached_n <= command_cap) {
         if (gpu_patch_cached_decode_ops((BnGPUOp *)command_buffer, cached_n,
                                         c, pos) == 0 &&
@@ -755,14 +765,22 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 need_logits ? BN_GPU_VALUE_LOGITS : -1,
                 need_logits ? s->logits : NULL,
                 need_logits ? c->vocab_size : 0) == 0) {
-            if (argmax_token &&
-                gpu->argmax_activation(
-                    gpu->ctx, BN_GPU_VALUE_LOGITS, c->vocab_size,
-                    penalty_tokens, n_penalty_tokens, repeat_penalty,
-                    argmax_token) != 0) {
-                bn_backend_session_clear_gpu_cached_ops(sess->backend);
-                bn_transformer_gpu_emit_context_free(&emit);
-                return NULL;
+            if (argmax_token) {
+                int argmax_rc = cached_has_logits
+                    ? gpu->argmax_activation(
+                          gpu->ctx, BN_GPU_VALUE_LOGITS, c->vocab_size,
+                          penalty_tokens, n_penalty_tokens, repeat_penalty,
+                          argmax_token)
+                    : gpu->matvec_argmax_activation(
+                          gpu->ctx, logit_res->gpu_buf, logit_res->type,
+                          logit_res->rows, logit_res->cols, BN_GPU_VALUE_XB,
+                          penalty_tokens, n_penalty_tokens, repeat_penalty,
+                          argmax_token);
+                if (argmax_rc != 0) {
+                    bn_backend_session_clear_gpu_cached_ops(sess->backend);
+                    bn_transformer_gpu_emit_context_free(&emit);
+                    return NULL;
+                }
             }
             bn_transformer_gpu_emit_context_free(&emit);
             return need_logits ? s->logits : s->x;
@@ -1279,9 +1297,8 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
     }
 
     // ---- Logits matvec: xb -> logits (xb is already normalized) ----
-    if (emit_logits) {
-        if (getenv("BN_GPU_CPU_LOGITS") ||
-            bn_transformer_gpu_logits_needs_cpu_fallback(gpu, logit_res)) {
+    if (emit_logits && !use_matvec_argmax) {
+        if (getenv("BN_GPU_CPU_LOGITS") || gpu_logits_need_cpu) {
             if (argmax_token)
                 return bn_transformer_gpu_reject_forward(
                     &emit, "gpu argmax requires gpu logits");
@@ -1318,12 +1335,20 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
             &emit, "gpu final execute failed");
     if (cacheable_decode && final_n > 0)
         bn_backend_session_set_gpu_cached_op_count(sess->backend, final_n,
-                                                   emit_logits);
+                                                   emit_logits &&
+                                                   !use_matvec_argmax);
     if (argmax_token) {
-        if (gpu->argmax_activation(
-                gpu->ctx, BN_GPU_VALUE_LOGITS, c->vocab_size,
-                penalty_tokens, n_penalty_tokens, repeat_penalty,
-                argmax_token) != 0)
+        int argmax_rc = use_matvec_argmax
+            ? gpu->matvec_argmax_activation(
+                  gpu->ctx, logit_res->gpu_buf, logit_res->type,
+                  logit_res->rows, logit_res->cols, BN_GPU_VALUE_XB,
+                  penalty_tokens, n_penalty_tokens, repeat_penalty,
+                  argmax_token)
+            : gpu->argmax_activation(
+                  gpu->ctx, BN_GPU_VALUE_LOGITS, c->vocab_size,
+                  penalty_tokens, n_penalty_tokens, repeat_penalty,
+                  argmax_token);
+        if (argmax_rc != 0)
             return bn_transformer_gpu_reject_forward(
                 &emit, "gpu argmax failed");
         if (getenv("BN_GPU_DEBUG_ARGMAX_COMPARE") &&
