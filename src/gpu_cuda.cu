@@ -12883,7 +12883,10 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 BN_CUDA_EXEC_FAIL("matvec split invalid args");
             if (split1 > split0 && (!out2 || split1 > total_rows))
                 BN_CUDA_EXEC_FAIL("matvec split invalid third output");
-            if (!disable_qkv_mixed_fuse &&
+            int q4k_qkv_mixed_slow =
+                op->type == BN_GGUF_TENSOR_Q4_K &&
+                getenv("BN_CUDA_ENABLE_Q4K_QKV_MIXED_FUSE") == NULL;
+            if (!disable_qkv_mixed_fuse && !q4k_qkv_mixed_slow &&
                 next && i + 7 < n_ops &&
                 next->op_code == BN_GPU_CODE_BIAS_ADD &&
                 next->buf_in == op->buf_out &&
