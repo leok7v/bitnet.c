@@ -13904,12 +13904,20 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
         }
         case BN_GPU_CODE_COPY: {
             float *in = cuda_act(ctx, op->buf_in);
-            float *out = cuda_act(ctx, op->buf_out);
+            void *out = cuda_act(ctx, op->buf_out);
             int n = (int)op->p[2];
             if (!in || !out || n < 0) return -1;
-            BN_CUDA_LAUNCH(ctx, copy_kernel, (n + threads - 1) / threads,
-                threads, 0,
-                in, out, (int)op->p[0], (int)op->p[1], n);
+            if (ctx->kv_f16 &&
+                (op->buf_out == BN_GPU_VALUE_KEY_CACHE ||
+                 op->buf_out == BN_GPU_VALUE_VALUE_CACHE)) {
+                BN_CUDA_LAUNCH(ctx, kv_store_vector_kernel,
+                    (n + threads - 1) / threads, threads, 0,
+                    out, in + (int)op->p[0], n, (size_t)op->p[1], 1);
+            } else {
+                BN_CUDA_LAUNCH(ctx, copy_kernel, (n + threads - 1) / threads,
+                    threads, 0,
+                    in, (float *)out, (int)op->p[0], (int)op->p[1], n);
+            }
             break;
         }
         case BN_GPU_CODE_DEINTERLEAVE_Q: {

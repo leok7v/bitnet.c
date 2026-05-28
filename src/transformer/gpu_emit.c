@@ -1201,9 +1201,10 @@ void bn_transformer_gpu_emit_context_qkv(BnTransformerGPUEmitContext *ctx,
                                  NULL, deinterleave_params);
         } else {
             if (use_qk_split) {
-                int k_split_buf = k_bias ? BN_GPU_VALUE_SCRATCH
-                                         : BN_GPU_VALUE_KEY_CACHE;
-                int k_split_offset = k_bias ? 0 : (int)kv_cache_off;
+                int k_needs_scratch = k_bias || c->kv_f16;
+                int k_split_buf = k_needs_scratch ? BN_GPU_VALUE_SCRATCH
+                                                   : BN_GPU_VALUE_KEY_CACHE;
+                int k_split_offset = k_needs_scratch ? 0 : (int)kv_cache_off;
                 emit_context_matvec_split(
                     ctx, lw->attn.wq.type, qk_stacked, BN_GPU_VALUE_XB,
                     BN_GPU_VALUE_Q, k_split_buf, -1,
@@ -1227,13 +1228,15 @@ void bn_transformer_gpu_emit_context_qkv(BnTransformerGPUEmitContext *ctx,
         }
 
         if (use_qk_split) {
-            if (k_bias) {
+            if (k_bias || c->kv_f16) {
                 uint32_t bias_params[8] = {
                     (uint32_t)kv_dim, 0, 0, 0, 0, 0, 0, 0
                 };
-                emit_context_utility(ctx, BN_GPU_IR_UTILITY_BIAS_ADD,
-                                     BN_GPU_VALUE_SCRATCH, -1, -1, 0,
-                                     k_bias, bias_params);
+                if (k_bias) {
+                    emit_context_utility(ctx, BN_GPU_IR_UTILITY_BIAS_ADD,
+                                         BN_GPU_VALUE_SCRATCH, -1, -1, 0,
+                                         k_bias, bias_params);
+                }
                 if (k_norm) {
                     uint32_t ph_params[8] = {
                         (uint32_t)head_size, u_eps,
