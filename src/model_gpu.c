@@ -16,13 +16,14 @@ static int checked_mul_size(size_t a, size_t b, size_t *out) {
 }
 
 static int cuda_moe_all_f16_cache_enabled_for_type(const BnGPUBackend *gpu,
-                                                   int type) {
+                                                   int type,
+                                                   int q8_f16_cache) {
     if (!gpu || !gpu->buffer_create_f16_cache ||
         getenv("BN_CUDA_DISABLE_MOE_ALL_F16_CACHE"))
         return 0;
     if (getenv("BN_CUDA_ENABLE_MOE_ALL_F16_CACHE"))
         return 1;
-    return type == BN_GGUF_TENSOR_Q8_0;
+    return q8_f16_cache && type == BN_GGUF_TENSOR_Q8_0;
 }
 
 BnGPUBackend *bn_model_gpu(const BnModel *model) {
@@ -87,7 +88,8 @@ static void *upload_moe_all_proj(BnModel *model,
                                  BnGPUBackend *gpu,
                                  const BnMoEExpertMap *em,
                                  int proj,
-                                 int n_experts) {
+                                 int n_experts,
+                                 int q8_f16_cache) {
     if (!model || !gpu || !em || n_experts <= 0)
         return NULL;
     size_t offset = 0;
@@ -131,7 +133,7 @@ static void *upload_moe_all_proj(BnModel *model,
     if ((size_t)n_experts > (size_t)INT_MAX / (size_t)rows)
         return NULL;
     int force_f16_cache =
-        cuda_moe_all_f16_cache_enabled_for_type(gpu, type);
+        cuda_moe_all_f16_cache_enabled_for_type(gpu, type, q8_f16_cache);
     int prefer_q6_f32_cache =
         proj == 2 && type == BN_GGUF_TENSOR_Q6_K &&
         !force_f16_cache &&
@@ -147,7 +149,9 @@ static void *upload_moe_all_proj(BnModel *model,
             ? gpu->buffer_create_f16_cache :
         prefer_q6_f32_cache
             ? gpu->buffer_create_q6_f32_cache :
-        (!force_full_buffer && gpu->buffer_create_quant_only)
+        ((!force_full_buffer ||
+          (type == BN_GGUF_TENSOR_Q8_0 && !q8_f16_cache)) &&
+         gpu->buffer_create_quant_only)
             ? gpu->buffer_create_quant_only
             : gpu->buffer_create;
     if (stride != expert_bytes) {
@@ -314,9 +318,154 @@ static size_t cuda_q6_down_f32_cache_bytes(const BnGPUBackend *gpu,
     return bytes <= max_bytes ? bytes : 0;
 }
 
+static int add_qweight_bytes(size_t *total, const BnQWeight *w) {
+    return add_size_checked(total, bn_qweight_data_size(w));
+}
+
+static size_t qweight_default_aux_cache_bytes(const BnQWeight *w) {
+    if (!w || !w->data || w->rows <= 0 || w->cols <= 0 ||
+        (w->cols & 31) != 0 ||
+        getenv("BN_CUDA_DISABLE_CUBLAS_MATMUL"))
+        return 0;
+    if (w->type != BN_GGUF_TENSOR_Q8_0 &&
+        w->type != BN_GGUF_TENSOR_Q5_0 &&
+        w->type != BN_GGUF_TENSOR_Q4_K &&
+        w->type != BN_GGUF_TENSOR_Q5_K &&
+        w->type != BN_GGUF_TENSOR_Q6_K)
+        return 0;
+    int q6_as_f16 = w->type == BN_GGUF_TENSOR_Q6_K &&
+                    getenv("BN_CUDA_DISABLE_Q6K_CUBLAS_F16") == NULL &&
+                    getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
+    size_t bytes = 0;
+    if (mul3_size((size_t)w->rows, (size_t)w->cols,
+                  w->type == BN_GGUF_TENSOR_Q6_K && !q6_as_f16
+                      ? sizeof(float) : sizeof(uint16_t),
+                  &bytes) != 0)
+        return SIZE_MAX;
+
+    int max_mb = 128;
+    const char *max_env = getenv("BN_CUDA_CUBLAS_CACHE_MAX_MB");
+    if (max_env && *max_env) {
+        max_mb = atoi(max_env);
+    } else if (w->type == BN_GGUF_TENSOR_Q4_K ||
+               w->type == BN_GGUF_TENSOR_Q5_K ||
+               w->type == BN_GGUF_TENSOR_Q6_K) {
+        max_mb = 512;
+    }
+    if (max_mb > 0 && bytes > (size_t)max_mb * 1024u * 1024u)
+        return 0;
+    return bytes;
+}
+
+static int add_qweight_upload_bytes(size_t *total, const BnQWeight *w) {
+    size_t aux = qweight_default_aux_cache_bytes(w);
+    if (add_qweight_bytes(total, w) != 0 || aux == SIZE_MAX)
+        return -1;
+    return add_size_checked(total, aux);
+}
+
+static int add_f32_bytes(size_t *total, const float *data, int n_elems) {
+    size_t bytes = 0;
+    if (!data || n_elems <= 0)
+        return 0;
+    if (checked_mul_size((size_t)n_elems, sizeof(float), &bytes) != 0)
+        return -1;
+    return add_size_checked(total, bytes);
+}
+
+static size_t estimate_cuda_base_model_bytes(const BnConfig *c,
+                                             const BnWeights *w) {
+    if (!c || !w)
+        return 0;
+    size_t total = 0;
+    if (w->output_weight.data) {
+        if (add_qweight_upload_bytes(&total, &w->output_weight) != 0)
+            return SIZE_MAX;
+    } else if (w->token_embedding) {
+        size_t elems = 0;
+        size_t bytes = 0;
+        if (checked_mul_size((size_t)c->vocab_size, (size_t)c->dim,
+                             &elems) != 0 ||
+            !bn_gguf_tensor_size((uint32_t)w->emb_type, (uint64_t)elems,
+                                 &bytes) ||
+            add_size_checked(&total, bytes) != 0)
+            return SIZE_MAX;
+    }
+    if (add_f32_bytes(&total, w->output_norm, c->dim) != 0)
+        return SIZE_MAX;
+
+    for (int l = 0; l < c->n_layers; l++) {
+        const BnLayerWeights *lw = &w->layers[l];
+        const BnQWeight *weights[] = {
+            &lw->attn.wq, &lw->attn.wk, &lw->attn.wv, &lw->attn.wo,
+            &lw->ffn.ffn_gate, &lw->ffn.ffn_up, &lw->ffn.ffn_down,
+            &lw->ssm.wqkv, &lw->ssm.wz,
+            &lw->ssm.ssm_alpha, &lw->ssm.ssm_beta, &lw->ssm.ssm_out,
+            &lw->shared.shared_gate, &lw->shared.shared_up,
+            &lw->shared.shared_down,
+        };
+        int n_weights = (int)(sizeof(weights) / sizeof(weights[0]));
+        for (int i = 0; i < n_weights; i++) {
+            if (add_qweight_upload_bytes(&total, weights[i]) != 0)
+                return SIZE_MAX;
+        }
+        if (add_f32_bytes(&total, lw->norm.attn_norm, c->dim) != 0 ||
+            add_f32_bytes(&total, lw->norm.ffn_norm, c->dim) != 0 ||
+            add_f32_bytes(&total, lw->moe.router_weight,
+                          c->n_experts * c->dim) != 0 ||
+            add_f32_bytes(&total, lw->shared.shared_expert_gate,
+                          c->dim) != 0)
+            return SIZE_MAX;
+        if (c->n_experts == 2 && c->n_experts_active == 2 &&
+            lw->moe.router_weight &&
+            add_f32_bytes(&total, lw->moe.router_weight, c->dim) != 0)
+            return SIZE_MAX;
+        if (add_f32_bytes(&total, lw->attn.q_bias, lw->attn.wq.rows) != 0 ||
+            add_f32_bytes(&total, lw->attn.k_bias, lw->attn.wk.rows) != 0 ||
+            add_f32_bytes(&total, lw->attn.v_bias, lw->attn.wv.rows) != 0)
+            return SIZE_MAX;
+        if (lw->attn.q_norm) {
+            int q_norm_size = c->qk_norm_per_head
+                ? c->n_heads * c->head_size : c->head_size;
+            if (add_f32_bytes(&total, lw->attn.q_norm, q_norm_size) != 0)
+                return SIZE_MAX;
+        }
+        if (lw->attn.k_norm) {
+            int k_norm_size = c->qk_norm_per_head ? c->kv_dim : c->head_size;
+            if (add_f32_bytes(&total, lw->attn.k_norm, k_norm_size) != 0)
+                return SIZE_MAX;
+        }
+        if (add_f32_bytes(&total, lw->norm.attn_sub_norm, c->dim) != 0 ||
+            add_f32_bytes(&total, lw->norm.ffn_sub_norm, c->hidden_dim) != 0)
+            return SIZE_MAX;
+        if (lw->ssm.ssm_conv1d) {
+            int num_v_heads = c->ssm_time_step_rank;
+            int head_k_dim = c->ssm_state_size;
+            int key_dim = c->ssm_group_count * head_k_dim;
+            int qkv_dim = key_dim * 2 + c->ssm_inner_size;
+            int kern = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
+            if (add_f32_bytes(&total, lw->ssm.ssm_conv1d,
+                              kern * qkv_dim) != 0 ||
+                add_f32_bytes(&total, lw->ssm.ssm_dt_bias,
+                              num_v_heads) != 0 ||
+                add_f32_bytes(&total, lw->ssm.ssm_a, num_v_heads) != 0)
+                return SIZE_MAX;
+            if (lw->ssm.ssm_norm) {
+                int head_v_dim = num_v_heads > 0
+                    ? c->ssm_inner_size / num_v_heads : c->ssm_inner_size;
+                if (add_f32_bytes(&total, lw->ssm.ssm_norm,
+                                  head_v_dim) != 0)
+                    return SIZE_MAX;
+            }
+        }
+    }
+    return total;
+}
+
 static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
                                           const BnWeights *w,
-                                          const BnGPUBackend *gpu) {
+                                          const BnGPUBackend *gpu,
+                                          int q8_f16_cache) {
     if (!c || !w || c->n_experts <= 0)
         return 0;
     size_t total = 0;
@@ -340,7 +489,8 @@ static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
         size_t aux = cuda_q6_down_f32_cache_bytes(gpu, em, c->n_experts);
         if (aux == SIZE_MAX || add_size_checked(&layer, aux) != 0)
             return SIZE_MAX;
-        if (cuda_moe_all_f16_cache_enabled_for_type(gpu, em->gate_type)) {
+        if (cuda_moe_all_f16_cache_enabled_for_type(gpu, em->gate_type,
+                                                    q8_f16_cache)) {
             if (mul3_size((size_t)c->n_experts,
                           (size_t)em->gate_rows,
                           (size_t)em->gate_cols, &aux) != 0 ||
@@ -348,7 +498,8 @@ static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
                 add_size_checked(&layer, aux) != 0)
                 return SIZE_MAX;
         }
-        if (cuda_moe_all_f16_cache_enabled_for_type(gpu, em->up_type)) {
+        if (cuda_moe_all_f16_cache_enabled_for_type(gpu, em->up_type,
+                                                    q8_f16_cache)) {
             if (mul3_size((size_t)c->n_experts,
                           (size_t)em->up_rows,
                           (size_t)em->up_cols, &aux) != 0 ||
@@ -356,7 +507,8 @@ static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
                 add_size_checked(&layer, aux) != 0)
                 return SIZE_MAX;
         }
-        if (cuda_moe_all_f16_cache_enabled_for_type(gpu, em->down_type)) {
+        if (cuda_moe_all_f16_cache_enabled_for_type(gpu, em->down_type,
+                                                    q8_f16_cache)) {
             if (mul3_size((size_t)c->n_experts,
                           (size_t)em->down_rows,
                           (size_t)em->down_cols, &aux) != 0 ||
@@ -372,13 +524,21 @@ static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
 
 static int cuda_moe_all_fits_memory(BnGPUBackend *gpu,
                                     const BnConfig *c,
-                                    const BnWeights *w) {
+                                    const BnWeights *w,
+                                    int q8_f16_cache) {
     if (!gpu || !gpu->memory_info)
         return 1;
-    size_t need = estimate_cuda_moe_all_bytes(c, w, gpu);
+    size_t need = estimate_cuda_moe_all_bytes(c, w, gpu, q8_f16_cache);
     if (need == 0)
         return 0;
     if (need == SIZE_MAX)
+        return 0;
+    size_t base = estimate_cuda_base_model_bytes(c, w);
+    if (base == SIZE_MAX)
+        return 0;
+    size_t projected = 0;
+    if (add_size_checked(&projected, need) != 0 ||
+        add_size_checked(&projected, base) != 0)
         return 0;
     size_t free_bytes = 0;
     size_t total_bytes = 0;
@@ -388,14 +548,19 @@ static int cuda_moe_all_fits_memory(BnGPUBackend *gpu,
     size_t reserve = reserve_mb > SIZE_MAX / (1024u * 1024u)
         ? SIZE_MAX
         : reserve_mb * 1024u * 1024u;
-    if (free_bytes > need && free_bytes - need >= reserve)
+    if (free_bytes > projected && free_bytes - projected >= reserve)
         return 1;
     fprintf(stderr,
-            "[bn:gpu] skipping full CUDA MoE residency: need=%.1f GiB "
+            "[bn:gpu] skipping full CUDA MoE residency: moe=%.1f GiB "
+            "base=%.1f GiB projected=%.1f GiB "
             "free=%.1f GiB total=%.1f GiB reserve=%.1f GiB "
-            "(using lazy GPU expert cache)\n",
-            need / 1073741824.0, free_bytes / 1073741824.0,
-            total_bytes / 1073741824.0, reserve / 1073741824.0);
+            "(%s)\n",
+            need / 1073741824.0, base / 1073741824.0,
+            projected / 1073741824.0, free_bytes / 1073741824.0,
+            total_bytes / 1073741824.0, reserve / 1073741824.0,
+            q8_f16_cache
+                ? "will try quant-only full residency"
+                : "using lazy GPU expert cache");
     return 0;
 }
 
@@ -410,8 +575,22 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
     int n_layers = c->n_layers;
     int upload_moe_all_model = !getenv("BN_CUDA_DISABLE_MOE_ROUTED_FFN") &&
                                can_use_cuda_moe_routed_ffn_model(c, w);
-    if (upload_moe_all_model && !cuda_moe_all_fits_memory(gpu, c, w))
-        upload_moe_all_model = 0;
+    int upload_moe_all_q8_f16_cache = 0;
+    if (upload_moe_all_model) {
+        int force_f16_cache =
+            getenv("BN_CUDA_ENABLE_MOE_ALL_F16_CACHE") != NULL;
+        if (cuda_moe_all_fits_memory(gpu, c, w, 1)) {
+            upload_moe_all_q8_f16_cache = 1;
+        } else if (!force_f16_cache &&
+                   cuda_moe_all_fits_memory(gpu, c, w, 0)) {
+            upload_moe_all_q8_f16_cache = 0;
+            fprintf(stderr,
+                    "[bn:gpu] using quant-only full CUDA MoE residency; "
+                    "F16 aux expert cache does not fit current VRAM\n");
+        } else {
+            upload_moe_all_model = 0;
+        }
+    }
 
     if (w->output_weight.data) {
         void *output_weight_gpu = upload_qweight(gpu, &w->output_weight);
@@ -482,15 +661,18 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
                              can_use_cuda_moe_routed_ffn(c, lw);
         void *moe_gate_all_gpu = upload_moe_all
             ? upload_moe_all_proj(model, gpu, &lw->moe.expert_map, 0,
-                                  c->n_experts)
+                                  c->n_experts,
+                                  upload_moe_all_q8_f16_cache)
             : NULL;
         void *moe_up_all_gpu = upload_moe_all
             ? upload_moe_all_proj(model, gpu, &lw->moe.expert_map, 1,
-                                  c->n_experts)
+                                  c->n_experts,
+                                  upload_moe_all_q8_f16_cache)
             : NULL;
         void *moe_down_all_gpu = upload_moe_all
             ? upload_moe_all_proj(model, gpu, &lw->moe.expert_map, 2,
-                                  c->n_experts)
+                                  c->n_experts,
+                                  upload_moe_all_q8_f16_cache)
             : NULL;
         if (upload_moe_all &&
             (!moe_gate_all_gpu || !moe_up_all_gpu || !moe_down_all_gpu)) {
@@ -500,9 +682,12 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
                 gpu->buffer_destroy(gpu->ctx, moe_up_all_gpu);
             if (moe_down_all_gpu)
                 gpu->buffer_destroy(gpu->ctx, moe_down_all_gpu);
-            moe_gate_all_gpu = NULL;
-            moe_up_all_gpu = NULL;
-            moe_down_all_gpu = NULL;
+            fprintf(stderr,
+                    "[bn:gpu] failed full CUDA MoE residency upload at "
+                    "layer=%d; aborting upload instead of mixing resident "
+                    "and fallback MoE paths\n", l);
+            bn_model_release_gpu(model);
+            return -1;
         }
         void *shared_expert_gate_gpu = lw->shared.shared_expert_gate
             ? gpu->buffer_create(
