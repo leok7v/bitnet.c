@@ -4651,6 +4651,41 @@ static __global__ void moe_q6k_down_routed_f32_cache_warp_kernel(
         out[row] = sum;
 }
 
+static __global__ void moe_q6k_down_routed_f16_cache_warp_kernel(
+    float *out,
+    const __half *down,
+    const float *mid,
+    const float *route,
+    int dim,
+    int hidden,
+    int n_experts,
+    int k) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    if (row >= dim) return;
+
+    float sum = 0.0f;
+    for (int slot = 0; slot < k; slot++) {
+        int expert = (int)(route[k + slot] + 0.5f);
+        if (expert < 0) expert = 0;
+        if (expert >= n_experts) expert = n_experts - 1;
+        const uint16_t *row_w =
+            (const uint16_t *)down +
+            ((size_t)expert * (size_t)dim + (size_t)row) * (size_t)hidden;
+        const float *slot_mid = mid + (size_t)slot * (size_t)hidden;
+        float slot_sum = 0.0f;
+        for (int c = lane; c < hidden; c += 32)
+            slot_sum += cuda_fp16_to_fp32(row_w[c]) * slot_mid[c];
+        sum += route[slot] * slot_sum;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        out[row] = sum;
+}
+
 static __global__ void moe_q6k_down_routed_f32_cache_batch_kernel(
     float *out,
     const float *down,
@@ -12829,6 +12864,14 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                                 moe_q6k_down_routed_f32_cache_warp_kernel,
                                 down_blocks, route_threads, 0,
                                 out, (const float *)down->f32_data, mid,
+                                route, dim, hidden, n_experts, k);
+                        } else if (down->f16_data &&
+                                   getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F16_CACHE") != NULL &&
+                                   getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F16_CACHE") == NULL) {
+                            BN_CUDA_LAUNCH(ctx,
+                                moe_q6k_down_routed_f16_cache_warp_kernel,
+                                down_blocks, route_threads, 0,
+                                out, (const __half *)down->f16_data, mid,
                                 route, dim, hidden, n_experts, k);
                         } else if (use_q6_float_down) {
                             BN_CUDA_LAUNCH(ctx,
