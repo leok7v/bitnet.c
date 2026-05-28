@@ -11351,10 +11351,13 @@ static int cuda_prefill_ssm_layer(
         return -1;
 
     cudaError_t err = cudaSuccess;
+    int alias_prev_output = !X && fuse_ffn &&
+                            getenv("BN_CUDA_DISABLE_SSM_PREFILL_INPUT_ALIAS") == NULL;
+    const float *d_input = alias_prev_output ? ctx->d_out : ctx->d_x;
     if (X) {
         err = cudaMemcpy(ctx->d_x, X, dim_values * sizeof(float),
                          cudaMemcpyHostToDevice);
-    } else {
+    } else if (!alias_prev_output) {
         /*
          * Keep chained SSM prefill GPU-resident.  A synchronous D2D memcpy
          * here forces the host to wait once per SSM layer, which is visible on
@@ -11390,7 +11393,7 @@ static int cuda_prefill_ssm_layer(
     int warps = threads / 32;
     rmsnorm_batch_kernel<<<n_tokens, threads,
                            (size_t)warps * sizeof(float)>>>(
-        d_norm, ctx->d_x, (const float *)attn_norm->data, dim,
+        d_norm, d_input, (const float *)attn_norm->data, dim,
         n_tokens, norm_eps);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -11616,12 +11619,13 @@ static int cuda_prefill_ssm_layer(
     }
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_SCAN);
 
-    if (cuda_matmul_device_out(ctx, ctx->d_out, ssm_out, d_ssm, dim,
+    float *d_ssm_residual = alias_prev_output ? d_ffn_residual : ctx->d_out;
+    if (cuda_matmul_device_out(ctx, d_ssm_residual, ssm_out, d_ssm, dim,
                                inner_dim, n_tokens, out_type) != 0)
         return -1;
     residual_add_kernel<<<((int)dim_values + threads - 1) / threads,
                            threads>>>(
-        ctx->d_out, ctx->d_x, (int)dim_values);
+        d_ssm_residual, d_input, (int)dim_values);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[bn:gpu:cuda] prefill ssm residual failed: %s\n",
@@ -11653,10 +11657,17 @@ static int cuda_prefill_ssm_layer(
                 ssm_ffn_t0 = ffn_profile_now__;                       \
             }                                                         \
         } while (0)
-        rmsnorm_batch_copy_kernel<<<n_tokens, threads,
-                                    (size_t)warps * sizeof(float)>>>(
-            d_ffn_norm, d_ffn_residual, ctx->d_out,
-            (const float *)ffn_norm->data, dim, n_tokens, norm_eps);
+        if (alias_prev_output) {
+            rmsnorm_batch_kernel<<<n_tokens, threads,
+                                   (size_t)warps * sizeof(float)>>>(
+                d_ffn_norm, d_ffn_residual, (const float *)ffn_norm->data,
+                dim, n_tokens, norm_eps);
+        } else {
+            rmsnorm_batch_copy_kernel<<<n_tokens, threads,
+                                        (size_t)warps * sizeof(float)>>>(
+                d_ffn_norm, d_ffn_residual, ctx->d_out,
+                (const float *)ffn_norm->data, dim, n_tokens, norm_eps);
+        }
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "[bn:gpu:cuda] prefill ssm ffn norm failed: %s\n",
