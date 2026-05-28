@@ -23,6 +23,7 @@ CUDA_DEVICE="${BN_CUDA_DEVICE:-auto}"
 MODEL_ROOT="${BN_MODEL_ROOT:-${MODEL_ROOT:-/data/models/gguf}}"
 MAXSEQ="${MAXSEQ:-512}"
 BITNET_TG_MODE="${BITNET_TG_MODE:-generate}"
+REQUIRE_PARITY="${REQUIRE_PARITY:-1}"
 
 LLAMA_CUDA_ENV=()
 if [ "$CUDA_DEVICE" != "auto" ] && [ -n "$CUDA_DEVICE" ]; then
@@ -78,6 +79,7 @@ fi
 
 echo -e "model\tbitnet_pp_tok_s\tllama_pp_tok_s\tpp_ratio\tbitnet_tg_tok_s\tllama_tg_tok_s\ttg_ratio\tstatus"
 
+fail=0
 for model in $MODELS; do
     if [ ! -f "$model" ]; then
         echo -e "$model\tSKIP\tmodel not found\t0\tSKIP"
@@ -146,6 +148,11 @@ for model in $MODELS; do
             else if (p >= 0.8 && t >= 0.8) print "WARN_CLOSE";
             else print "FAIL";
         }')
+    if [ "$REQUIRE_PARITY" = "1" ] && [ "$status" != "PASS_PARITY" ]; then
+        fail=1
+    fi
 
     echo -e "$(basename "$model")\t$bitnet_pp\t$llama_pp\t$pp_ratio\t$bitnet_tps\t$llama_tps\t$tg_ratio\t$status"
 done
+
+exit "$fail"
