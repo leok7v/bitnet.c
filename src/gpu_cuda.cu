@@ -821,6 +821,36 @@ static __global__ void q4k_q8k_dot_matvec_kernel(float *out,
     }
 }
 
+static __global__ void q4k_q8k_dot_matvec4_kernel(float *out,
+                                                  const BnBlockQ4K *blocks,
+                                                  const BnBlockQ8K *xq,
+                                                  const float *bias,
+                                                  int rows, int cols,
+                                                  size_t out_offset) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int lane_group = lane >> 3;
+    int sublane = lane & 7;
+    int row = (blockIdx.x * warps_per_block + warp) * 4 + lane_group;
+    if (row >= rows) return;
+
+    int n_bpr = cols / BN_QK_K;
+    float sum = 0.0f;
+    const BnBlockQ4K *row_blocks = blocks + (size_t)row * n_bpr;
+    for (int b = sublane; b < n_bpr; b += 8)
+        sum += cuda_vec_dot_q4k_q8k(&row_blocks[b], xq + b);
+
+    unsigned mask = 0xffu << (lane_group * 8);
+    sum += __shfl_down_sync(mask, sum, 4);
+    sum += __shfl_down_sync(mask, sum, 2);
+    sum += __shfl_down_sync(mask, sum, 1);
+    if (sublane == 0) {
+        if (bias) sum += bias[row];
+        out[out_offset + row] = sum;
+    }
+}
+
 static __global__ void q4k_q8k_dot_matvec_pair_kernel(
         float *out0, float *out1,
         const BnBlockQ4K *blocks0, const BnBlockQ4K *blocks1,
@@ -12080,6 +12110,16 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
     static unsigned long long profile_calls = 0;
     static unsigned long long profile_ops[BN_CUDA_PROFILE_MAX] = {0};
     static double profile_ms[BN_CUDA_PROFILE_MAX] = {0.0};
+    typedef struct {
+        int code;
+        int type;
+        int rows;
+        int cols;
+        unsigned long long ops;
+        double ms;
+    } BnCudaShapeProfile;
+    static BnCudaShapeProfile shape_profile[128];
+    static int shape_profile_count = 0;
     static unsigned long long wall_calls = 0;
     static unsigned long long wall_ops = 0;
     static unsigned long long wall_launches = 0;
@@ -12408,7 +12448,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     int pair_threads = 256;
                     int warps = pair_threads / 32;
                     if ((op->cols <= 4096 ||
-                         (op->cols >= 5120 && op->cols <= 8192)) &&
+                         (op->cols >= 5120 && op->cols <= 8192) ||
+                         op->cols >= 16384) &&
                         getenv("BN_CUDA_DISABLE_Q6K_MATVEC4") == NULL) {
                         int q6_blocks =
                             (op->rows + warps * 4 - 1) / (warps * 4);
@@ -12530,7 +12571,8 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 int q6_threads = 256;
                 int warps = q6_threads / 32;
                 if ((op->cols <= 4096 ||
-                     (op->cols >= 5120 && op->cols <= 8192)) &&
+                     (op->cols >= 5120 && op->cols <= 8192) ||
+                     op->cols >= 16384) &&
                     getenv("BN_CUDA_DISABLE_Q6K_MATVEC4") == NULL) {
                     int blocks = (op->rows + warps * 4 - 1) / (warps * 4);
                     BN_CUDA_LAUNCH(ctx, q6k_dot_matvec4_kernel, blocks,
@@ -12564,11 +12606,20 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     xq, in, op->cols, 1);
                 int q4_threads = 256;
                 int warps = q4_threads / 32;
-                int blocks = (op->rows + warps - 1) / warps;
-                BN_CUDA_LAUNCH(ctx, q4k_q8k_dot_matvec_kernel, blocks,
-                    q4_threads, 0,
-                    out, (const BnBlockQ4K *)w->data, xq, bias,
-                    op->rows, op->cols, out_offset);
+                if (op->cols >= 16384 &&
+                    getenv("BN_CUDA_DISABLE_Q4K_Q8K_MATVEC4") == NULL) {
+                    int blocks = (op->rows + warps * 4 - 1) / (warps * 4);
+                    BN_CUDA_LAUNCH(ctx, q4k_q8k_dot_matvec4_kernel, blocks,
+                        q4_threads, 0,
+                        out, (const BnBlockQ4K *)w->data, xq, bias,
+                        op->rows, op->cols, out_offset);
+                } else {
+                    int blocks = (op->rows + warps - 1) / warps;
+                    BN_CUDA_LAUNCH(ctx, q4k_q8k_dot_matvec_kernel, blocks,
+                        q4_threads, 0,
+                        out, (const BnBlockQ4K *)w->data, xq, bias,
+                        op->rows, op->cols, out_offset);
+                }
             } else if (op->type == BN_GGUF_TENSOR_Q4_K &&
                        (op->cols % BN_QK_K) == 0 && enable_q4k_dot) {
                 if (cuda_ensure_q8_1(ctx, op->cols) != 0)
@@ -13876,6 +13927,36 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                 profile_ops[profile_code]++;
                 profile_ms[profile_code] += (double)ms;
             }
+            if (getenv("BN_CUDA_PROFILE_SHAPES") &&
+                (op->op_code == BN_GPU_CODE_MATVEC ||
+                 op->op_code == BN_GPU_CODE_FUSED_GATEUP_SILU ||
+                 op->op_code == BN_GPU_CODE_Q4K_MATVEC_SPLIT)) {
+                int found = -1;
+                for (int si = 0; si < shape_profile_count; si++) {
+                    if (shape_profile[si].code == op->op_code &&
+                        shape_profile[si].type == op->type &&
+                        shape_profile[si].rows == op->rows &&
+                        shape_profile[si].cols == op->cols) {
+                        found = si;
+                        break;
+                    }
+                }
+                if (found < 0 &&
+                    shape_profile_count <
+                        (int)(sizeof(shape_profile) / sizeof(shape_profile[0]))) {
+                    found = shape_profile_count++;
+                    shape_profile[found].code = op->op_code;
+                    shape_profile[found].type = op->type;
+                    shape_profile[found].rows = op->rows;
+                    shape_profile[found].cols = op->cols;
+                    shape_profile[found].ops = 0;
+                    shape_profile[found].ms = 0.0;
+                }
+                if (found >= 0) {
+                    shape_profile[found].ops++;
+                    shape_profile[found].ms += (double)ms;
+                }
+            }
         }
     }
 
@@ -13987,6 +14068,19 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                         profile_ms[code],
                         profile_ms[code] * 1000.0 /
                             (double)profile_ops[code]);
+            }
+            if (getenv("BN_CUDA_PROFILE_SHAPES")) {
+                fprintf(stderr, "[bn:gpu:cuda:profile-shapes]\n");
+                for (int si = 0; si < shape_profile_count; si++) {
+                    BnCudaShapeProfile *sp = &shape_profile[si];
+                    if (!sp->ops) continue;
+                    fprintf(stderr,
+                            "  %-18s type=%d rows=%d cols=%d ops=%llu "
+                            "total_ms=%.3f avg_us=%.2f\n",
+                            cuda_op_name(sp->code), sp->type, sp->rows,
+                            sp->cols, sp->ops, sp->ms,
+                            sp->ms * 1000.0 / (double)sp->ops);
+                }
             }
         }
     }
