@@ -6661,6 +6661,69 @@ static __global__ void moe_scatter_add_kernel(float *dst,
               w * src[(size_t)row * dim + col]);
 }
 
+static __global__ void moe_gather_sorted_f16_kernel(
+    __half *dst, const float *src, const int *slot_order,
+    const int *expert_offsets, const int *expert_counts,
+    const int *active_experts, int n_active, int max_count, int dim, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_active * max_count * dim;
+    if (idx >= total) return;
+    int col = idx % dim;
+    int j = (idx / dim) % max_count;
+    int a = idx / (dim * max_count);
+    int expert = active_experts[a];
+    int count = expert_counts[expert];
+    if (j >= count) return;
+    int route_pos = slot_order[expert_offsets[expert] + j];
+    int token = route_pos / k;
+    dst[(size_t)a * (size_t)max_count * (size_t)dim +
+        (size_t)j * (size_t)dim + (size_t)col] =
+        __float2half_rn(src[(size_t)token * (size_t)dim + (size_t)col]);
+}
+
+static __global__ void moe_gateup_grouped_to_f16_kernel(
+    __half *mid, const float *gate, const float *up,
+    const int *active_experts, const int *expert_counts,
+    int n_active, int max_count, int hidden, int act_type) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_active * max_count * hidden;
+    if (idx >= total) return;
+    int h = idx % hidden;
+    int j = (idx / hidden) % max_count;
+    int a = idx / (hidden * max_count);
+    int expert = active_experts[a];
+    if (j >= expert_counts[expert]) return;
+    size_t off = (size_t)a * (size_t)max_count * (size_t)hidden +
+                 (size_t)j * (size_t)hidden + (size_t)h;
+    float gv = gate[off];
+    float uv = up[off];
+    float v = act_type == 0 ? (gv / (1.0f + __expf(-gv))) * uv : gv * uv;
+    mid[off] = __float2half_rn(v);
+}
+
+static __global__ void moe_scatter_sorted_grouped_kernel(
+    float *dst, const float *src, const int *slot_order,
+    const int *expert_offsets, const int *expert_counts,
+    const int *active_experts, const float *weights,
+    int n_active, int max_count, int dim, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_active * max_count * dim;
+    if (idx >= total) return;
+    int col = idx % dim;
+    int j = (idx / dim) % max_count;
+    int a = idx / (dim * max_count);
+    int expert = active_experts[a];
+    int count = expert_counts[expert];
+    if (j >= count) return;
+    int route_pos = slot_order[expert_offsets[expert] + j];
+    int token = route_pos / k;
+    float w = weights[route_pos];
+    size_t src_off = (size_t)a * (size_t)max_count * (size_t)dim +
+                     (size_t)j * (size_t)dim + (size_t)col;
+    atomicAdd(dst + (size_t)token * (size_t)dim + (size_t)col,
+              w * src[src_off]);
+}
+
 static int cuda_type_supported(int type) {
     static int init = 0;
     static int disable_matvec = 0;
@@ -7425,6 +7488,212 @@ static int cuda_cublas_matmul_f16_preconverted(BnCudaCtx *ctx, float *d_out,
         return -1;
     }
     return 0;
+}
+
+static int cuda_moe_cublas_grouped_prefill(
+    BnCudaCtx *ctx, float *d_full_out,
+    const BnCudaBuffer *gate, const BnCudaBuffer *up,
+    const BnCudaBuffer *down, const float *d_full_x,
+    const float *d_weights, const int *d_slot_order,
+    const int *d_expert_offsets, const int *d_expert_counts,
+    int *d_active_experts, int n_tokens, int dim, int hidden_dim,
+    int n_experts, int k, int act_type) {
+    if (!ctx || !ctx->cublas || !d_full_out || !gate || !up || !down ||
+        !gate->f16_data || !up->f16_data || !down->f16_data ||
+        !d_full_x || !d_weights || !d_slot_order || !d_expert_offsets ||
+        !d_expert_counts || !d_active_experts || n_tokens <= 1 ||
+        dim <= 0 || hidden_dim <= 0 || n_experts <= 0 || k <= 0)
+        return -1;
+
+    int *h_counts = (int *)malloc((size_t)n_experts * sizeof(int));
+    int *h_offsets = (int *)malloc((size_t)n_experts * sizeof(int));
+    int *h_active = (int *)malloc((size_t)n_experts * sizeof(int));
+    if (!h_counts || !h_offsets || !h_active) {
+        if (h_counts) free(h_counts);
+        if (h_offsets) free(h_offsets);
+        if (h_active) free(h_active);
+        return -1;
+    }
+    cudaError_t err = cudaMemcpy(h_counts, d_expert_counts,
+                                 (size_t)n_experts * sizeof(int),
+                                 cudaMemcpyDeviceToHost);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(h_offsets, d_expert_offsets,
+                         (size_t)n_experts * sizeof(int),
+                         cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        free(h_counts);
+        free(h_offsets);
+        free(h_active);
+        return -1;
+    }
+    int n_active = 0;
+    int max_count = 0;
+    for (int e = 0; e < n_experts; e++) {
+        int count = h_counts[e];
+        if (count > 0) {
+            h_active[n_active++] = e;
+            if (count > max_count) max_count = count;
+        }
+    }
+    if (n_active <= 0 || max_count <= 0) {
+        free(h_counts);
+        free(h_offsets);
+        free(h_active);
+        return -1;
+    }
+    err = cudaMemcpy(d_active_experts, h_active,
+                     (size_t)n_active * sizeof(int),
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        free(h_counts);
+        free(h_offsets);
+        free(h_active);
+        return -1;
+    }
+
+    size_t gather_values = (size_t)n_active * (size_t)max_count *
+                           (size_t)dim;
+    size_t hidden_values = (size_t)n_active * (size_t)max_count *
+                           (size_t)hidden_dim;
+    size_t out_values = gather_values;
+    size_t x_bytes = gather_values * sizeof(__half) +
+                     hidden_values * sizeof(__half);
+    size_t out_bytes = hidden_values * 2u * sizeof(float) +
+                       out_values * sizeof(float);
+    if (cuda_ensure_scratch(ctx, x_bytes, out_bytes) != 0) {
+        free(h_counts);
+        free(h_offsets);
+        free(h_active);
+        return -1;
+    }
+    __half *d_gather = (__half *)ctx->d_x;
+    __half *d_mid = (__half *)((uint8_t *)ctx->d_x +
+                               gather_values * sizeof(__half));
+    float *d_gate = ctx->d_out;
+    float *d_up = d_gate + hidden_values;
+    float *d_down = d_up + hidden_values;
+
+    int threads = 256;
+    int gather_total = (int)gather_values;
+    moe_gather_sorted_f16_kernel<<<(gather_total + threads - 1) / threads,
+                                   threads>>>(
+        d_gather, d_full_x, d_slot_order, d_expert_offsets,
+        d_expert_counts, d_active_experts, n_active, max_count, dim, k);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        free(h_counts);
+        free(h_offsets);
+        free(h_active);
+        return -1;
+    }
+
+    int ptrs_per = 9;
+    int n_ptrs = ptrs_per * n_active;
+    if (cuda_ensure_gemm_ptrs(ctx, n_ptrs) != 0) {
+        free(h_counts);
+        free(h_offsets);
+        free(h_active);
+        return -1;
+    }
+    void **gate_a = ctx->h_gemm_ptrs;
+    void **gate_b = gate_a + n_active;
+    void **gate_c = gate_b + n_active;
+    void **up_a = gate_c + n_active;
+    void **up_b = up_a + n_active;
+    void **up_c = up_b + n_active;
+    void **down_a = up_c + n_active;
+    void **down_b = down_a + n_active;
+    void **down_c = down_b + n_active;
+    for (int i = 0; i < n_active; i++) {
+        int e = h_active[i];
+        size_t in_off = (size_t)i * (size_t)max_count * (size_t)dim;
+        size_t hidden_off =
+            (size_t)i * (size_t)max_count * (size_t)hidden_dim;
+        gate_a[i] = (uint8_t *)gate->f16_data +
+                    (size_t)e * (size_t)hidden_dim * (size_t)dim *
+                    sizeof(__half);
+        gate_b[i] = d_gather + in_off;
+        gate_c[i] = d_gate + hidden_off;
+        up_a[i] = (uint8_t *)up->f16_data +
+                  (size_t)e * (size_t)hidden_dim * (size_t)dim *
+                  sizeof(__half);
+        up_b[i] = d_gather + in_off;
+        up_c[i] = d_up + hidden_off;
+        down_a[i] = (uint8_t *)down->f16_data +
+                    (size_t)e * (size_t)dim * (size_t)hidden_dim *
+                    sizeof(__half);
+        down_b[i] = d_mid + hidden_off;
+        down_c[i] = d_down + (size_t)i * (size_t)max_count * (size_t)dim;
+    }
+    free(h_counts);
+    free(h_offsets);
+    free(h_active);
+
+    err = cudaMemcpy(ctx->d_gemm_ptrs, ctx->h_gemm_ptrs,
+                     (size_t)n_ptrs * sizeof(void *),
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+        return -1;
+    void **d_gate_a = ctx->d_gemm_ptrs;
+    void **d_gate_b = d_gate_a + n_active;
+    void **d_gate_c = d_gate_b + n_active;
+    void **d_up_a = d_gate_c + n_active;
+    void **d_up_b = d_up_a + n_active;
+    void **d_up_c = d_up_b + n_active;
+    void **d_down_a = d_up_c + n_active;
+    void **d_down_b = d_down_a + n_active;
+    void **d_down_c = d_down_b + n_active;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    if (ctx->exec_stream)
+        cublasSetStream(ctx->cublas, ctx->exec_stream);
+    cublasStatus_t st = cublasGemmBatchedEx(
+        ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        hidden_dim, max_count, dim, &alpha,
+        (const void *const *)d_gate_a, CUDA_R_16F, dim,
+        (const void *const *)d_gate_b, CUDA_R_16F, dim,
+        &beta, (void *const *)d_gate_c, CUDA_R_32F, hidden_dim,
+        n_active, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasGemmBatchedEx(
+            ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            hidden_dim, max_count, dim, &alpha,
+            (const void *const *)d_up_a, CUDA_R_16F, dim,
+            (const void *const *)d_up_b, CUDA_R_16F, dim,
+            &beta, (void *const *)d_up_c, CUDA_R_32F, hidden_dim,
+            n_active, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+    if (st != CUBLAS_STATUS_SUCCESS)
+        return -1;
+
+    int act_total = (int)hidden_values;
+    moe_gateup_grouped_to_f16_kernel<<<(act_total + threads - 1) / threads,
+                                       threads>>>(
+        d_mid, d_gate, d_up, d_active_experts, d_expert_counts,
+        n_active, max_count, hidden_dim, act_type);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+        return -1;
+
+    st = cublasGemmBatchedEx(
+        ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        dim, max_count, hidden_dim, &alpha,
+        (const void *const *)d_down_a, CUDA_R_16F, hidden_dim,
+        (const void *const *)d_down_b, CUDA_R_16F, hidden_dim,
+        &beta, (void *const *)d_down_c, CUDA_R_32F, dim,
+        n_active, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st != CUBLAS_STATUS_SUCCESS)
+        return -1;
+
+    int scatter_total = (int)out_values;
+    moe_scatter_sorted_grouped_kernel<<<(scatter_total + threads - 1) / threads,
+                                        threads>>>(
+        d_full_out, d_down, d_slot_order, d_expert_offsets, d_expert_counts,
+        d_active_experts, d_weights, n_active, max_count, dim, k);
+    err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : -1;
 }
 
 static int cuda_matmul_device_out_preconverted_f16(
@@ -9313,11 +9582,16 @@ static int cuda_moe_route_routed_ffn_batch(
     size_t route_items = (size_t)n_tokens * (size_t)k;
     size_t idx_bytes = route_items * sizeof(int);
     size_t weight_bytes = route_items * sizeof(float);
+    int use_cublas_grouped =
+        routed_q4 && down_type == BN_GGUF_TENSOR_Q6_K &&
+        gate->f16_data && up->f16_data && down->f16_data &&
+        getenv("BN_CUDA_ENABLE_MOE_CUBLAS_GROUPED") != NULL;
     int use_sorted_slots =
         routed_q4 && n_tokens > 1 &&
-        getenv("BN_CUDA_ENABLE_MOE_ROUTE_SORT") != NULL;
+        (use_cublas_grouped ||
+         getenv("BN_CUDA_ENABLE_MOE_ROUTE_SORT") != NULL);
     size_t route_aux_bytes = use_sorted_slots
-        ? (route_items * sizeof(int) + (size_t)n_experts * 3u * sizeof(int))
+        ? (route_items * sizeof(int) + (size_t)n_experts * 4u * sizeof(int))
         : 0u;
     if (cuda_ensure_ops(ctx, idx_bytes + weight_bytes + route_aux_bytes) != 0)
         return -1;
@@ -9336,6 +9610,8 @@ static int cuda_moe_route_routed_ffn_batch(
         ? d_expert_counts + n_experts : NULL;
     int *d_expert_fill = use_sorted_slots
         ? d_expert_offsets + n_experts : NULL;
+    int *d_active_experts = use_sorted_slots
+        ? d_expert_fill + n_experts : NULL;
     int profile_prefill_moe =
         getenv("BN_CUDA_PROFILE_MOE_PREFILL_INTERNAL") != NULL;
     static double profile_totals[7] = {0.0};
@@ -9461,6 +9737,24 @@ static int cuda_moe_route_routed_ffn_batch(
 
     int gateup_tasks = n_tokens * k * hidden_dim;
     int gateup_blocks = (gateup_tasks + warps - 1) / warps;
+    int down_tasks = n_tokens * dim;
+    int down_blocks = (down_tasks + warps - 1) / warps;
+
+    if (use_cublas_grouped) {
+        if (cuda_moe_cublas_grouped_prefill(
+                ctx, d_full_out, gate, up, down, d_full_x, d_weights,
+                d_slot_order, d_expert_offsets, d_expert_counts,
+                d_active_experts, n_tokens, dim, hidden_dim, n_experts, k,
+                act_type) == 0) {
+            err = cudaSuccess;
+            BN_CUDA_MOE_PREFILL_PROFILE_STEP(3);
+            goto moe_route_routed_readback;
+        }
+        if (getenv("BN_CUDA_DEBUG_MOE_CUBLAS_GROUPED"))
+            fprintf(stderr,
+                    "[bn:gpu:cuda] grouped cublas moe prefill failed; falling back\n");
+    }
+
     if (routed_q8) {
         moe_q8_0_gateup_routed_mid_batch_kernel<<<gateup_blocks, threads, 0>>>(
             d_mid, (const BnBlockQ8_0 *)gate->data,
@@ -9525,8 +9819,6 @@ static int cuda_moe_route_routed_ffn_batch(
     }
     BN_CUDA_MOE_PREFILL_PROFILE_STEP(3);
 
-    int down_tasks = n_tokens * dim;
-    int down_blocks = (down_tasks + warps - 1) / warps;
     if (routed_q8) {
         moe_q8_0_down_routed_accum_batch_kernel<<<down_blocks, threads, 0>>>(
             d_full_out, (const BnBlockQ8_0 *)down->data, d_mid, d_indices,
@@ -9609,6 +9901,7 @@ static int cuda_moe_route_routed_ffn_batch(
     }
     err = cudaGetLastError();
     BN_CUDA_MOE_PREFILL_PROFILE_STEP(5);
+moe_route_routed_readback:
     if (err == cudaSuccess)
         err = cudaMemcpy(out, d_full_out, full_bytes, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
