@@ -727,7 +727,8 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
     int use_matvec_argmax =
         argmax_token && !need_logits && gpu->matvec_argmax_activation &&
         !getenv("BN_GPU_CPU_LOGITS") && !gpu_logits_need_cpu &&
-        getenv("BN_CUDA_ENABLE_LOGITS_ARGMAX") &&
+        !getenv("BN_CUDA_DISABLE_LOGITS_ARGMAX") &&
+        c->n_experts == 2 && c->n_experts_active == 2 &&
         logit_res->type == BN_GGUF_TENSOR_Q6_K;
     int cacheable_decode =
         (!emit_logits || argmax_token ||
