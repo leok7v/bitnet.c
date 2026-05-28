@@ -5991,6 +5991,23 @@ static __global__ void ffn_activation_batch_kernel(float *out,
     }
 }
 
+static __global__ void ffn_activation_batch_to_f16_kernel(
+    __half *out, const float *gate_up, int hidden_dim, int n_tokens,
+    int act_type) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_dim * n_tokens;
+    if (i >= total) return;
+    int token = i / hidden_dim;
+    int h = i - token * hidden_dim;
+    size_t base = (size_t)token * hidden_dim + h;
+    float gate = gate_up[base];
+    float up = gate_up[(size_t)n_tokens * hidden_dim + base];
+    float v = act_type == 0
+        ? (gate / (1.0f + __expf(-gate))) * up
+        : gate * up;
+    out[base] = __float2half_rn(v);
+}
+
 static __global__ void ffn_activation_batch_stacked_kernel(
     float *out, const float *gate_up, int hidden_dim, int n_tokens,
     int act_type) {
@@ -6008,6 +6025,23 @@ static __global__ void ffn_activation_batch_stacked_kernel(
     } else {
         out[(size_t)token * hidden_dim + h] = gate * up;
     }
+}
+
+static __global__ void ffn_activation_batch_stacked_to_f16_kernel(
+    __half *out, const float *gate_up, int hidden_dim, int n_tokens,
+    int act_type) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_dim * n_tokens;
+    if (i >= total) return;
+    int token = i / hidden_dim;
+    int h = i - token * hidden_dim;
+    size_t src = (size_t)token * (size_t)hidden_dim * 2u + (size_t)h;
+    float gate = gate_up[src];
+    float up = gate_up[src + (size_t)hidden_dim];
+    float v = act_type == 0
+        ? (gate / (1.0f + __expf(-gate))) * up
+        : gate * up;
+    out[(size_t)token * hidden_dim + h] = __float2half_rn(v);
 }
 
 static __global__ void moe_gather_kernel(float *dst, const float *src,
@@ -9551,10 +9585,21 @@ static int cuda_prefill_dense_layer(
     }
     BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_GATEUP);
 
+    int ffn_act_f16_ready = 0;
     if (!ffn_act_ready) {
         int act_total = n_tokens * hidden_dim;
         blocks = (act_total + threads - 1) / threads;
-        if (stacked_gateup) {
+        ffn_act_f16_ready = down->f16_data &&
+                            cuda_ensure_x_f16(ctx, hidden_values) == 0;
+        if (ffn_act_f16_ready && stacked_gateup) {
+            ffn_activation_batch_stacked_to_f16_kernel<<<blocks, threads>>>(
+                (__half *)ctx->d_x_f16, d_gateup, hidden_dim, n_tokens,
+                act_type);
+        } else if (ffn_act_f16_ready) {
+            ffn_activation_batch_to_f16_kernel<<<blocks, threads>>>(
+                (__half *)ctx->d_x_f16, d_gateup, hidden_dim, n_tokens,
+                act_type);
+        } else if (stacked_gateup) {
             ffn_activation_batch_stacked_kernel<<<blocks, threads>>>(
                 d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
         } else {
@@ -9569,9 +9614,16 @@ static int cuda_prefill_dense_layer(
         }
     }
     BN_CUDA_DENSE_PROFILE_STEP(BN_CUDA_DENSE_PROF_ACT);
-    if (cuda_matmul_device_out(ctx, ctx->d_out, down, d_ffn_act, dim,
-                               hidden_dim, n_tokens, down_type) != 0)
-        return -1;
+    if (ffn_act_f16_ready) {
+        if (cuda_cublas_matmul_f16_preconverted(
+                ctx, ctx->d_out, down, ctx->d_x_f16, dim, hidden_dim,
+                n_tokens) != 0)
+            return -1;
+    } else {
+        if (cuda_matmul_device_out(ctx, ctx->d_out, down, d_ffn_act, dim,
+                                   hidden_dim, n_tokens, down_type) != 0)
+            return -1;
+    }
     blocks = ((int)dim_values + threads - 1) / threads;
     residual_add_kernel<<<blocks, threads>>>(ctx->d_out, d_ffn_residual,
                                              (int)dim_values);
@@ -9812,10 +9864,19 @@ static int cuda_prefill_ssm_layer(
     }
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_NORM);
 
+    const void *norm_f16 = NULL;
+    if (((use_qkvz && qkvz->f16_data) ||
+         (!use_qkvz && (wqkv->f16_data || wz->f16_data)) ||
+         (use_ab && ab->f16_data) ||
+         (!use_ab && (alpha->f16_data || beta->f16_data))) &&
+        cuda_convert_f32_to_f16(ctx, d_norm, dim_values) == 0) {
+        norm_f16 = ctx->d_x_f16;
+    }
+
     if (use_qkvz) {
-        if (cuda_matmul_device_out(ctx, d_qkvz, qkvz, d_norm,
-                                   qkv_dim + inner_dim, dim, n_tokens,
-                                   wqkv_type) != 0)
+        if (cuda_matmul_device_out_preconverted_f16(
+                ctx, d_qkvz, qkvz, d_norm, norm_f16,
+                qkv_dim + inner_dim, dim, n_tokens, wqkv_type) != 0)
             return -1;
         int split_total = n_tokens * (qkv_dim + inner_dim);
         ssm_prefill_split_qkvz_kernel<<<(split_total + threads - 1) / threads,
@@ -9827,10 +9888,12 @@ static int cuda_prefill_ssm_layer(
                     cudaGetErrorString(err));
             return -1;
         }
-    } else if (cuda_matmul_device_out(ctx, d_qkv, wqkv, d_norm, qkv_dim, dim,
-                                      n_tokens, wqkv_type) != 0 ||
-               cuda_matmul_device_out(ctx, d_z, wz, d_norm, inner_dim, dim,
-                                      n_tokens, wz_type) != 0) {
+    } else if (cuda_matmul_device_out_preconverted_f16(
+                   ctx, d_qkv, wqkv, d_norm, norm_f16, qkv_dim, dim,
+                   n_tokens, wqkv_type) != 0 ||
+               cuda_matmul_device_out_preconverted_f16(
+                   ctx, d_z, wz, d_norm, norm_f16, inner_dim, dim,
+                   n_tokens, wz_type) != 0) {
         return -1;
     }
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_QKVZ);
@@ -9851,8 +9914,9 @@ static int cuda_prefill_ssm_layer(
         }
         ab_preactivated = 1;
     } else if (use_ab) {
-        if (cuda_matmul_device_out(ctx, d_ab, ab, d_norm, 2 * num_v_heads,
-                                   dim, n_tokens, alpha_type) != 0)
+        if (cuda_matmul_device_out_preconverted_f16(
+                ctx, d_ab, ab, d_norm, norm_f16, 2 * num_v_heads,
+                dim, n_tokens, alpha_type) != 0)
             return -1;
         int split_total = n_tokens * num_v_heads;
         ssm_prefill_split_ab_kernel<<<(split_total + threads - 1) / threads,
@@ -9864,12 +9928,12 @@ static int cuda_prefill_ssm_layer(
                     cudaGetErrorString(err));
             return -1;
         }
-    } else if (cuda_matmul_device_out(ctx, d_alpha, alpha, d_norm,
-                                      num_v_heads, dim, n_tokens,
-                                      alpha_type) != 0 ||
-               cuda_matmul_device_out(ctx, d_beta, beta, d_norm,
-                                      num_v_heads, dim, n_tokens,
-                                      beta_type) != 0) {
+    } else if (cuda_matmul_device_out_preconverted_f16(
+                   ctx, d_alpha, alpha, d_norm, norm_f16,
+                   num_v_heads, dim, n_tokens, alpha_type) != 0 ||
+               cuda_matmul_device_out_preconverted_f16(
+                   ctx, d_beta, beta, d_norm, norm_f16,
+                   num_v_heads, dim, n_tokens, beta_type) != 0) {
         return -1;
     }
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_AB);
@@ -10031,6 +10095,28 @@ static int cuda_prefill_ssm_layer(
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_OUT);
 
     if (fuse_ffn) {
+        const int ssm_ffn_profile = getenv("BN_CUDA_SSM_FFN_PROFILE") != NULL;
+        static double ssm_ffn_profile_norm = 0.0;
+        static double ssm_ffn_profile_gateup = 0.0;
+        static double ssm_ffn_profile_act = 0.0;
+        static double ssm_ffn_profile_down = 0.0;
+        static double ssm_ffn_profile_resid = 0.0;
+        static unsigned long long ssm_ffn_profile_layers = 0;
+        double ssm_ffn_t0 = ssm_ffn_profile ? cuda_wall_ms() : 0.0;
+#define BN_CUDA_SSM_FFN_PROFILE_STEP(dst_) do {                       \
+            if (ssm_ffn_profile) {                                    \
+                cudaError_t ffn_profile_err__ = cudaDeviceSynchronize(); \
+                double ffn_profile_now__ = cuda_wall_ms();            \
+                if (ffn_profile_err__ != cudaSuccess) {               \
+                    fprintf(stderr,                                   \
+                            "[bn:gpu:cuda] ssm ffn profile sync failed: %s\n", \
+                            cudaGetErrorString(ffn_profile_err__));   \
+                    return -1;                                        \
+                }                                                     \
+                (dst_) += ffn_profile_now__ - ssm_ffn_t0;             \
+                ssm_ffn_t0 = ffn_profile_now__;                       \
+            }                                                         \
+        } while (0)
         rmsnorm_batch_copy_kernel<<<n_tokens, threads,
                                     (size_t)warps * sizeof(float)>>>(
             d_ffn_norm, d_ffn_residual, ctx->d_out,
@@ -10041,28 +10127,51 @@ static int cuda_prefill_ssm_layer(
                     cudaGetErrorString(err));
             return -1;
         }
+        BN_CUDA_SSM_FFN_PROFILE_STEP(ssm_ffn_profile_norm);
+        const void *ffn_norm_f16 = NULL;
+        if (((stacked_ffn_gateup && ffn_gate->f16_data) ||
+             (!stacked_ffn_gateup &&
+              ((ffn_gate && ffn_gate->f16_data) ||
+               (ffn_up && ffn_up->f16_data)))) &&
+            cuda_convert_f32_to_f16(ctx, d_ffn_norm, dim_values) == 0) {
+            ffn_norm_f16 = ctx->d_x_f16;
+        }
         if (stacked_ffn_gateup) {
-            if (cuda_matmul_device_out(ctx, d_gateup, ffn_gate, d_ffn_norm,
-                                       hidden_dim * 2, dim, n_tokens,
-                                       ffn_gate_type) != 0)
+            if (cuda_matmul_device_out_preconverted_f16(
+                    ctx, d_gateup, ffn_gate, d_ffn_norm, ffn_norm_f16,
+                    hidden_dim * 2, dim, n_tokens, ffn_gate_type) != 0)
                 return -1;
         } else {
-            if (cuda_matmul_device_out(ctx, d_gateup, ffn_gate, d_ffn_norm,
-                                       hidden_dim, dim, n_tokens,
-                                       ffn_gate_type) != 0 ||
-                cuda_matmul_device_out(ctx, d_gateup + hidden_values, ffn_up,
-                                       d_ffn_norm, hidden_dim, dim,
-                                       n_tokens, ffn_up_type) != 0)
+            if (cuda_matmul_device_out_preconverted_f16(
+                    ctx, d_gateup, ffn_gate, d_ffn_norm, ffn_norm_f16,
+                    hidden_dim, dim, n_tokens, ffn_gate_type) != 0 ||
+                cuda_matmul_device_out_preconverted_f16(
+                    ctx, d_gateup + hidden_values, ffn_up, d_ffn_norm,
+                    ffn_norm_f16, hidden_dim, dim, n_tokens,
+                    ffn_up_type) != 0)
                 return -1;
         }
+        BN_CUDA_SSM_FFN_PROFILE_STEP(ssm_ffn_profile_gateup);
         int act_total = n_tokens * hidden_dim;
-        if (stacked_ffn_gateup) {
-            ffn_activation_batch_stacked_kernel<<<(act_total + threads - 1) / threads,
-                                                  threads>>>(
+        int act_to_f16 = ffn_down->f16_data &&
+                         cuda_ensure_x_f16(ctx, hidden_values) == 0;
+        if (act_to_f16 && stacked_ffn_gateup) {
+            ffn_activation_batch_stacked_to_f16_kernel<<<
+                (act_total + threads - 1) / threads, threads>>>(
+                (__half *)ctx->d_x_f16, d_gateup, hidden_dim, n_tokens,
+                act_type);
+        } else if (act_to_f16) {
+            ffn_activation_batch_to_f16_kernel<<<
+                (act_total + threads - 1) / threads, threads>>>(
+                (__half *)ctx->d_x_f16, d_gateup, hidden_dim, n_tokens,
+                act_type);
+        } else if (stacked_ffn_gateup) {
+            ffn_activation_batch_stacked_kernel<<<
+                (act_total + threads - 1) / threads, threads>>>(
                 d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
         } else {
-            ffn_activation_batch_kernel<<<(act_total + threads - 1) / threads,
-                                          threads>>>(
+            ffn_activation_batch_kernel<<<
+                (act_total + threads - 1) / threads, threads>>>(
                 d_ffn_act, d_gateup, hidden_dim, n_tokens, act_type);
         }
         err = cudaGetLastError();
@@ -10071,9 +10180,19 @@ static int cuda_prefill_ssm_layer(
                     cudaGetErrorString(err));
             return -1;
         }
-        if (cuda_matmul_device_out(ctx, ctx->d_out, ffn_down, d_ffn_act, dim,
-                                   hidden_dim, n_tokens, ffn_down_type) != 0)
-            return -1;
+        BN_CUDA_SSM_FFN_PROFILE_STEP(ssm_ffn_profile_act);
+        if (act_to_f16) {
+            if (cuda_cublas_matmul_f16_preconverted(
+                    ctx, ctx->d_out, ffn_down, ctx->d_x_f16, dim,
+                    hidden_dim, n_tokens) != 0)
+                return -1;
+        } else {
+            if (cuda_matmul_device_out(ctx, ctx->d_out, ffn_down, d_ffn_act,
+                                       dim, hidden_dim, n_tokens,
+                                       ffn_down_type) != 0)
+                return -1;
+        }
+        BN_CUDA_SSM_FFN_PROFILE_STEP(ssm_ffn_profile_down);
         residual_add_kernel<<<((int)dim_values + threads - 1) / threads,
                                threads>>>(
             ctx->d_out, d_ffn_residual, (int)dim_values);
@@ -10083,6 +10202,27 @@ static int cuda_prefill_ssm_layer(
                     cudaGetErrorString(err));
             return -1;
         }
+        BN_CUDA_SSM_FFN_PROFILE_STEP(ssm_ffn_profile_resid);
+        if (ssm_ffn_profile) {
+            ssm_ffn_profile_layers++;
+            if ((ssm_ffn_profile_layers % 64u) == 0u) {
+                double sum = ssm_ffn_profile_norm + ssm_ffn_profile_gateup +
+                             ssm_ffn_profile_act + ssm_ffn_profile_down +
+                             ssm_ffn_profile_resid;
+                fprintf(stderr,
+                        "[bn:gpu:cuda:ssm_ffn_profile] layers=%llu tokens=%d total=%.3f norm=%.3f gateup=%.3f act=%.3f down=%.3f resid=%.3f\n",
+                        ssm_ffn_profile_layers, n_tokens, sum,
+                        ssm_ffn_profile_norm, ssm_ffn_profile_gateup,
+                        ssm_ffn_profile_act, ssm_ffn_profile_down,
+                        ssm_ffn_profile_resid);
+                ssm_ffn_profile_norm = 0.0;
+                ssm_ffn_profile_gateup = 0.0;
+                ssm_ffn_profile_act = 0.0;
+                ssm_ffn_profile_down = 0.0;
+                ssm_ffn_profile_resid = 0.0;
+            }
+        }
+#undef BN_CUDA_SSM_FFN_PROFILE_STEP
         if (did_ffn)
             *did_ffn = 1;
     }
