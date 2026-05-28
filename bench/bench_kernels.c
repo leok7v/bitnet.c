@@ -570,7 +570,7 @@ static int bench_use_gpu_batch_prefill(const BnModel *m) {
         return 0;
     BnGPUBackend *gpu = bn_model_gpu((BnModel *)m);
     if (c->full_attn_interval > 0)
-        return gpu && gpu->kind == BN_GPU_BACKEND_CUDA && c->n_experts <= 0;
+        return gpu && gpu->kind == BN_GPU_BACKEND_CUDA;
     if (c->n_experts > 0)
         return 1;
     return c->dim <= 2560;

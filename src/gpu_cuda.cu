@@ -11783,6 +11783,17 @@ static int cuda_ops_have_moe(const BnGPUOp *ops, int n_ops) {
     return 0;
 }
 
+static int cuda_ops_have_q8_moe_routed_ffn(const BnGPUOp *ops, int n_ops) {
+    if (!ops) return 0;
+    for (int i = 0; i < n_ops; i++) {
+        const BnGPUOp *op = &ops[i];
+        if (op->op_code == BN_GPU_CODE_MOE_ROUTED_FFN &&
+            op->type == BN_GGUF_TENSOR_Q8_0)
+            return 1;
+    }
+    return 0;
+}
+
 static int cuda_buf_unused_until_write(const BnGPUOp *ops, int n_ops,
                                        int start, int buf) {
     if (!ops || buf < 0) return 0;
@@ -11969,6 +11980,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
     int default_graph_exec =
         getenv("BN_CUDA_DISABLE_GRAPH_EXEC") == NULL &&
         getenv("BN_CUDA_ENABLE_MOE_FFN") == NULL &&
+        !cuda_ops_have_q8_moe_routed_ffn(ops, n_ops) &&
         cuda_ops_look_like_decode_graph(ops, n_ops, readback_buf,
                                         out_host, out_len);
     int q8_preq_logits_default = !disable_q8_preq_logits;

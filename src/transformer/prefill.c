@@ -941,7 +941,6 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
     BnGPUBackend *prefill_gpu = bn_model_gpu(m);
     int cuda_hybrid_prefill =
         c->full_attn_interval > 0 && c->ssm_inner_size > 0 &&
-        c->n_experts <= 0 &&
         prefill_gpu && prefill_gpu->kind == BN_GPU_BACKEND_CUDA;
     if (c->full_attn_interval > 0 && c->ssm_inner_size > 0 &&
         !cuda_hybrid_prefill && !getenv("BN_PREFILL_ALLOW_HYBRID_BATCH")) {
