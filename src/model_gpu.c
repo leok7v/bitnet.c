@@ -210,7 +210,7 @@ static int optional_layout_fits_memory(BnGPUBackend *gpu, size_t bytes,
     size_t total_bytes = 0;
     if (gpu->memory_info(gpu->ctx, &free_bytes, &total_bytes) != 0)
         return 1;
-    size_t reserve_mb = env_mb_or_default("BN_CUDA_LAYOUT_RESERVE_MB", 4096);
+    size_t reserve_mb = env_mb_or_default("BN_CUDA_LAYOUT_RESERVE_MB", 512);
     size_t reserve = reserve_mb > SIZE_MAX / (1024u * 1024u)
         ? SIZE_MAX
         : reserve_mb * 1024u * 1024u;
@@ -323,7 +323,7 @@ static int cuda_moe_all_fits_memory(BnGPUBackend *gpu,
     size_t total_bytes = 0;
     if (gpu->memory_info(gpu->ctx, &free_bytes, &total_bytes) != 0)
         return 1;
-    size_t reserve_mb = env_mb_or_default("BN_CUDA_MOE_FULL_RESERVE_MB", 4096);
+    size_t reserve_mb = env_mb_or_default("BN_CUDA_MOE_FULL_RESERVE_MB", 512);
     size_t reserve = reserve_mb > SIZE_MAX / (1024u * 1024u)
         ? SIZE_MAX
         : reserve_mb * 1024u * 1024u;

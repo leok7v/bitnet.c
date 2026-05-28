@@ -10031,17 +10031,10 @@ static int cuda_prefill_ssm_layer(
     BN_CUDA_SSM_PROFILE_STEP(BN_CUDA_SSM_PROF_OUT);
 
     if (fuse_ffn) {
-        err = cudaMemcpy(d_ffn_residual, ctx->d_out,
-                         dim_values * sizeof(float), cudaMemcpyDeviceToDevice);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[bn:gpu:cuda] prefill ssm ffn residual copy failed: %s\n",
-                    cudaGetErrorString(err));
-            return -1;
-        }
-        rmsnorm_batch_kernel<<<n_tokens, threads,
-                               (size_t)warps * sizeof(float)>>>(
-            d_ffn_norm, ctx->d_out, (const float *)ffn_norm->data, dim,
-            n_tokens, norm_eps);
+        rmsnorm_batch_copy_kernel<<<n_tokens, threads,
+                                    (size_t)warps * sizeof(float)>>>(
+            d_ffn_norm, d_ffn_residual, ctx->d_out,
+            (const float *)ffn_norm->data, dim, n_tokens, norm_eps);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "[bn:gpu:cuda] prefill ssm ffn norm failed: %s\n",
