@@ -278,13 +278,39 @@ static int cuda_moe_down_q6_f32_cache_enabled(const BnGPUBackend *gpu) {
            getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
 }
 
+static size_t cuda_q6_down_f32_cache_bytes(const BnGPUBackend *gpu,
+                                           const BnMoEExpertMap *em,
+                                           int n_experts) {
+    if (!cuda_moe_down_q6_f32_cache_enabled(gpu) || !em ||
+        em->down_type != BN_GGUF_TENSOR_Q6_K || n_experts <= 0)
+        return 0;
+
+    size_t elems = 0;
+    size_t bytes = 0;
+    if (mul3_size((size_t)n_experts, (size_t)em->down_rows,
+                  (size_t)em->down_cols, &elems) != 0 ||
+        checked_mul_size(elems, sizeof(float), &bytes) != 0)
+        return SIZE_MAX;
+
+    if (getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE"))
+        return bytes;
+
+    int max_mb = 512;
+    const char *max_env = getenv("BN_CUDA_CUBLAS_CACHE_MAX_MB");
+    if (max_env && *max_env)
+        max_mb = atoi(max_env);
+    if (max_mb <= 0)
+        return bytes;
+    size_t max_bytes = (size_t)max_mb * 1024u * 1024u;
+    return bytes <= max_bytes ? bytes : 0;
+}
+
 static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
                                           const BnWeights *w,
                                           const BnGPUBackend *gpu) {
     if (!c || !w || c->n_experts <= 0)
         return 0;
     size_t total = 0;
-    int q6_f32_cache = cuda_moe_down_q6_f32_cache_enabled(gpu);
     for (int l = 0; l < c->n_layers; l++) {
         const BnMoEExpertMap *em = &w->layers[l].moe.expert_map;
         size_t layer = 0;
@@ -302,17 +328,10 @@ static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
             proj > SIZE_MAX - layer)
             return SIZE_MAX;
         layer += proj;
-        if (q6_f32_cache && em->down_type == BN_GGUF_TENSOR_Q6_K) {
-            size_t aux = 0;
-            if (mul3_size((size_t)c->n_experts,
-                          (size_t)em->down_rows,
-                          (size_t)em->down_cols, &aux) != 0 ||
-                checked_mul_size(aux, sizeof(float), &aux) != 0 ||
-                add_size_checked(&layer, aux) != 0)
-                return SIZE_MAX;
-        }
+        size_t aux = cuda_q6_down_f32_cache_bytes(gpu, em, c->n_experts);
+        if (aux == SIZE_MAX || add_size_checked(&layer, aux) != 0)
+            return SIZE_MAX;
         if (cuda_moe_all_f16_cache_enabled()) {
-            size_t aux = 0;
             if (mul3_size((size_t)c->n_experts,
                           (size_t)em->gate_rows,
                           (size_t)em->gate_cols, &aux) != 0 ||
