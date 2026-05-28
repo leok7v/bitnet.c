@@ -26,6 +26,8 @@ MODEL_ROOT="${BN_MODEL_ROOT:-${MODEL_ROOT:-/data/models/gguf}}"
 MAXSEQ="${MAXSEQ:-512}"
 BITNET_TG_MODE="${BITNET_TG_MODE:-generate}"
 REQUIRE_PARITY="${REQUIRE_PARITY:-1}"
+LLAMA_NGL="${LLAMA_NGL:-99}"
+LLAMA_NGL_SHARDED_RETRY="${LLAMA_NGL_SHARDED_RETRY:-32}"
 
 LLAMA_CUDA_ENV=()
 if [ "$CUDA_DEVICE" != "auto" ] && [ -n "$CUDA_DEVICE" ]; then
@@ -124,9 +126,25 @@ for model in $MODELS; do
             awk '/Throughput:/ { v=$2 } END { if (v == "") v="0"; print v }')
     fi
 
+    llama_ngl="$LLAMA_NGL"
     if ! llama_out=$(env "${LLAMA_CUDA_ENV[@]}" \
         LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$LLAMA_BENCH" -m "$model" -p "$PREFILL_TOKS" -n "$LLAMA_TOKS" -t "$THREADS" -ngl 99 2>&1); then
+        "$LLAMA_BENCH" -m "$model" -p "$PREFILL_TOKS" -n "$LLAMA_TOKS" -t "$THREADS" -ngl "$llama_ngl" 2>&1); then
+        if [[ "$model" == *-of-*.gguf ]] &&
+           [ -n "$LLAMA_NGL_SHARDED_RETRY" ]; then
+            echo "WARN: llama-bench full offload failed for sharded model; retrying -ngl $LLAMA_NGL_SHARDED_RETRY" >&2
+            llama_ngl="$LLAMA_NGL_SHARDED_RETRY"
+            llama_out=$(env "${LLAMA_CUDA_ENV[@]}" \
+                LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                "$LLAMA_BENCH" -m "$model" -p "$PREFILL_TOKS" -n "$LLAMA_TOKS" -t "$THREADS" -ngl "$llama_ngl" 2>&1)
+            llama_rc=$?
+        else
+            llama_rc=1
+        fi
+    else
+        llama_rc=0
+    fi
+    if [ "$llama_rc" -ne 0 ]; then
         echo -e "$(basename "$model")\t$bitnet_pp\tllama-bench failed\t0\t$bitnet_tps\tllama-bench failed\t0\tFAIL"
         printf '%s\n' "$llama_out" >&2
         continue
