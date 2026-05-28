@@ -7911,6 +7911,11 @@ static int cuda_force_quant_matmul_for_type(int type) {
             getenv("BN_CUDA_FORCE_Q6K_QUANT_MATMUL") != NULL);
 }
 
+static int cuda_use_q6k_4warp_long(int rows, int cols) {
+    return rows >= 2560 && cols >= 8192 && cols <= 16384 &&
+           getenv("BN_CUDA_DISABLE_Q6K_4WARP_LONG") == NULL;
+}
+
 static int cuda_cublas_matmul_f16(BnCudaCtx *ctx, float *d_out,
                                   const BnCudaBuffer *w,
                                   const float *d_x,
@@ -12817,8 +12822,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                         xq, in, op->cols, 1);
                     int pair_threads = 256;
                     int warps = pair_threads / 32;
-                    if (op->rows >= 2560 && op->cols >= 8192 &&
-                        getenv("BN_CUDA_DISABLE_Q6K_4WARP_LONG") == NULL) {
+                    if (cuda_use_q6k_4warp_long(op->rows, op->cols)) {
                         int q6_blocks = op->rows;
                         BN_CUDA_LAUNCH(ctx, q6k_dot_matvec_4warp_kernel,
                             q6_blocks, pair_threads, 0,
@@ -12964,8 +12968,7 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     xq, in, op->cols, 1);
                 int q6_threads = 256;
                 int warps = q6_threads / 32;
-                if (op->rows >= 2560 && op->cols >= 8192 &&
-                    getenv("BN_CUDA_DISABLE_Q6K_4WARP_LONG") == NULL) {
+                if (cuda_use_q6k_4warp_long(op->rows, op->cols)) {
                     int blocks = op->rows;
                     BN_CUDA_LAUNCH_STABLE(ctx, stable_decode_matvec,
                         q6k_dot_matvec_4warp_kernel, blocks,
