@@ -63,6 +63,9 @@ run_case() {
         if [[ "$path" == *-of-*.gguf ]]; then
             echo "RUN $name sharded mmap: $path"
             ran=$((ran + 1))
+            if [ "$RUN_BENCH" = "1" ]; then
+                bench_models="${bench_models}${bench_models:+ }$path"
+            fi
             if [ "$RUN_COHERENCE" = "1" ] && [ "$RUN_SHARDED_MOE_COHERENCE" = "1" ]; then
                 "$COHERENCE" "$path" --cuda --require-all-tokens || fail=1
             elif [ "$RUN_SHARDED_MOE_SMOKE" = "1" ]; then
