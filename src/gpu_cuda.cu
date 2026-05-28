@@ -2703,6 +2703,38 @@ static __global__ void q6k_dot_matvec4_kernel(float *out,
     }
 }
 
+static __global__ void q6k_dot_matvec_4warp_kernel(float *out,
+                                                   const BnBlockQ6K *blocks,
+                                                   const BnBlockQ8K *xq,
+                                                   const float *bias,
+                                                   int rows, int cols,
+                                                   size_t out_offset) {
+    __shared__ float partial[4];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row = blockIdx.x;
+    if (row >= rows || warp >= 4) return;
+
+    int n_bpr = cols / BN_QK_K;
+    int tid = warp * 32 + lane;
+    float sum = 0.0f;
+    const BnBlockQ6K *row_blocks = blocks + (size_t)row * n_bpr;
+    for (int b = tid; b < n_bpr; b += 128)
+        sum += cuda_vec_dot_q6k_q8k(&row_blocks[b], xq + b);
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        partial[warp] = sum;
+    __syncthreads();
+
+    if (warp == 0 && lane == 0) {
+        sum = partial[0] + partial[1] + partial[2] + partial[3];
+        if (bias) sum += bias[row];
+        out[out_offset + row] = sum;
+    }
+}
+
 static __global__ void q6k_dot_argmax32_kernel(
     BnCudaArgmaxPair *partials, const BnBlockQ6K *blocks,
     const BnBlockQ8K *xq, const int *penalty_tokens, int n_penalty_tokens,
@@ -12785,7 +12817,15 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                         xq, in, op->cols, 1);
                     int pair_threads = 256;
                     int warps = pair_threads / 32;
-                    if ((op->cols <= 4096 ||
+                    if (op->rows >= 2560 && op->cols >= 8192 &&
+                        getenv("BN_CUDA_DISABLE_Q6K_4WARP_LONG") == NULL) {
+                        int q6_blocks = op->rows;
+                        BN_CUDA_LAUNCH(ctx, q6k_dot_matvec_4warp_kernel,
+                            q6_blocks, pair_threads, 0,
+                            out, (const BnBlockQ6K *)w->data, xq,
+                            (const float *)NULL,
+                            op->rows, op->cols, out_offset);
+                    } else if ((op->cols <= 4096 ||
                          (op->cols >= 5120 && op->cols <= 8192) ||
                          op->cols >= 16384) &&
                         getenv("BN_CUDA_DISABLE_Q6K_MATVEC4") == NULL) {
@@ -12924,7 +12964,15 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                     xq, in, op->cols, 1);
                 int q6_threads = 256;
                 int warps = q6_threads / 32;
-                if ((op->cols <= 4096 ||
+                if (op->rows >= 2560 && op->cols >= 8192 &&
+                    getenv("BN_CUDA_DISABLE_Q6K_4WARP_LONG") == NULL) {
+                    int blocks = op->rows;
+                    BN_CUDA_LAUNCH_STABLE(ctx, stable_decode_matvec,
+                        q6k_dot_matvec_4warp_kernel, blocks,
+                        q6_threads, 0,
+                        out, (const BnBlockQ6K *)w->data, xq, bias,
+                        op->rows, op->cols, out_offset);
+                } else if ((op->cols <= 4096 ||
                      (op->cols >= 5120 && op->cols <= 8192) ||
                      op->cols >= 16384) &&
                     getenv("BN_CUDA_DISABLE_Q6K_MATVEC4") == NULL) {
