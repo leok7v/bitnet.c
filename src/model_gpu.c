@@ -15,6 +15,10 @@ static int checked_mul_size(size_t a, size_t b, size_t *out) {
     return 0;
 }
 
+static int cuda_moe_all_f16_cache_enabled(void) {
+    return getenv("BN_CUDA_ENABLE_MOE_ALL_F16_CACHE") != NULL;
+}
+
 BnGPUBackend *bn_model_gpu(const BnModel *model) {
     return model ? bn_backend_model_gpu(bn_model_backend(model)) : NULL;
 }
@@ -120,11 +124,14 @@ static void *upload_moe_all_proj(BnModel *model,
         return NULL;
     if ((size_t)n_experts > (size_t)INT_MAX / (size_t)rows)
         return NULL;
+    int force_f16_cache = cuda_moe_all_f16_cache_enabled();
     int prefer_q6_f32_cache =
         proj == 2 && type == BN_GGUF_TENSOR_Q6_K &&
+        !force_f16_cache &&
         gpu->buffer_create_q6_f32_cache &&
         getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
     int force_full_buffer =
+        force_f16_cache ||
         prefer_q6_f32_cache ||
         (proj == 2 && type == BN_GGUF_TENSOR_Q6_K &&
          getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE"));
@@ -267,6 +274,7 @@ static int mul3_size(size_t a, size_t b, size_t c, size_t *out) {
 
 static int cuda_moe_down_q6_f32_cache_enabled(const BnGPUBackend *gpu) {
     return gpu && gpu->buffer_create_q6_f32_cache &&
+           getenv("BN_CUDA_ENABLE_MOE_ALL_F16_CACHE") == NULL &&
            getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
 }
 
@@ -300,6 +308,27 @@ static size_t estimate_cuda_moe_all_bytes(const BnConfig *c,
                           (size_t)em->down_rows,
                           (size_t)em->down_cols, &aux) != 0 ||
                 checked_mul_size(aux, sizeof(float), &aux) != 0 ||
+                add_size_checked(&layer, aux) != 0)
+                return SIZE_MAX;
+        }
+        if (cuda_moe_all_f16_cache_enabled()) {
+            size_t aux = 0;
+            if (mul3_size((size_t)c->n_experts,
+                          (size_t)em->gate_rows,
+                          (size_t)em->gate_cols, &aux) != 0 ||
+                checked_mul_size(aux, sizeof(uint16_t), &aux) != 0 ||
+                add_size_checked(&layer, aux) != 0)
+                return SIZE_MAX;
+            if (mul3_size((size_t)c->n_experts,
+                          (size_t)em->up_rows,
+                          (size_t)em->up_cols, &aux) != 0 ||
+                checked_mul_size(aux, sizeof(uint16_t), &aux) != 0 ||
+                add_size_checked(&layer, aux) != 0)
+                return SIZE_MAX;
+            if (mul3_size((size_t)c->n_experts,
+                          (size_t)em->down_rows,
+                          (size_t)em->down_cols, &aux) != 0 ||
+                checked_mul_size(aux, sizeof(uint16_t), &aux) != 0 ||
                 add_size_checked(&layer, aux) != 0)
                 return SIZE_MAX;
         }
