@@ -1448,7 +1448,7 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         bn_transformer_gpu_emit_context_free(&emit);
         return s->x;
     }
-    if (getenv("BN_METAL_ENABLE_Q6_Q8K") &&
+    if (!getenv("BN_GPU_DISABLE_Q6_LOGITS_REFINE") &&
         logit_res->type == BN_GGUF_TENSOR_Q6_K &&
         logit_res->cpu_weight) {
         int refine_top = 8;
