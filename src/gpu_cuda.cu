@@ -7829,6 +7829,8 @@ static int cuda_init_activations(void *vctx, const void *config_ptr) {
             (size_t)n_ssm * (kern - 1) * qkv_dim * sizeof(float);
         sizes[BN_GPU_VALUE_SSM_QKV] = (size_t)qkv_dim * sizeof(float);
         sizes[BN_GPU_VALUE_SSM_Z] = (size_t)value_dim * sizeof(float);
+        if (value_dim > c->dim)
+            sizes[BN_GPU_VALUE_XB2] = (size_t)value_dim * sizeof(float);
         sizes[BN_GPU_VALUE_SSM_ALPHA] =
             (size_t)num_v_heads * sizeof(float);
         sizes[BN_GPU_VALUE_SSM_BETA] =
