@@ -993,7 +993,11 @@ void bn_transformer_gpu_emit_context_dense_ffn(
     void *ffn_sub_norm = res ? res->ffn_sub_norm : NULL;
 
     if (ffn_plan->has_gate && lw->ffn.ffn_gate.data) {
-        int use_fused_gateup = !getenv("BN_GPU_DISABLE_FUSED_GATEUP") &&
+        int prefer_gateup_split =
+            lw->ffn.ffn_gate.type == BN_GGUF_TENSOR_Q8_0 &&
+            c && c->n_experts > 0 && c->full_attn_interval > 0;
+        int use_fused_gateup = !prefer_gateup_split &&
+                               !getenv("BN_GPU_DISABLE_FUSED_GATEUP") &&
                                gateup_stacked &&
                                bn_transformer_gpu_can_fused_gateup_silu(res->gpu, lw->ffn.ffn_gate.type,
                                                                          ffn_plan->activation);
@@ -1674,7 +1678,10 @@ void bn_transformer_gpu_emit_context_moe(BnTransformerGPUEmitContext *ctx,
     }
 
     if (lw->shared.shared_gate.data && shared && shared->shared_gate) {
+        int prefer_shared_gateup_split =
+            lw->shared.shared_gate.type == BN_GGUF_TENSOR_Q8_0;
         int use_shared_fused_gateup =
+            !prefer_shared_gateup_split &&
             !getenv("BN_GPU_DISABLE_FUSED_GATEUP") &&
             shared->shared_gateup_stacked &&
             lw->shared.shared_gate.type == lw->shared.shared_up.type &&
