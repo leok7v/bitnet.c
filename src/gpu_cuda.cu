@@ -5235,6 +5235,34 @@ static __global__ void moe_q6k_down_all2_f32_cache_warp_kernel(
         out[row] = sum;
 }
 
+static __global__ void moe_q6k_down_all2_f32_cache_pair2_kernel(
+    float *pair_out,
+    const float *down,
+    const float *mid,
+    const float *route,
+    int dim,
+    int hidden) {
+    int lane = threadIdx.x;
+    int lane_group = threadIdx.y;
+    int row_in_pair = lane_group & 1;
+    int slot = lane_group >> 1;
+    int row = blockIdx.x * 2 + row_in_pair;
+    if (row >= dim || slot >= 2) return;
+
+    const float *row_w =
+        down + ((size_t)slot * (size_t)dim + (size_t)row) *
+                   (size_t)hidden;
+    const float *slot_mid = mid + (size_t)slot * (size_t)hidden;
+    float sum = 0.0f;
+    for (int c = lane; c < hidden; c += 32)
+        sum += row_w[c] * slot_mid[c];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        pair_out[(size_t)slot * (size_t)dim + (size_t)row] =
+            route[slot] * sum;
+}
+
 static __global__ void moe_q6k_down_routed_f16_cache_warp_kernel(
     float *out,
     const __half *down,
@@ -14267,6 +14295,20 @@ static int cuda_execute(void *vctx, const void *ops_raw, int n_ops,
                             down->f32_data && hidden >= 4096 &&
                             getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
                         if (prefer_q6_f32_down && n_experts == 2 && k == 2 &&
+                            getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_PAIR2") == NULL) {
+                            if (cuda_ensure_prefill(
+                                    ctx, (size_t)k * (size_t)dim) != 0)
+                                return -1;
+                            float *pair_out = ctx->d_prefill;
+                            BN_CUDA_LAUNCH(ctx,
+                                moe_q6k_down_all2_f32_cache_pair2_kernel,
+                                (dim + 1) / 2, dim3(32, 4, 1), 0,
+                                pair_out, (const float *)down->f32_data, mid,
+                                route, dim, hidden);
+                            BN_CUDA_LAUNCH(ctx, moe_sum_pairs_kernel,
+                                (dim + threads - 1) / threads, threads, 0,
+                                out, pair_out, dim, k);
+                        } else if (prefer_q6_f32_down && n_experts == 2 && k == 2 &&
                             getenv("BN_CUDA_DISABLE_MOE_ALL2_FAST") == NULL) {
                             BN_CUDA_LAUNCH(ctx,
                                 moe_q6k_down_all2_f32_cache_warp_kernel,
