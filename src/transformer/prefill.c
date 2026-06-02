@@ -2439,17 +2439,49 @@ prefill_layers_done:
 
 float *bn_transformer_prefill(BnModel *m, BnSession *s, const int *tokens,
                               int n_tokens, int pos0) {
+    if (m && m->config.n_experts == 2 &&
+        m->config.n_experts_active == 2 &&
+        m->config.has_shared_expert) {
+        for (int i = 0; i + 1 < n_tokens; i++)
+            if (bn_transformer_forward_no_logits(m, s, tokens[i], pos0 + i) != 0)
+                return NULL;
+        return n_tokens > 0
+            ? bn_transformer_forward(m, s, tokens[n_tokens - 1],
+                                     pos0 + n_tokens - 1)
+            : NULL;
+    }
     return prefill_internal(m, s, tokens, n_tokens, pos0, NULL, 1);
 }
 
 int bn_transformer_prefill_no_logits(BnModel *m, BnSession *s, const int *tokens,
                                      int n_tokens, int pos0) {
+    if (m && m->config.n_experts == 2 &&
+        m->config.n_experts_active == 2 &&
+        m->config.has_shared_expert) {
+        for (int i = 0; i < n_tokens; i++)
+            if (bn_transformer_forward_no_logits(m, s, tokens[i], pos0 + i) != 0)
+                return -1;
+        return 0;
+    }
     return prefill_internal(m, s, tokens, n_tokens, pos0, NULL, 0) ? 0 : -1;
 }
 
 int bn_transformer_prefill_all(BnModel *m, BnSession *s, const int *tokens,
                                int n_tokens, int pos0, float *all_logits) {
     if (!all_logits || n_tokens <= 0) return -1;
+
+    if (m && m->config.n_experts == 2 &&
+        m->config.n_experts_active == 2 &&
+        m->config.has_shared_expert) {
+        size_t row_bytes = (size_t)m->config.vocab_size * sizeof(float);
+        for (int i = 0; i < n_tokens; i++) {
+            float *logits = bn_transformer_forward(m, s, tokens[i], pos0 + i);
+            if (!logits) return -1;
+            memcpy(all_logits + (size_t)i * m->config.vocab_size,
+                   logits, row_bytes);
+        }
+        return 0;
+    }
 
     if (n_tokens == 1) {
         float *logits = bn_transformer_forward(m, s, tokens[0], pos0);

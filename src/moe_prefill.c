@@ -143,6 +143,8 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
     int moe_hidden = c->moe_intermediate_size;
     int K = c->n_experts_active;
     int n_experts = c->n_experts;
+    int force_matvec_prefill =
+        n_experts == 2 && K == 2 && c->has_shared_expert;
     const BnMoEExpertMap *map = &lw->moe.expert_map;
 
     BnAllocator a = bn_allocator_default();
@@ -663,6 +665,26 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
             bn_quant_matvec(down_buf, &wdown, gate_buf, x_q_scratch,
                             bn_model_pool(m));
             ms->stats.down_time_ms += bn_moe_time_ms() - t0;
+        } else if (force_matvec_prefill) {
+            for (int i = 0; i < T; i++) {
+                float *x_t = gather_buf + (size_t)i * dim;
+                float *gate_t = gate_buf + (size_t)i * moe_hidden;
+                float *up_t = up_buf + (size_t)i * moe_hidden;
+                float *down_t = down_buf + (size_t)i * dim;
+                BnMatvecTask gu[2] = {
+                     { gate_t, &wgate, NULL, 0 },
+                     { up_t,   &wup,   NULL, 0 },
+                };
+                bn_quant_matvec_batch(gu, 2, x_t, x_q_scratch,
+                                      bn_model_pool(m));
+                for (int h = 0; h < moe_hidden; h++) {
+                    float g = gate_t[h];
+                    gate_t[h] = (g / (1.0f + expf(-g))) * up_t[h];
+                }
+                bn_quant_matvec(down_t, &wdown, gate_t, x_q_scratch,
+                                bn_model_pool(m));
+            }
+            ms->stats.gate_up_time_ms += bn_moe_time_ms() - t0;
         } else {
             bn_quant_matmul(gate_buf, &wgate, gather_buf, T, x_q_scratch, bn_model_pool(m));
             bn_quant_matmul(up_buf, &wup, gather_buf, T, x_q_scratch, bn_model_pool(m));
@@ -751,7 +773,26 @@ int bn_moe_forward_batch(struct BnModel *m, BnSession *sess,
                 }
             }
 
-            if (!used_gpu_shared) {
+            if (!used_gpu_shared && force_matvec_prefill) {
+                for (int t = 0; t < n_tokens; t++) {
+                    const float *x_t = Xb + (size_t)t * dim;
+                    float *gate_t = sh_g + (size_t)t * shared_hidden;
+                    float *up_t = sh_u + (size_t)t * shared_hidden;
+                    float *down_t = sh_d + (size_t)t * dim;
+                    BnMatvecTask shared_gu[2] = {
+                         { gate_t, &lw->shared.shared_gate, NULL, 0 },
+                         { up_t,   &lw->shared.shared_up,   NULL, 0 },
+                    };
+                    bn_quant_matvec_batch(shared_gu, 2, x_t, x_q_scratch,
+                                          bn_model_pool(m));
+                    for (int h = 0; h < shared_hidden; h++) {
+                        float g = gate_t[h];
+                        gate_t[h] = (g / (1.0f + expf(-g))) * up_t[h];
+                    }
+                    bn_quant_matvec(down_t, &lw->shared.shared_down, gate_t,
+                                    x_q_scratch, bn_model_pool(m));
+                }
+            } else if (!used_gpu_shared) {
                 bn_quant_matmul(sh_g, &lw->shared.shared_gate, Xb, n_tokens, x_q_scratch, bn_model_pool(m));
                 bn_quant_matmul(sh_u, &lw->shared.shared_up, Xb, n_tokens, x_q_scratch, bn_model_pool(m));
 

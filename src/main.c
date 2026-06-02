@@ -59,6 +59,7 @@ typedef struct {
     int prefault_moe;   // touch all mmap'd MoE expert pages before generation
     int quiet;          // suppress generated token output
     int token_ids;      // print generated token IDs to stderr
+    int prompt_bos;     // prepend BOS to single-shot raw prompt
     int top_logits;     // hidden diagnostic: print top-K logits before sampling
     const char *draft_path; // --draft <model.gguf> for speculative decoding
     int draft_k;        // --draft-k: number of draft tokens (default 5)
@@ -118,6 +119,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --prefault-moe    Fault all mmap'd MoE expert pages during startup\n");
     fprintf(stderr, "  --quiet           Suppress generated token output\n");
     fprintf(stderr, "  --token-ids       Print generated token IDs to stderr\n");
+    fprintf(stderr, "  --bos             Prepend BOS to single-shot raw prompt\n");
     fprintf(stderr, "  --draft <path>  Draft model for speculative decoding\n");
     fprintf(stderr, "  --draft-k <int> Draft tokens per iteration (default: 5)\n");
     fprintf(stderr, "  --webgpu        Enable WebGPU backend (requires BN_ENABLE_WEBGPU=1)\n");
@@ -216,6 +218,10 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.quiet = 1;
         } else if (strcmp(argv[i], "--token-ids") == 0) {
             args.token_ids = 1;
+        } else if (strcmp(argv[i], "--bos") == 0) {
+            args.prompt_bos = 1;
+        } else if (strcmp(argv[i], "--no-bos") == 0) {
+            args.prompt_bos = 0;
         } else if (strcmp(argv[i], "--top-logits") == 0 && i + 1 < argc) {
             args.top_logits = parse_int(argv[++i], "--top-logits");
         } else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
@@ -1181,7 +1187,8 @@ int main(int argc, char **argv) {
             bn_gguf_free(gf);
             return 1;
         }
-        int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, tokenizer.add_bos,
+        int add_bos = args.prompt_bos && tokenizer.add_bos;
+        int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, add_bos,
                                         prompt_tokens, max_prompt_tokens);
         {
             char np[16]; snprintf(np, sizeof(np), "%d", n_prompt);
