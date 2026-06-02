@@ -968,12 +968,10 @@ int main(int argc, char **argv) {
             int routed_resident_layers =
                 bench_cuda_routed_moe_resident_layers(&model,
                                                       &routed_moe_layers);
-            int prefer_cache_prefill =
-                model.config.n_experts == 2 &&
-                model.config.n_experts_active == 2 &&
-                getenv("BN_CUDA_DISABLE_MOE_CACHE_PREFILL") == NULL &&
+            int duplicate_cache_enabled =
+                getenv("BN_CUDA_ENABLE_DUPLICATE_MOE_CACHE") != NULL &&
                 getenv("BN_CUDA_DISABLE_DUPLICATE_MOE_CACHE") == NULL;
-            if (!cache_env && !prefer_cache_prefill &&
+            if (!cache_env && !duplicate_cache_enabled &&
                 routed_moe_layers > 0 &&
                 routed_resident_layers == routed_moe_layers)
                 gpu_cache_mb = 0;

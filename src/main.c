@@ -476,12 +476,10 @@ static void maybe_create_gpu_moe_cache(BnModel *model,
                     "resident_layers", resident,
                     "moe_layers", layers);
     }
-    int prefer_cache_prefill =
-        model->config.n_experts == 2 &&
-        model->config.n_experts_active == 2 &&
-        getenv("BN_CUDA_DISABLE_MOE_CACHE_PREFILL") == NULL &&
+    int duplicate_cache_enabled =
+        getenv("BN_CUDA_ENABLE_DUPLICATE_MOE_CACHE") != NULL &&
         getenv("BN_CUDA_DISABLE_DUPLICATE_MOE_CACHE") == NULL;
-    if (!args->gpu_cache_mb_set && !prefer_cache_prefill &&
+    if (!args->gpu_cache_mb_set && !duplicate_cache_enabled &&
         routed_moe_layers > 0 && routed_resident_layers == routed_moe_layers)
         return;
     size_t entry_bytes = model_moe_entry_bytes(model, gpu);
