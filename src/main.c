@@ -120,6 +120,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --quiet           Suppress generated token output\n");
     fprintf(stderr, "  --token-ids       Print generated token IDs to stderr\n");
     fprintf(stderr, "  --bos             Prepend BOS to single-shot raw prompt\n");
+    fprintf(stderr, "  --no-bos          Do not prepend BOS to single-shot raw prompt\n");
     fprintf(stderr, "  --draft <path>  Draft model for speculative decoding\n");
     fprintf(stderr, "  --draft-k <int> Draft tokens per iteration (default: 5)\n");
     fprintf(stderr, "  --webgpu        Enable WebGPU backend (requires BN_ENABLE_WEBGPU=1)\n");
@@ -167,6 +168,7 @@ static CLIArgs parse_args(int argc, char **argv) {
     args.topp = 0.9f;
     args.repeat_penalty = 1.1f;
     args.seed = 42;
+    args.prompt_bos = 1;
     args.max_seq_len = 0;
     args.cache_mb = 4096;
     args.gpu_cache_mb = 4096;
