@@ -35,6 +35,9 @@ def parse_args():
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--min-overlap", type=int, default=3)
     p.add_argument("--maxseq", type=int, default=512)
+    p.add_argument("-t", "--threads", type=int)
+    p.add_argument("--kv16", action="store_true")
+    p.add_argument("--no-prefill", action="store_true")
     p.add_argument("--metal", action="store_true")
     p.add_argument("--llama-metal", action="store_true")
     p.add_argument("--llama-server-url", default="http://127.0.0.1:8027")
@@ -73,6 +76,12 @@ def run_bitnet_topk(args, prompt):
     ]
     if args.metal:
         cmd.append("--metal")
+    if args.kv16:
+        cmd.append("--kv16")
+    if args.no_prefill:
+        cmd.append("--no-prefill")
+    if args.threads is not None:
+        cmd += ["-t", str(args.threads)]
     if args.flash:
         cmd.append("--flash")
     if args.q4_q8_tail_native is not None:
@@ -121,10 +130,14 @@ def llama_topk(server_url, prompt, top_k):
     body = {
         "prompt": prompt,
         "n_predict": 1,
-        "temperature": 0,
+        "temperature": -1,
         "repeat_penalty": 1.0,
+        "top_k": 0,
+        "top_p": 1.0,
+        "min_p": 0.0,
         "cache_prompt": False,
         "n_probs": top_k,
+        "post_sampling_probs": False,
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -270,8 +283,8 @@ def main():
         print(f"{status} {prompt!r}: top1 bitnet={b_ids[0]} llama={l_ids[0]} "
               f"overlap={overlap}/{args.top_k}")
         if not ok:
-            print(f"  bitnet top: {b_ids}")
-            print(f"  llama  top: {l_ids}")
+            print(f"  bitnet top: {[(tid, score) for _, tid, score in b_rows]}")
+            print(f"  llama  top: {[(tid, score) for _, tid, score in l_rows]}")
 
     print("---")
     print(f"Top-1 matches: {top1_matches}/{len(prompts)}")

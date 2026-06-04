@@ -21,6 +21,9 @@ def parse_args():
     p.add_argument("--ctx", type=int, default=512)
     p.add_argument("--ngl", type=int, default=99)
     p.add_argument("--np", type=int, default=1)
+    p.add_argument("--flash-attn", choices=("on", "off"), default="on")
+    p.add_argument("--cache-k")
+    p.add_argument("--cache-v")
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument("--log", default="/tmp/bitnet-llama-topk-server.log")
     args, compare_args = p.parse_known_args()
@@ -75,12 +78,16 @@ def main():
         args.llama_server,
         "-m", args.model,
         "-ngl", str(args.ngl),
-        "-fa", "on",
+        "-fa", args.flash_attn,
         "-c", str(args.ctx),
         "-np", str(args.np),
         "--host", args.host,
         "--port", str(args.port),
     ]
+    if args.cache_k:
+        cmd += ["-ctk", args.cache_k]
+    if args.cache_v:
+        cmd += ["-ctv", args.cache_v]
 
     os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
     with open(args.log, "w", encoding="utf-8") as log:
