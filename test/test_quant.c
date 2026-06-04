@@ -25,6 +25,24 @@ static float ref_dot_f16(const uint16_t *w, const float *x, int cols) {
     return sum;
 }
 
+static void test_fp16_conversion(void) {
+    printf("test_fp16_conversion... ");
+
+    assert(bn_fp32_to_fp16(1.0f) == 0x3C00);
+    assert(bn_fp32_to_fp16(-0.0f) == 0x8000);
+    assert(bn_fp32_to_fp16(0x1.0p-14f) == 0x0400);
+    assert(bn_fp32_to_fp16(0x1.0p-24f) == 0x0001);
+    assert(bn_fp32_to_fp16(65504.0f) == 0x7BFF);
+    assert(bn_fp32_to_fp16(INFINITY) == 0x7C00);
+    assert(bn_fp32_to_fp16(NAN) == 0x7E00);
+
+    // Halfway between 0x3C01 and 0x3C02 rounds to the even mantissa.
+    assert(bn_fp32_to_fp16(0x1.006p+0f) == 0x3C02);
+    assert(fabsf(bn_fp16_to_fp32(0x0001) - 0x1.0p-24f) < 1e-12f);
+
+    printf("PASSED\n");
+}
+
 // --- Integration test: dispatch routing ---
 // Verifies that bn_quant_matvec dispatches correctly for each format.
 
@@ -1048,6 +1066,7 @@ static void test_kquant_preq8k_matmul_correctness(void) {
 
 int main(void) {
     printf("=== Quant Integration Tests ===\n");
+    test_fp16_conversion();
     test_dispatch_routing();
     test_matvec_batch();
     test_matvec_threaded();

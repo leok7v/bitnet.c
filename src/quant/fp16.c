@@ -1,4 +1,5 @@
 #include "quant.h"
+#include <math.h>
 #include <string.h>
 
 // --- FP16 <-> FP32 conversion ---
@@ -42,18 +43,28 @@ float bn_bf16_to_fp32(uint16_t h) {
 }
 
 uint16_t bn_fp32_to_fp16(float val) {
-    uint32_t f;
-    memcpy(&f, &val, 4);
+    const float scale_to_inf = 0x1.0p+112f;
+    const float scale_to_zero = 0x1.0p-110f;
+    float base = (fabsf(val) * scale_to_inf) * scale_to_zero;
 
-    uint32_t sign = (f >> 16) & BN_FP16_SIGN_MASK;
-    int32_t  exp  = ((f >> 23) & 0xFF) - 127;
-    uint32_t mant = f & BN_FP32_MANT_MASK;
+    uint32_t w;
+    memcpy(&w, &val, sizeof(w));
 
-    if (exp > 15) {
-        return (uint16_t)(sign | BN_FP16_INF);  // Inf
-    } else if (exp < -14) {
-        return (uint16_t)sign;  // Zero (flush subnormals)
-    } else {
-        return (uint16_t)(sign | ((uint32_t)(exp + 15) << 10) | (mant >> 13));
-    }
+    const uint32_t shl1_w = w + w;
+    const uint32_t sign = w & 0x80000000u;
+    uint32_t bias = shl1_w & 0xFF000000u;
+    if (bias < 0x71000000u) bias = 0x71000000u;
+
+    const uint32_t base_bits = (bias >> 1) + 0x07800000u;
+    float base_bias;
+    memcpy(&base_bias, &base_bits, sizeof(base_bias));
+    base += base_bias;
+
+    uint32_t bits;
+    memcpy(&bits, &base, sizeof(bits));
+    const uint32_t exp_bits = (bits >> 13) & 0x00007C00u;
+    const uint32_t mantissa_bits = bits & 0x00000FFFu;
+    const uint32_t nonsign = exp_bits + mantissa_bits;
+    return (uint16_t)((sign >> 16) |
+                      (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
 }
