@@ -999,13 +999,15 @@ static void test_kquant_preq8k_matmul_correctness(void) {
     int16_t *x_bsums = (int16_t *)malloc((size_t)n_tokens * n_bpr * 16 * sizeof(int16_t));
     float *ref4 = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
     float *ref6 = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
+    float *force4 = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
+    float *force6 = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
     float *out4 = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
     float *out4b = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
     float *out6 = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
     float *out4_prepared = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
     float *out4b_prepared = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
-    assert(X && x_q && x_d && x_bsums && ref4 && ref6 && out4 && out4b &&
-           out6 && out4_prepared && out4b_prepared);
+    assert(X && x_q && x_d && x_bsums && ref4 && ref6 && force4 && force6 &&
+           out4 && out4b && out6 && out4_prepared && out4b_prepared);
 
     for (int t = 0; t < n_tokens; t++) {
         for (int i = 0; i < cols; i++)
@@ -1018,6 +1020,14 @@ static void test_kquant_preq8k_matmul_correctness(void) {
                         x_q + (size_t)t * cols, NULL);
         bn_quant_matvec(ref6 + (size_t)t * rows, &W6, X + (size_t)t * cols,
                         x_q + (size_t)t * cols, NULL);
+        BnMatvecTask force_tasks[2] = {
+            { force4 + (size_t)t * rows, &W4a, NULL,
+              BN_MATVEC_TASK_FORCE_FLOAT_KQUANT },
+            { force6 + (size_t)t * rows, &W6, NULL,
+              BN_MATVEC_TASK_FORCE_FLOAT_KQUANT },
+        };
+        bn_quant_matvec_batch(force_tasks, 2, X + (size_t)t * cols,
+                              x_q + (size_t)t * cols, NULL);
     }
 
     bn_quant_matmul_preq8k(out4, &W4a, n_tokens, x_q, x_d, x_bsums, X, NULL);
@@ -1052,15 +1062,58 @@ static void test_kquant_preq8k_matmul_correctness(void) {
     for (int i = 0; i < rows * n_tokens; i++) {
         assert(fabsf(out4[i] - ref4[i]) < 1e-3f);
         assert(fabsf(out6[i] - ref6[i]) < 1e-3f);
+        assert(fabsf(out4[i] - force4[i]) < 1e-3f);
+        assert(fabsf(out6[i] - force6[i]) < 1e-3f);
         assert(fabsf(out4_prepared[i] - out4[i]) < 1e-5f);
         assert(fabsf(out4b_prepared[i] - out4b[i]) < 1e-5f);
     }
 
     free(q4a); free(q4b); free(q6);
     free(X); free(x_q); free(x_d); free(x_bsums);
-    free(ref4); free(ref6); free(out4); free(out4b); free(out6);
+    free(ref4); free(ref6); free(force4); free(force6);
+    free(out4); free(out4b); free(out6);
     free(out4_prepared); free(out4b_prepared);
     sh_arena_free(prep_arena);
+    printf("PASSED\n");
+}
+
+static void test_activation_quant_rounding(void) {
+    printf("test_activation_quant_rounding... ");
+
+    float x[BN_QK_K] = {0};
+    int8_t x_i8[BN_QK_K];
+    int8_t x_q8k[BN_QK_K];
+    float x_d[1];
+    int16_t x_bsums[16];
+
+    x[0] = 127.0f;
+    x[1] = 0.5f;
+    x[2] = -0.5f;
+    x[3] = 1.5f;
+    x[4] = -1.5f;
+    x[5] = 2.5f;
+    x[6] = -2.5f;
+
+    float scale = bn_quant_x_to_i8(x, x_i8, BN_QK_K);
+    assert(fabsf(scale - 1.0f) < 1e-6f);
+    assert(x_i8[0] == 127);
+    assert(x_i8[1] == 1);
+    assert(x_i8[2] == -1);
+    assert(x_i8[3] == 2);
+    assert(x_i8[4] == -2);
+    assert(x_i8[5] == 3);
+    assert(x_i8[6] == -3);
+
+    bn_quant_x_to_q8k(x, x_q8k, x_d, x_bsums, BN_QK_K);
+    assert(fabsf(x_d[0] - 1.0f) < 1e-6f);
+    assert(x_q8k[0] == 127);
+    assert(x_q8k[1] == 1);
+    assert(x_q8k[2] == -1);
+    assert(x_q8k[3] == 2);
+    assert(x_q8k[4] == -2);
+    assert(x_q8k[5] == 3);
+    assert(x_q8k[6] == -3);
+
     printf("PASSED\n");
 }
 
@@ -1085,6 +1138,7 @@ int main(void) {
     test_mixed_kquant_matvec_batch_correctness();
     test_mixed_kquant_matvec_multi_correctness();
     test_kquant_preq8k_matmul_correctness();
+    test_activation_quant_rounding();
     printf("All quant integration tests passed!\n");
     return 0;
 }

@@ -61,7 +61,8 @@ int main(int argc, char **argv) {
     // Encode test prompt
     const char *prompt = argc >= 3 ? argv[2] : "The capital of France";
     int prompt_tokens[256];
-    int n_prompt = bn_tokenizer_encode(&tok, prompt, 1, prompt_tokens, 256);
+    int n_prompt = bn_tokenizer_encode(&tok, prompt, tok.add_bos,
+                                       prompt_tokens, 256);
     printf("Prompt: \"%s\" (%d tokens)\n", prompt, n_prompt);
     assert(n_prompt >= 2);
 

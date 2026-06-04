@@ -5,6 +5,14 @@
 #include <assert.h>
 #include <math.h>
 
+static inline __m256i bn_avx2_round_half_away_epi32(__m256 v) {
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 zero = _mm256_setzero_ps();
+    __m256 bias = _mm256_blendv_ps(_mm256_sub_ps(zero, half), half,
+                                   _mm256_cmp_ps(v, zero, _CMP_GE_OQ));
+    return _mm256_cvttps_epi32(_mm256_add_ps(v, bias));
+}
+
 float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
     // Find absolute max via AVX2
     __m256 vmax = _mm256_setzero_ps();
@@ -39,10 +47,14 @@ float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
 
     i = 0;
     for (; i + 31 < n; i += 32) {
-        __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
-        __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8), vinv));
-        __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
-        __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
+        __m256i i0 = bn_avx2_round_half_away_epi32(
+            _mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
+        __m256i i1 = bn_avx2_round_half_away_epi32(
+            _mm256_mul_ps(_mm256_loadu_ps(x + i + 8), vinv));
+        __m256i i2 = bn_avx2_round_half_away_epi32(
+            _mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
+        __m256i i3 = bn_avx2_round_half_away_epi32(
+            _mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
         __m256i s01 = _mm256_packs_epi32(i0, i1);   // 32->16, within lanes
         __m256i s23 = _mm256_packs_epi32(i2, i3);
         __m256i b = _mm256_packs_epi16(s01, s23);    // 16->8, within lanes
@@ -96,10 +108,10 @@ void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
             __m256 f1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d + 8)));
             __m256 f2 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d + 16)));
             __m256 f3 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d + 24)));
-            __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(f0, vinv));
-            __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(f1, vinv));
-            __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(f2, vinv));
-            __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(f3, vinv));
+            __m256i i0 = bn_avx2_round_half_away_epi32(_mm256_mul_ps(f0, vinv));
+            __m256i i1 = bn_avx2_round_half_away_epi32(_mm256_mul_ps(f1, vinv));
+            __m256i i2 = bn_avx2_round_half_away_epi32(_mm256_mul_ps(f2, vinv));
+            __m256i i3 = bn_avx2_round_half_away_epi32(_mm256_mul_ps(f3, vinv));
             __m256i s01 = _mm256_packs_epi32(i0, i1);
             __m256i s23 = _mm256_packs_epi32(i2, i3);
             __m256i b = _mm256_packs_epi16(s01, s23);
@@ -164,10 +176,14 @@ void bn_quant_x_to_q8k(const float *x, int8_t *x_q, float *x_d,
             const float *gx = xb + g * 32;
             int8_t *gq = qb + g * 32;
 
-            __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(gx), vinv));
-            __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(gx + 8), vinv));
-            __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(gx + 16), vinv));
-            __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(gx + 24), vinv));
+            __m256i i0 = bn_avx2_round_half_away_epi32(
+                _mm256_mul_ps(_mm256_loadu_ps(gx), vinv));
+            __m256i i1 = bn_avx2_round_half_away_epi32(
+                _mm256_mul_ps(_mm256_loadu_ps(gx + 8), vinv));
+            __m256i i2 = bn_avx2_round_half_away_epi32(
+                _mm256_mul_ps(_mm256_loadu_ps(gx + 16), vinv));
+            __m256i i3 = bn_avx2_round_half_away_epi32(
+                _mm256_mul_ps(_mm256_loadu_ps(gx + 24), vinv));
             __m256i s01 = _mm256_packs_epi32(i0, i1);
             __m256i s23 = _mm256_packs_epi32(i2, i3);
             __m256i packed = _mm256_packs_epi16(s01, s23);
