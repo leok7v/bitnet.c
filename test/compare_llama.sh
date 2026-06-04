@@ -10,6 +10,8 @@
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --metal --llama-metal --flash
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --metal --llama-gpu-layers 12
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --metal --llama-metal --llama-flash-off
+#   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --llama-cache-k f32 --llama-cache-v f32
+#   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --llama-batch 1 --llama-ubatch 1
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf -v    # verbose
 #   ./test/compare_llama.sh models/qwen2.5-3b-instruct-q4_0.gguf --strict
 #
@@ -27,6 +29,7 @@ BITNET_ARGS=()
 LLAMA_ARGS=(-ngl 0 -dev none)
 LLAMA_FLASH=()
 LLAMA_THREADS=1
+LLAMA_THREADS_BATCH=()
 CUSTOM_PROMPTS=()
 LLAMA_BIN_DIR="${LLAMA_BIN_DIR:-/home/mark/artalis.io/tools/llama.cpp/build/bin}"
 while [[ $# -gt 0 ]]; do
@@ -39,6 +42,11 @@ while [[ $# -gt 0 ]]; do
         --kv16) BITNET_ARGS+=(--kv16); shift ;;
         --llama-cuda) LLAMA_ARGS=(-ngl 99); shift ;;
         --llama-gpu-layers) LLAMA_ARGS=(-ngl "$2"); shift 2 ;;
+        --llama-cache-k) LLAMA_ARGS+=(-ctk "$2"); shift 2 ;;
+        --llama-cache-v) LLAMA_ARGS+=(-ctv "$2"); shift 2 ;;
+        --llama-batch) LLAMA_ARGS+=(-b "$2"); shift 2 ;;
+        --llama-ubatch) LLAMA_ARGS+=(-ub "$2"); shift 2 ;;
+        --llama-threads-batch) LLAMA_THREADS_BATCH=(-tb "$2"); shift 2 ;;
         --webgpu|--gpu) BITNET_ARGS+=(--webgpu); shift ;;
         --no-prefill) BITNET_ARGS+=(--no-prefill); shift ;;
         --flash) BITNET_ARGS+=(--flash); LLAMA_FLASH=(-fa on); shift ;;
@@ -157,9 +165,9 @@ if (( ${#BITNET_ARGS[@]} > 0 )); then
     echo "bitnet args: ${BITNET_ARGS[*]}"
 fi
 if (( ${#LLAMA_FLASH[@]} > 0 )); then
-    echo "llama args:  ${LLAMA_ARGS[*]} ${LLAMA_FLASH[*]} -t $LLAMA_THREADS"
+    echo "llama args:  ${LLAMA_ARGS[*]} ${LLAMA_FLASH[*]} -t $LLAMA_THREADS ${LLAMA_THREADS_BATCH[*]}"
 else
-    echo "llama args:  ${LLAMA_ARGS[*]} -t $LLAMA_THREADS"
+    echo "llama args:  ${LLAMA_ARGS[*]} -t $LLAMA_THREADS ${LLAMA_THREADS_BATCH[*]}"
 fi
 echo "---"
 
@@ -188,7 +196,8 @@ for prompt in "${PROMPTS[@]}"; do
     llama_out=$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         "$LLAMA" -m "$MODEL" "${llama_run_args[@]}" -p "$prompt" -n "$N_TOKENS" \
         --temp 0 --no-display-prompt -no-cnv --simple-io --verbosity 1 \
-        -t "$LLAMA_THREADS" 2>"$llama_stderr" | sed 's/> EOF by user$//') || true
+        -t "$LLAMA_THREADS" "${LLAMA_THREADS_BATCH[@]}" \
+        2>"$llama_stderr" | sed 's/> EOF by user$//') || true
 
     if [[ -z "$bitnet_out" || -z "$llama_out" ]]; then
         echo -e "${RED}ERROR${RESET}   \"$prompt\""
