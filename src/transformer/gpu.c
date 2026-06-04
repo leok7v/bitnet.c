@@ -889,7 +889,7 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
     int gpu_logits_need_cpu =
         bn_transformer_gpu_logits_needs_cpu_fallback(gpu, logit_res);
     int prefer_cached_dense_logits_argmax =
-        c->n_experts <= 0 && logit_res->rows <= 160000 &&
+        c->n_experts <= 0 && logit_res->rows <= 262144 &&
         !getenv("BN_CUDA_ENABLE_DENSE_LOGITS_ARGMAX");
     int use_matvec_argmax =
         argmax_token && !need_logits && gpu->matvec_argmax_activation &&
@@ -897,7 +897,10 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
         !getenv("BN_CUDA_DISABLE_LOGITS_ARGMAX") &&
         !prefer_cached_dense_logits_argmax &&
         (c->n_experts <= 0 ||
-         (c->n_experts == 2 && c->n_experts_active == 2)) &&
+         (c->n_experts == 2 && c->n_experts_active == 2) ||
+         (c->n_experts > 0 && logit_res->cols == 1536 &&
+          !getenv("BN_CUDA_DISABLE_MOE_LOGITS_MMVQ_ARGMAX")) ||
+         getenv("BN_CUDA_ENABLE_MOE_LOGITS_MMVQ_ARGMAX") != NULL) &&
         logit_res->type == BN_GGUF_TENSOR_Q6_K;
     int cacheable_decode =
         (!emit_logits || argmax_token ||

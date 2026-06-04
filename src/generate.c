@@ -69,6 +69,7 @@ static int check_stop_strings(const char *buf, int buf_len,
 
 // --- Loop detection ---
 #define LOOP_BUF_SIZE 32
+#define LOOP_BUF_MASK (LOOP_BUF_SIZE - 1)
 #define LOOP_NGRAM    4
 
 #define BN_MAX_TOP_LOGITS 32
@@ -144,6 +145,7 @@ int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampl
     const char *top_env = getenv("BN_TOP_LOGITS");
     const char *logit_ids_env = getenv("BN_LOGIT_IDS");
     int top_logits = top_env ? atoi(top_env) : 0;
+    int disable_loop_abort = getenv("BN_DISABLE_LOOP_ABORT") != NULL;
     int have_gpu_next = 0;
     int gpu_next = -1;
 
@@ -169,20 +171,22 @@ int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampl
 
         // Ring buffer loop detection
         loop_buf[loop_idx] = next;
-        loop_idx = (loop_idx + 1) % LOOP_BUF_SIZE;
+        loop_idx = (loop_idx + 1) & LOOP_BUF_MASK;
         gen_count++;
 
-        if (gen_count >= 2 * LOOP_NGRAM) {
+        if (!disable_loop_abort && gen_count >= 2 * LOOP_NGRAM) {
             int looping = 1;
             for (int k = 0; k < LOOP_NGRAM; k++) {
-                int a = loop_buf[((loop_idx - 1 - k) % LOOP_BUF_SIZE + LOOP_BUF_SIZE) % LOOP_BUF_SIZE];
-                int b = loop_buf[((loop_idx - 1 - k - LOOP_NGRAM) % LOOP_BUF_SIZE + LOOP_BUF_SIZE) % LOOP_BUF_SIZE];
+                int a = loop_buf[(loop_idx - 1 - k) & LOOP_BUF_MASK];
+                int b = loop_buf[(loop_idx - 1 - k - LOOP_NGRAM) &
+                                 LOOP_BUF_MASK];
                 if (a != b) { looping = 0; break; }
             }
             if (looping) return -1;
         }
 
-        bn_sampler_accept(sampler, next);
+        if (sampler->repeat_penalty != 1.0f)
+            bn_sampler_accept(sampler, next);
 
         const char *piece = (cb || max_stop_len > 0)
                                 ? bn_tokenizer_decode(tok, next)

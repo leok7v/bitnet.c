@@ -29,10 +29,13 @@ REQUIRE_PARITY="${REQUIRE_PARITY:-1}"
 LLAMA_NGL="${LLAMA_NGL:-99}"
 LLAMA_NGL_SHARDED_RETRY="${LLAMA_NGL_SHARDED_RETRY:-32}"
 BITNET_BENCH_EXTRA_ARGS="${BITNET_BENCH_EXTRA_ARGS:-}"
-BITNET_CLI_EXTRA_ARGS="${BITNET_CLI_EXTRA_ARGS:-}"
+BITNET_BENCH_ENV="${BITNET_BENCH_ENV:-BN_CUDA_DISABLE_Q4K_Q8K_DOT=1 BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE=1}"
+BITNET_CLI_EXTRA_ARGS="${BITNET_CLI_EXTRA_ARGS:---repeat-penalty 1}"
+BITNET_CLI_ENV="${BITNET_CLI_ENV:-BN_DISABLE_LOOP_ABORT=1}"
 LLAMA_BENCH_EXTRA_ARGS="${LLAMA_BENCH_EXTRA_ARGS:-}"
 
 read -r -a BITNET_BENCH_EXTRA <<< "$BITNET_BENCH_EXTRA_ARGS"
+read -r -a BITNET_BENCH_ENV_ARR <<< "$BITNET_BENCH_ENV"
 read -r -a BITNET_CLI_EXTRA <<< "$BITNET_CLI_EXTRA_ARGS"
 read -r -a LLAMA_BENCH_EXTRA <<< "$LLAMA_BENCH_EXTRA_ARGS"
 
@@ -97,7 +100,8 @@ for model in $MODELS; do
         continue
     fi
 
-    if ! bitnet_out=$(BN_CUDA_DEVICE="$CUDA_DEVICE" "$BITNET_BENCH" "$model" \
+    if ! bitnet_out=$(env "${BITNET_BENCH_ENV_ARR[@]}" \
+        BN_CUDA_DEVICE="$CUDA_DEVICE" "$BITNET_BENCH" "$model" \
         --cuda --iters "$ITERS" --toks "$TOKS" --prefill-toks "$PREFILL_TOKS" \
         --prefill-iters 1 --prefill-no-logits --threads "$THREADS" \
         --random-gen "${BITNET_BENCH_EXTRA[@]}" 2>&1); then
@@ -109,9 +113,11 @@ for model in $MODELS; do
         awk '/^Prefill/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) { v=$i; break } } END { if (v == "") v="0"; print v }')
 
     if [ "$BITNET_TG_MODE" = "generate" ]; then
-        if ! bitnet_tg_out=$(BN_CUDA_DEVICE="$CUDA_DEVICE" "$BITNET_CLI" \
-            "$model" --cuda -n "$TOKS" -t "$THREADS" \
-            --maxseq "$MAXSEQ" --quiet "${BITNET_CLI_EXTRA[@]}" 2>&1); then
+        read -r -a BITNET_CLI_ENV_ARR <<< "$BITNET_CLI_ENV"
+        if ! bitnet_tg_out=$(env "${BITNET_CLI_ENV_ARR[@]}" \
+            BN_CUDA_DEVICE="$CUDA_DEVICE" "$BITNET_CLI" "$model" --cuda \
+            -n "$TOKS" -t "$THREADS" --maxseq "$MAXSEQ" --quiet \
+            "${BITNET_CLI_EXTRA[@]}" 2>&1); then
             echo -e "$(basename "$model")\t$bitnet_pp\tSKIP\t0\tERROR\tbitnet generate failed\t0\tFAIL"
             printf '%s\n' "$bitnet_tg_out" >&2
             continue

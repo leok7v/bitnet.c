@@ -167,6 +167,7 @@ static void *upload_moe_all_proj(BnModel *model,
         cuda_moe_all_f16_cache_enabled_for_type(gpu, type, q8_f16_cache);
     int prefer_q6_f32_cache =
         proj == 2 && type == BN_GGUF_TENSOR_Q6_K &&
+        cols > 1024 &&
         !force_f16_cache &&
         gpu->buffer_create_q6_f32_cache &&
         getenv("BN_CUDA_DISABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL;
@@ -345,6 +346,9 @@ static size_t cuda_q6_down_f32_cache_bytes(const BnGPUBackend *gpu,
                                            int n_experts) {
     if (!cuda_moe_down_q6_f32_cache_enabled(gpu) || !em ||
         em->down_type != BN_GGUF_TENSOR_Q6_K || n_experts <= 0)
+        return 0;
+    if (em->down_cols <= 1024 &&
+        getenv("BN_CUDA_ENABLE_Q6K_MOE_DOWN_F32_CACHE") == NULL)
         return 0;
 
     size_t elems = 0;
