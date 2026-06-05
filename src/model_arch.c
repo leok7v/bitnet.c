@@ -174,6 +174,8 @@ void bn_model_arch_load_moe_config(BnConfig *c,
     if (c->n_experts <= 0) return;
     c->moe_norm_topk_prob = strcmp(prefix, "qwen2moe") != 0;
     c->moe_exact_silu = strcmp(prefix, "qwen2moe") == 0;
+    if (c->moe_exact_silu)
+        c->arch_flags |= BN_MODEL_ARCH_FLAG_QWEN2MOE;
     snprintf(key, sizeof(key), "%s.expert_weights_scale", prefix);
     c->moe_expert_weights_scale = bn_gguf_get_f32(f, key);
 

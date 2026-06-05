@@ -11,6 +11,7 @@
 #define BN_MODEL_ARCH_FLAG_QWEN 4u
 #define BN_MODEL_ARCH_FLAG_BITNET 8u
 #define BN_MODEL_ARCH_FLAG_QWEN3 16u
+#define BN_MODEL_ARCH_FLAG_QWEN2MOE 32u
 
 typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads;

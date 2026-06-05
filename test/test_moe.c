@@ -1,5 +1,6 @@
 #include "moe.h"
 #include "model.h"
+#include "model_arch.h"
 #include "quant.h"
 #include "../src/moe_internal.h"
 #include <stdio.h>
@@ -181,6 +182,42 @@ static void test_moe_config_compat(void) {
     printf("PASSED\n");
 }
 
+static BnGGUFKeyValue make_u32_kv(char *key, uint32_t value) {
+    BnGGUFKeyValue kv = {0};
+    kv.key = key;
+    kv.type = BN_GGUF_TYPE_UINT32;
+    kv.value.u32 = value;
+    return kv;
+}
+
+static void test_qwen2moe_arch_config(void) {
+    printf("test_qwen2moe_arch_config... ");
+
+    BnGGUFKeyValue kvs[3];
+    kvs[0] = make_u32_kv("qwen2moe.expert_count", 2);
+    kvs[1] = make_u32_kv("qwen2moe.expert_used_count", 2);
+    kvs[2] = make_u32_kv("qwen2moe.expert_feed_forward_length", 8960);
+
+    BnGGUFFile f = {0};
+    f.n_kv = 3;
+    f.kvs = kvs;
+
+    BnConfig c = {0};
+    c.arch_flags = BN_MODEL_ARCH_FLAG_QWEN;
+    const BnModelArchOps *ops = bn_model_arch_ops_for("qwen2moe");
+    assert(ops != NULL);
+    bn_model_arch_load_moe_config(&c, &f, ops, "qwen2moe");
+
+    assert(c.n_experts == 2);
+    assert(c.n_experts_active == 2);
+    assert(c.moe_intermediate_size == 8960);
+    assert(c.moe_norm_topk_prob == 0);
+    assert(c.moe_exact_silu == 1);
+    assert((c.arch_flags & BN_MODEL_ARCH_FLAG_QWEN2MOE) != 0);
+
+    printf("PASSED\n");
+}
+
 // --- Test: SwiGLU activation (reference check) ---
 
 static void test_swiglu(void) {
@@ -248,6 +285,7 @@ int main(void) {
     test_expert_map_split();
     test_expert_map_fused_gate_up();
     test_moe_config_compat();
+    test_qwen2moe_arch_config();
     test_swiglu();
     test_route_uniform();
     test_moe_cache();

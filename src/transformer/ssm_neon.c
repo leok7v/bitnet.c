@@ -92,84 +92,38 @@ void bn_transformer_ssm_delta_neon_range(void *ctx, int start, int end) {
         float decay = c->alpha[hv];
         float beta = c->beta[hv];
 
-        // --- Pass 0: Decay state S *= decay ---
-        float32x4_t vdecay = vdupq_n_f32(decay);
-        int n_state = head_k_dim * head_v_dim;
-        for (int i = 0; i < n_state; i += 16) {
-            vst1q_f32(S + i,      vmulq_f32(vld1q_f32(S + i),      vdecay));
-            vst1q_f32(S + i + 4,  vmulq_f32(vld1q_f32(S + i + 4),  vdecay));
-            vst1q_f32(S + i + 8,  vmulq_f32(vld1q_f32(S + i + 8),  vdecay));
-            vst1q_f32(S + i + 12, vmulq_f32(vld1q_f32(S + i + 12), vdecay));
-        }
-
-        // --- Pass 1: sk = S @ k ---
-        // sk[v] = sum_k S[k*head_v_dim + v] * kh[k]
-        // Accumulate rows of S weighted by kh[k]
-        float sk[head_v_dim] __attribute__((aligned(16)));
-        {
-            float32x4_t kv = vdupq_n_f32(kh[0]);
-            float *row = S;
-            for (int v = 0; v < head_v_dim; v += 16) {
-                vst1q_f32(sk + v,      vmulq_f32(vld1q_f32(row + v),      kv));
-                vst1q_f32(sk + v + 4,  vmulq_f32(vld1q_f32(row + v + 4),  kv));
-                vst1q_f32(sk + v + 8,  vmulq_f32(vld1q_f32(row + v + 8),  kv));
-                vst1q_f32(sk + v + 12, vmulq_f32(vld1q_f32(row + v + 12), kv));
-            }
-        }
-        for (int k = 1; k < head_k_dim; k++) {
-            float32x4_t kv = vdupq_n_f32(kh[k]);
-            float *row = S + (size_t)k * head_v_dim;
-            for (int v = 0; v < head_v_dim; v += 16) {
-                vst1q_f32(sk + v,      vmlaq_f32(vld1q_f32(sk + v),      vld1q_f32(row + v),      kv));
-                vst1q_f32(sk + v + 4,  vmlaq_f32(vld1q_f32(sk + v + 4),  vld1q_f32(row + v + 4),  kv));
-                vst1q_f32(sk + v + 8,  vmlaq_f32(vld1q_f32(sk + v + 8),  vld1q_f32(row + v + 8),  kv));
-                vst1q_f32(sk + v + 12, vmlaq_f32(vld1q_f32(sk + v + 12), vld1q_f32(row + v + 12), kv));
-            }
-        }
-
-        // --- Compute delta = beta * (v - sk) in-place over sk ---
-        float32x4_t vbeta = vdupq_n_f32(beta);
-        for (int v = 0; v < head_v_dim; v += 16) {
-            vst1q_f32(sk + v,      vmulq_f32(vbeta, vsubq_f32(vld1q_f32(vh + v),      vld1q_f32(sk + v))));
-            vst1q_f32(sk + v + 4,  vmulq_f32(vbeta, vsubq_f32(vld1q_f32(vh + v + 4),  vld1q_f32(sk + v + 4))));
-            vst1q_f32(sk + v + 8,  vmulq_f32(vbeta, vsubq_f32(vld1q_f32(vh + v + 8),  vld1q_f32(sk + v + 8))));
-            vst1q_f32(sk + v + 12, vmulq_f32(vbeta, vsubq_f32(vld1q_f32(vh + v + 12), vld1q_f32(sk + v + 12))));
-        }
-
-        // --- Pass 2: State update S[k][v] += kh[k] * delta[v] ---
-        for (int k = 0; k < head_k_dim; k++) {
-            float32x4_t kv = vdupq_n_f32(kh[k]);
-            float *row = S + (size_t)k * head_v_dim;
-            for (int v = 0; v < head_v_dim; v += 16) {
-                vst1q_f32(row + v,      vmlaq_f32(vld1q_f32(row + v),      kv, vld1q_f32(sk + v)));
-                vst1q_f32(row + v + 4,  vmlaq_f32(vld1q_f32(row + v + 4),  kv, vld1q_f32(sk + v + 4)));
-                vst1q_f32(row + v + 8,  vmlaq_f32(vld1q_f32(row + v + 8),  kv, vld1q_f32(sk + v + 8)));
-                vst1q_f32(row + v + 12, vmlaq_f32(vld1q_f32(row + v + 12), kv, vld1q_f32(sk + v + 12)));
-            }
-        }
-
-        // --- Pass 3: Read output o = S^T @ q * q_scale ---
-        // o[v] = sum_k S[k*head_v_dim + v] * qh[k]
+        // State is transposed: S[v][k] stores the mathematical state[k][v].
         float *oh = c->out + hv * head_v_dim;
-        {
-            float32x4_t qv = vdupq_n_f32(qh[0] * q_scale);
-            float *row = S;
-            for (int v = 0; v < head_v_dim; v += 16) {
-                vst1q_f32(oh + v,      vmulq_f32(vld1q_f32(row + v),      qv));
-                vst1q_f32(oh + v + 4,  vmulq_f32(vld1q_f32(row + v + 4),  qv));
-                vst1q_f32(oh + v + 8,  vmulq_f32(vld1q_f32(row + v + 8),  qv));
-                vst1q_f32(oh + v + 12, vmulq_f32(vld1q_f32(row + v + 12), qv));
+        for (int v = 0; v < head_v_dim; v++) {
+            float *row = S + (size_t)v * head_k_dim;
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            float32x4_t vdecay = vdupq_n_f32(decay);
+            int k = 0;
+            for (; k + 4 <= head_k_dim; k += 4) {
+                float32x4_t r = vmulq_f32(vld1q_f32(row + k), vdecay);
+                vst1q_f32(row + k, r);
+                acc = vmlaq_f32(acc, r, vld1q_f32(kh + k));
             }
-        }
-        for (int k = 1; k < head_k_dim; k++) {
-            float32x4_t qv = vdupq_n_f32(qh[k] * q_scale);
-            float *row = S + (size_t)k * head_v_dim;
-            for (int v = 0; v < head_v_dim; v += 16) {
-                vst1q_f32(oh + v,      vmlaq_f32(vld1q_f32(oh + v),      vld1q_f32(row + v),      qv));
-                vst1q_f32(oh + v + 4,  vmlaq_f32(vld1q_f32(oh + v + 4),  vld1q_f32(row + v + 4),  qv));
-                vst1q_f32(oh + v + 8,  vmlaq_f32(vld1q_f32(oh + v + 8),  vld1q_f32(row + v + 8),  qv));
-                vst1q_f32(oh + v + 12, vmlaq_f32(vld1q_f32(oh + v + 12), vld1q_f32(row + v + 12), qv));
+            float sk = bn_transformer_neon_hsum_f32(acc);
+            for (; k < head_k_dim; k++) {
+                row[k] *= decay;
+                sk += row[k] * kh[k];
             }
+            float delta = (vh[v] - sk) * beta;
+            float32x4_t vdelta = vdupq_n_f32(delta);
+            for (k = 0; k + 4 <= head_k_dim; k += 4)
+                vst1q_f32(row + k, vmlaq_f32(vld1q_f32(row + k),
+                                             vld1q_f32(kh + k), vdelta));
+            for (; k < head_k_dim; k++)
+                row[k] += kh[k] * delta;
+
+            acc = vdupq_n_f32(0.0f);
+            for (k = 0; k + 4 <= head_k_dim; k += 4)
+                acc = vmlaq_f32(acc, vld1q_f32(row + k), vld1q_f32(qh + k));
+            float sum = bn_transformer_neon_hsum_f32(acc);
+            for (; k < head_k_dim; k++)
+                sum += row[k] * qh[k];
+            oh[v] = sum * q_scale;
         }
     }
 }

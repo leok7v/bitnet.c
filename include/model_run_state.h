@@ -18,7 +18,7 @@ typedef struct {
     uint8_t *value_cache_tq;      // [n_attn_layers * seq_len * n_kv_heads * val_bytes]
     float *q_rotated;             // [n_heads * head_size] scratch for rotated queries
     // SSM state (NULL if no SSM layers)
-    float *ssm_state;             // [n_ssm * num_v_heads * head_k_dim * head_v_dim]
+    float *ssm_state;             // [n_ssm][num_v_heads][head_v_dim][head_k_dim]
     float *ssm_conv_state;        // [n_ssm * (conv_kernel-1) * conv_dim]
 } BnRunState;
 

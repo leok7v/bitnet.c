@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <ctype.h>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -39,6 +40,7 @@
 typedef struct {
     const char *model_path;
     const char *prompt;
+    const char *prompt_token_ids;
     int n_tokens;
     float temperature;
     float topp;
@@ -101,6 +103,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s <model.gguf> [options]\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -p <prompt>     Input prompt (default: \"Hello\")\n");
+    fprintf(stderr, "  --prompt-token-ids <ids>  Comma-separated prompt token IDs for parity debugging\n");
     fprintf(stderr, "  -n <int>        Number of tokens to generate (default: 256)\n");
     fprintf(stderr, "  --temp <float>  Temperature (default: 0.0 = greedy)\n");
     fprintf(stderr, "  --topp <float>  Top-p sampling (default: 0.9)\n");
@@ -160,6 +163,40 @@ static float parse_float(const char *s, const char *name) {
     return val;
 }
 
+static int parse_prompt_token_ids(const char *s, int *tokens, int cap) {
+    if (!s || !*s)
+        return -1;
+
+    int count = 0;
+    const char *p = s;
+    while (1) {
+        while (isspace((unsigned char)*p))
+            p++;
+        if (*p == '\0')
+            return count > 0 ? count : -1;
+
+        char *end = NULL;
+        long val = strtol(p, &end, 10);
+        if (end == p || val < 0 || val > INT_MAX)
+            return -1;
+        if (tokens) {
+            if (count >= cap)
+                return -1;
+            tokens[count] = (int)val;
+        }
+        count++;
+
+        p = end;
+        while (isspace((unsigned char)*p))
+            p++;
+        if (*p == '\0')
+            return count;
+        if (*p != ',')
+            return -1;
+        p++;
+    }
+}
+
 static CLIArgs parse_args(int argc, char **argv) {
     CLIArgs args = {0};
     args.prompt = "Hello";
@@ -188,6 +225,8 @@ static CLIArgs parse_args(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             args.prompt = argv[++i];
+        } else if (strcmp(argv[i], "--prompt-token-ids") == 0 && i + 1 < argc) {
+            args.prompt_token_ids = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             args.n_tokens = parse_int(argv[++i], "-n");
         } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
@@ -312,6 +351,11 @@ static CLIArgs parse_args(int argc, char **argv) {
             print_usage(argv[0]);
             exit(1);
         }
+    }
+
+    if (args.chat && args.prompt_token_ids) {
+        fprintf(stderr, "--prompt-token-ids is only supported in single-shot mode\n");
+        exit(1);
     }
 
     return args;
@@ -1177,7 +1221,18 @@ int main(int argc, char **argv) {
         bn_prompt_cache_free(prompt_cache);
     } else {
         // --- Single-shot generation ---
-        int max_prompt_tokens = (int)strlen(args.prompt) + 3;
+        int max_prompt_tokens = args.prompt_token_ids
+            ? parse_prompt_token_ids(args.prompt_token_ids, NULL, 0)
+            : (int)strlen(args.prompt) + 3;
+        if (max_prompt_tokens <= 0) {
+            fprintf(stderr, "Invalid value for --prompt-token-ids: %s\n",
+                    args.prompt_token_ids ? args.prompt_token_ids : "");
+            bn_sampler_free(&sampler);
+            bn_tokenizer_free(&tokenizer);
+            bn_model_free(&model);
+            bn_gguf_free(gf);
+            return 1;
+        }
         int *prompt_tokens = (int *)malloc(max_prompt_tokens * sizeof(int));
         if (!prompt_tokens) {
             SH_LOG_ERROR("Failed to allocate prompt token buffer");
@@ -1187,9 +1242,37 @@ int main(int argc, char **argv) {
             bn_gguf_free(gf);
             return 1;
         }
-        int add_bos = args.prompt_bos && tokenizer.add_bos;
-        int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, add_bos,
-                                        prompt_tokens, max_prompt_tokens);
+        int n_prompt = 0;
+        if (args.prompt_token_ids) {
+            n_prompt = parse_prompt_token_ids(args.prompt_token_ids,
+                                              prompt_tokens, max_prompt_tokens);
+            if (n_prompt != max_prompt_tokens) {
+                fprintf(stderr, "Invalid value for --prompt-token-ids: %s\n",
+                        args.prompt_token_ids);
+                free(prompt_tokens);
+                bn_sampler_free(&sampler);
+                bn_tokenizer_free(&tokenizer);
+                bn_model_free(&model);
+                bn_gguf_free(gf);
+                return 1;
+            }
+            for (int i = 0; i < n_prompt; i++) {
+                if (prompt_tokens[i] >= cfg->vocab_size) {
+                    fprintf(stderr, "Prompt token ID out of range: %d\n",
+                            prompt_tokens[i]);
+                    free(prompt_tokens);
+                    bn_sampler_free(&sampler);
+                    bn_tokenizer_free(&tokenizer);
+                    bn_model_free(&model);
+                    bn_gguf_free(gf);
+                    return 1;
+                }
+            }
+        } else {
+            int add_bos = args.prompt_bos && tokenizer.add_bos;
+            n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, add_bos,
+                                           prompt_tokens, max_prompt_tokens);
+        }
         {
             char np[16]; snprintf(np, sizeof(np), "%d", n_prompt);
             SH_LOG_INFO("Prompt encoded", "n_tokens", np);

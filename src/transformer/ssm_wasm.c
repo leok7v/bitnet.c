@@ -87,82 +87,56 @@ void bn_transformer_ssm_delta_wasm_range(void *ctx, int start, int end) {
         float decay = c->alpha[hv];
         float beta = c->beta[hv];
 
-        // --- Pass 0: Decay state S *= decay ---
-        v128_t vdecay = wasm_f32x4_splat(decay);
-        int n_state = head_k_dim * head_v_dim;
-        for (int i = 0; i < n_state; i += 8) {
-            wasm_v128_store(S + i,     wasm_f32x4_mul(wasm_v128_load(S + i),     vdecay));
-            wasm_v128_store(S + i + 4, wasm_f32x4_mul(wasm_v128_load(S + i + 4), vdecay));
-        }
-
-        // --- Pass 1: sk = S @ k ---
-        float sk[head_v_dim];
-        {
-            v128_t kv = wasm_f32x4_splat(kh[0]);
-            float *row = S;
-            for (int v = 0; v < head_v_dim; v += 8) {
-                wasm_v128_store(sk + v,     wasm_f32x4_mul(wasm_v128_load(row + v),     kv));
-                wasm_v128_store(sk + v + 4, wasm_f32x4_mul(wasm_v128_load(row + v + 4), kv));
-            }
-        }
-        for (int k = 1; k < head_k_dim; k++) {
-            v128_t kv = wasm_f32x4_splat(kh[k]);
-            float *row = S + (size_t)k * head_v_dim;
-            for (int v = 0; v < head_v_dim; v += 8) {
-#ifdef __wasm_relaxed_simd__
-                wasm_v128_store(sk + v,     wasm_f32x4_relaxed_madd(wasm_v128_load(row + v),     kv, wasm_v128_load(sk + v)));
-                wasm_v128_store(sk + v + 4, wasm_f32x4_relaxed_madd(wasm_v128_load(row + v + 4), kv, wasm_v128_load(sk + v + 4)));
-#else
-                wasm_v128_store(sk + v,     wasm_f32x4_add(wasm_v128_load(sk + v),     wasm_f32x4_mul(wasm_v128_load(row + v),     kv)));
-                wasm_v128_store(sk + v + 4, wasm_f32x4_add(wasm_v128_load(sk + v + 4), wasm_f32x4_mul(wasm_v128_load(row + v + 4), kv)));
-#endif
-            }
-        }
-
-        // --- Compute delta = beta * (v - sk) in-place over sk ---
-        v128_t vbeta = wasm_f32x4_splat(beta);
-        for (int v = 0; v < head_v_dim; v += 8) {
-            wasm_v128_store(sk + v,     wasm_f32x4_mul(vbeta, wasm_f32x4_sub(wasm_v128_load(vh + v),     wasm_v128_load(sk + v))));
-            wasm_v128_store(sk + v + 4, wasm_f32x4_mul(vbeta, wasm_f32x4_sub(wasm_v128_load(vh + v + 4), wasm_v128_load(sk + v + 4))));
-        }
-
-        // --- Pass 2: State update S[k][v] += kh[k] * delta[v] ---
-        for (int k = 0; k < head_k_dim; k++) {
-            v128_t kv = wasm_f32x4_splat(kh[k]);
-            float *row = S + (size_t)k * head_v_dim;
-            for (int v = 0; v < head_v_dim; v += 8) {
-#ifdef __wasm_relaxed_simd__
-                wasm_v128_store(row + v,     wasm_f32x4_relaxed_madd(kv, wasm_v128_load(sk + v),     wasm_v128_load(row + v)));
-                wasm_v128_store(row + v + 4, wasm_f32x4_relaxed_madd(kv, wasm_v128_load(sk + v + 4), wasm_v128_load(row + v + 4)));
-#else
-                wasm_v128_store(row + v,     wasm_f32x4_add(wasm_v128_load(row + v),     wasm_f32x4_mul(kv, wasm_v128_load(sk + v))));
-                wasm_v128_store(row + v + 4, wasm_f32x4_add(wasm_v128_load(row + v + 4), wasm_f32x4_mul(kv, wasm_v128_load(sk + v + 4))));
-#endif
-            }
-        }
-
-        // --- Pass 3: Read output o = S^T @ q * q_scale ---
+        // State is transposed: S[v][k] stores the mathematical state[k][v].
         float *oh = c->out + hv * head_v_dim;
-        {
-            v128_t qv = wasm_f32x4_splat(qh[0] * q_scale);
-            float *row = S;
-            for (int v = 0; v < head_v_dim; v += 8) {
-                wasm_v128_store(oh + v,     wasm_f32x4_mul(wasm_v128_load(row + v),     qv));
-                wasm_v128_store(oh + v + 4, wasm_f32x4_mul(wasm_v128_load(row + v + 4), qv));
-            }
-        }
-        for (int k = 1; k < head_k_dim; k++) {
-            v128_t qv = wasm_f32x4_splat(qh[k] * q_scale);
-            float *row = S + (size_t)k * head_v_dim;
-            for (int v = 0; v < head_v_dim; v += 8) {
+        for (int v = 0; v < head_v_dim; v++) {
+            float *row = S + (size_t)v * head_k_dim;
+            v128_t acc = wasm_f32x4_splat(0.0f);
+            v128_t vdecay = wasm_f32x4_splat(decay);
+            int k = 0;
+            for (; k + 4 <= head_k_dim; k += 4) {
+                v128_t r = wasm_f32x4_mul(wasm_v128_load(row + k), vdecay);
+                wasm_v128_store(row + k, r);
 #ifdef __wasm_relaxed_simd__
-                wasm_v128_store(oh + v,     wasm_f32x4_relaxed_madd(wasm_v128_load(row + v),     qv, wasm_v128_load(oh + v)));
-                wasm_v128_store(oh + v + 4, wasm_f32x4_relaxed_madd(wasm_v128_load(row + v + 4), qv, wasm_v128_load(oh + v + 4)));
+                acc = wasm_f32x4_relaxed_madd(r, wasm_v128_load(kh + k), acc);
 #else
-                wasm_v128_store(oh + v,     wasm_f32x4_add(wasm_v128_load(oh + v),     wasm_f32x4_mul(wasm_v128_load(row + v),     qv)));
-                wasm_v128_store(oh + v + 4, wasm_f32x4_add(wasm_v128_load(oh + v + 4), wasm_f32x4_mul(wasm_v128_load(row + v + 4), qv)));
+                acc = wasm_f32x4_add(acc, wasm_f32x4_mul(r, wasm_v128_load(kh + k)));
 #endif
             }
+            float sk = bn_wasm_hsum_f32x4(acc);
+            for (; k < head_k_dim; k++) {
+                row[k] *= decay;
+                sk += row[k] * kh[k];
+            }
+            float delta = (vh[v] - sk) * beta;
+            v128_t vdelta = wasm_f32x4_splat(delta);
+            for (k = 0; k + 4 <= head_k_dim; k += 4) {
+#ifdef __wasm_relaxed_simd__
+                wasm_v128_store(row + k, wasm_f32x4_relaxed_madd(
+                    wasm_v128_load(kh + k), vdelta, wasm_v128_load(row + k)));
+#else
+                wasm_v128_store(row + k, wasm_f32x4_add(
+                    wasm_v128_load(row + k),
+                    wasm_f32x4_mul(wasm_v128_load(kh + k), vdelta)));
+#endif
+            }
+            for (; k < head_k_dim; k++)
+                row[k] += kh[k] * delta;
+
+            acc = wasm_f32x4_splat(0.0f);
+            for (k = 0; k + 4 <= head_k_dim; k += 4) {
+#ifdef __wasm_relaxed_simd__
+                acc = wasm_f32x4_relaxed_madd(wasm_v128_load(row + k),
+                                               wasm_v128_load(qh + k), acc);
+#else
+                acc = wasm_f32x4_add(acc, wasm_f32x4_mul(wasm_v128_load(row + k),
+                                                         wasm_v128_load(qh + k)));
+#endif
+            }
+            float sum = bn_wasm_hsum_f32x4(acc);
+            for (; k < head_k_dim; k++)
+                sum += row[k] * qh[k];
+            oh[v] = sum * q_scale;
         }
     }
 }

@@ -956,25 +956,9 @@ int bn_transformer_gpu_upload_ssm_state(BnModel *m, BnSession *sess) {
 
     size_t state_values = (size_t)n_ssm * (size_t)num_v_heads *
                           (size_t)head_k_dim * (size_t)head_v_dim;
-    float *gpu_state = (float *)malloc(state_values * sizeof(float));
-    if (!gpu_state) return -1;
-    for (int l = 0; l < n_ssm; l++) {
-        for (int hv = 0; hv < num_v_heads; hv++) {
-            size_t base = ((size_t)l * (size_t)num_v_heads +
-                           (size_t)hv) *
-                          (size_t)head_k_dim * (size_t)head_v_dim;
-            const float *src = s->ssm_state + base;
-            float *dst = gpu_state + base;
-            for (int k = 0; k < head_k_dim; k++)
-                for (int v = 0; v < head_v_dim; v++)
-                    dst[(size_t)v * (size_t)head_k_dim + (size_t)k] =
-                        src[(size_t)k * (size_t)head_v_dim + (size_t)v];
-        }
-    }
     int rc = gpu->write_activation(gpu->ctx, BN_GPU_VALUE_SSM_STATE,
-                                   gpu_state,
+                                   s->ssm_state,
                                    state_values * sizeof(float), 0);
-    free(gpu_state);
     if (rc != 0) return -1;
 
     size_t conv_values = (size_t)n_ssm * (size_t)(kern - 1) *

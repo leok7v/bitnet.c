@@ -83,6 +83,12 @@ static int moe_try_gpu_serial_expert(BnModel *m, BnSession *sess,
     return 0;
 }
 
+static uint32_t moe_kquant_gateup_flags(const BnConfig *c) {
+    return (c && (c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN2MOE))
+        ? BN_MATVEC_TASK_FORCE_FLOAT_KQUANT
+        : 0u;
+}
+
 // Full MoE FFN block
 void bn_moe_forward(struct BnModel *m, BnSession *sess,
                     struct BnLayerWeights *lw, int l) {
@@ -96,6 +102,7 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
     int moe_hidden = c->moe_intermediate_size;
     int exact_silu = c->moe_exact_silu;
     int K = c->n_experts_active;
+    uint32_t gateup_flags = moe_kquant_gateup_flags(c);
     double t0;
 
     // 1. RMSNorm input
@@ -158,8 +165,8 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
             BnMatvecTask gu_tasks[2 * BN_MAX_MOE_K + 2];
             int n_gu = 0;
             for (int k = 0; k < valid_k; k++) {
-                gu_tasks[n_gu++] = (BnMatvecTask){ ms->expert_hb_batch[k],  &wgates[k], NULL, 0 };
-                gu_tasks[n_gu++] = (BnMatvecTask){ ms->expert_hb2_batch[k], &wups[k]  , NULL, 0 };
+                gu_tasks[n_gu++] = (BnMatvecTask){ ms->expert_hb_batch[k],  &wgates[k], NULL, gateup_flags };
+                gu_tasks[n_gu++] = (BnMatvecTask){ ms->expert_hb2_batch[k], &wups[k]  , NULL, gateup_flags };
             }
             if (c->has_shared_expert && lw->shared.shared_gate.data) {
                 int batch_type = gu_tasks[0].W->type;
@@ -179,8 +186,8 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
                 }
 #endif
                 if (can_batch_shared) {
-                    gu_tasks[n_gu++] = (BnMatvecTask){ s->hb,  &lw->shared.shared_gate, NULL, 0 };
-                    gu_tasks[n_gu++] = (BnMatvecTask){ s->hb2, &lw->shared.shared_up  , NULL, 0 };
+                    gu_tasks[n_gu++] = (BnMatvecTask){ s->hb,  &lw->shared.shared_gate, NULL, gateup_flags };
+                    gu_tasks[n_gu++] = (BnMatvecTask){ s->hb2, &lw->shared.shared_up  , NULL, gateup_flags };
                     shared_gu_ready = 1;
                 }
             }
@@ -340,8 +347,8 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
                                               map->gate_rows, map->gate_cols);
                 wups[h]   = bn_moe_make_qweight(cp + bn_moe_cache_gate_bytes(cache), map->up_type,
                                               map->up_rows, map->up_cols);
-                gu_tasks[2*h]     = (BnMatvecTask){ ms->expert_hb_batch[h],  &wgates[h], NULL, 0 };
-                gu_tasks[2*h + 1] = (BnMatvecTask){ ms->expert_hb2_batch[h], &wups[h]  , NULL, 0 };
+                gu_tasks[2*h]     = (BnMatvecTask){ ms->expert_hb_batch[h],  &wgates[h], NULL, gateup_flags };
+                gu_tasks[2*h + 1] = (BnMatvecTask){ ms->expert_hb2_batch[h], &wups[h]  , NULL, gateup_flags };
             }
             bn_quant_matvec_batch(gu_tasks, 2 * n_hits, s->xb, s->x_q, bn_model_pool(m));
             ms->stats.gate_up_time_ms += bn_moe_time_ms() - t0;
@@ -466,8 +473,8 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
                 BnQWeight wup = bn_moe_make_qweight(up_ptr, map->up_type,
                                                   map->up_rows, map->up_cols);
                 BnMatvecTask gu[2] = {
-                     { ms->expert_hb,  &wgate, NULL, 0 },
-                     { ms->expert_hb2, &wup  , NULL, 0 },
+                     { ms->expert_hb,  &wgate, NULL, gateup_flags },
+                     { ms->expert_hb2, &wup  , NULL, gateup_flags },
                 };
                 bn_quant_matvec_batch(gu, 2, s->xb, s->x_q, bn_model_pool(m));
             }
@@ -532,8 +539,8 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
             BnQWeight wup = bn_moe_make_qweight(up_data, lw->moe.expert_map.up_type,
                                               lw->moe.expert_map.up_rows, lw->moe.expert_map.up_cols);
             BnMatvecTask gu[2] = {
-                 { ms->expert_hb,  &wgate, NULL, 0 },
-                 { ms->expert_hb2, &wup  , NULL, 0 },
+                 { ms->expert_hb,  &wgate, NULL, gateup_flags },
+                 { ms->expert_hb2, &wup  , NULL, gateup_flags },
             };
             bn_quant_matvec_batch(gu, 2, s->xb, s->x_q, bn_model_pool(m));
             ms->stats.gate_up_time_ms += bn_moe_time_ms() - t0;
@@ -570,8 +577,8 @@ void bn_moe_forward(struct BnModel *m, BnSession *sess,
 
         if (!shared_gu_ready) {
             BnMatvecTask shared_gu[2] = {
-                 { s->hb,  &lw->shared.shared_gate, NULL, 0 },
-                 { s->hb2, &lw->shared.shared_up  , NULL, 0 },
+                 { s->hb,  &lw->shared.shared_gate, NULL, gateup_flags },
+                 { s->hb2, &lw->shared.shared_up  , NULL, gateup_flags },
             };
             bn_quant_matvec_batch(shared_gu, 2, s->xb, s->x_q, bn_model_pool(m));
         }

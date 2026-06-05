@@ -13,8 +13,10 @@ import urllib.request
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(allow_abbrev=False)
     p.add_argument("model")
+    p.add_argument("--bitnet", default="./bitnet",
+                   help="bitnet executable to compare")
     p.add_argument("--llama-server", default="llama-server")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8027)
@@ -23,7 +25,15 @@ def parse_args():
     p.add_argument("--np", type=int, default=1)
     p.add_argument("--batch", type=int)
     p.add_argument("--ubatch", type=int)
-    p.add_argument("--flash-attn", choices=("on", "off"), default="on")
+    p.add_argument("--llama-device",
+                   help="llama-server -dev value, e.g. 'none' for no offload")
+    p.add_argument("--llama-op-offload", choices=("on", "off"),
+                   help="llama-server op offload mode")
+    p.add_argument(
+        "--flash-attn",
+        choices=("on", "off"),
+        help="llama-server flash attention mode; defaults to matching compare --flash",
+    )
     p.add_argument("--cache-k")
     p.add_argument("--cache-v")
     p.add_argument("--timeout", type=float, default=180.0)
@@ -32,6 +42,8 @@ def parse_args():
     if compare_args and compare_args[0] == "--":
         compare_args = compare_args[1:]
     args.compare_args = compare_args
+    if args.flash_attn is None:
+        args.flash_attn = "on" if "--flash" in compare_args else "off"
     return args
 
 
@@ -94,6 +106,12 @@ def main():
         cmd += ["-b", str(args.batch)]
     if args.ubatch is not None:
         cmd += ["-ub", str(args.ubatch)]
+    if args.llama_device:
+        cmd += ["-dev", args.llama_device]
+    if args.llama_op_offload == "off":
+        cmd.append("--no-op-offload")
+    elif args.llama_op_offload == "on":
+        cmd.append("--op-offload")
 
     os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
     with open(args.log, "w", encoding="utf-8") as log:
@@ -109,6 +127,8 @@ def main():
                 sys.executable,
                 "test/compare_llama_topk.py",
                 args.model,
+                "--bitnet",
+                args.bitnet,
                 "--llama-server-url",
                 server_url,
             ] + compare_args

@@ -18,7 +18,7 @@ typedef struct {
 } BnSSML2NormCtx;
 
 typedef struct {
-    float *state, *out;
+    float *state, *out;       // state layout: [v_head][head_v_dim][head_k_dim]
     const float *q, *k;
     float *v;              // also temp for sk
     const float *alpha, *beta;

@@ -65,32 +65,28 @@ void bn_transformer_ssm_delta_scalar_range(void *ctx, int start, int end) {
         float decay = c->alpha[hv];
         float beta = c->beta[hv];
 
-        // Decay state
-        for (int i = 0; i < head_k_dim * head_v_dim; i++)
-            S[i] *= decay;
-
-        // sk = S @ k
-        float sk[head_v_dim];
+        // State is transposed: S[v][k] stores the mathematical state[k][v].
+        float delta[head_v_dim];
         for (int v = 0; v < head_v_dim; v++) {
+            float *row = S + (size_t)v * head_k_dim;
             float sum = 0;
             for (int k = 0; k < head_k_dim; k++)
-                sum += S[(size_t)k * head_v_dim + v] * kh[k];
-            sk[v] = sum;
+                row[k] *= decay;
+            for (int k = 0; k < head_k_dim; k++)
+                sum += row[k] * kh[k];
+            delta[v] = beta * (vh[v] - sum);
         }
 
-        // State update: S += k ⊗ (beta * (v - sk))
-        for (int k = 0; k < head_k_dim; k++) {
-            float kk = kh[k];
-            for (int v = 0; v < head_v_dim; v++)
-                S[(size_t)k * head_v_dim + v] += kk * beta * (vh[v] - sk[v]);
-        }
-
-        // Read output: o = S^T @ (q * q_scale)
+        // State update and read output in llama.cpp fused-GDN dot/mad order.
         float *oh = c->out + hv * head_v_dim;
         for (int v = 0; v < head_v_dim; v++) {
+            float *row = S + (size_t)v * head_k_dim;
+            float d = delta[v];
+            for (int k = 0; k < head_k_dim; k++)
+                row[k] += kh[k] * d;
             float sum = 0;
             for (int k = 0; k < head_k_dim; k++)
-                sum += S[(size_t)k * head_v_dim + v] * qh[k];
+                sum += row[k] * qh[k];
             oh[v] = sum * q_scale;
         }
     }
