@@ -5,6 +5,7 @@ Start a matching llama-server first, for example:
   llama-server -m model.gguf -ngl 99 -fa on -c 512 -np 1 --host 127.0.0.1 --port 8027
 
 With --benchmark, the default --min-throughput-ratio is 1.0.
+Use --check-output-tokens to also require exact generated token ID parity.
 """
 
 import argparse
@@ -34,6 +35,8 @@ def parse_args():
     p.add_argument("--prompt", action="append", dest="prompts")
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--min-overlap", type=int, default=3)
+    p.add_argument("--check-output-tokens", action="store_true")
+    p.add_argument("--output-tokens", type=int, default=8)
     p.add_argument("--maxseq", type=int, default=512)
     p.add_argument("-t", "--threads", type=int)
     p.add_argument("--kv16", action="store_true")
@@ -62,18 +65,7 @@ def parse_args():
     return p.parse_args()
 
 
-def run_bitnet_topk(args, prompt):
-    cmd = [
-        "./bitnet",
-        args.model,
-        "-p", prompt,
-        "-n", "1",
-        "--temp", "0",
-        "--repeat-penalty", "1",
-        "--quiet",
-        "--top-logits", str(args.top_k),
-        "--maxseq", str(args.maxseq),
-    ]
+def append_bitnet_common_args(cmd, args):
     if args.metal:
         cmd.append("--metal")
     if args.kv16:
@@ -108,6 +100,21 @@ def run_bitnet_topk(args, prompt):
     if args.metal_q4_prepared:
         cmd.append("--metal-q4-prepared")
 
+
+def run_bitnet_topk(args, prompt):
+    cmd = [
+        "./bitnet",
+        args.model,
+        "-p", prompt,
+        "-n", "1",
+        "--temp", "0",
+        "--repeat-penalty", "1",
+        "--quiet",
+        "--top-logits", str(args.top_k),
+        "--maxseq", str(args.maxseq),
+    ]
+    append_bitnet_common_args(cmd, args)
+
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, check=False)
     if proc.returncode != 0:
@@ -124,6 +131,80 @@ def run_bitnet_topk(args, prompt):
         raise RuntimeError(f"bitnet top-logit dump incomplete for prompt {prompt!r}")
     rows.sort()
     return rows
+
+
+def run_bitnet_tokens(args, prompt):
+    cmd = [
+        "./bitnet",
+        args.model,
+        "-p", prompt,
+        "-n", str(args.output_tokens),
+        "--temp", "0",
+        "--repeat-penalty", "1",
+        "--token-ids",
+        "--maxseq", str(args.maxseq),
+    ]
+    append_bitnet_common_args(cmd, args)
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr)
+    return [int(m.group(1))
+            for m in re.finditer(r"(?:^|\s)token_id=(\d+)", proc.stderr)]
+
+
+def extract_llama_token_ids(payload):
+    tokens = payload.get("tokens")
+    if isinstance(tokens, list):
+        ids = []
+        for row in tokens:
+            if isinstance(row, int):
+                ids.append(row)
+            elif isinstance(row, dict):
+                token_id = row.get("id", row.get("token_id"))
+                if token_id is not None:
+                    ids.append(int(token_id))
+            else:
+                return []
+        return ids
+
+    probs = payload.get("completion_probabilities") or []
+    ids = []
+    for row in probs:
+        if "id" in row:
+            ids.append(int(row["id"]))
+        elif "token" in row and isinstance(row["token"], dict):
+            token_id = row["token"].get("id", row["token"].get("token_id"))
+            if token_id is not None:
+                ids.append(int(token_id))
+    return ids
+
+
+def llama_tokens(server_url, prompt, n_tokens):
+    body = {
+        "prompt": prompt,
+        "n_predict": n_tokens,
+        "temperature": -1,
+        "repeat_penalty": 1.0,
+        "top_k": 0,
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "cache_prompt": False,
+        "return_tokens": True,
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        server_url.rstrip("/") + "/completion",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    ids = extract_llama_token_ids(payload)
+    if len(ids) < n_tokens:
+        raise RuntimeError(f"llama-server returned incomplete token IDs: {payload}")
+    return ids[:n_tokens]
 
 
 def llama_topk(server_url, prompt, top_k):
@@ -255,6 +336,9 @@ def main():
     if args.min_overlap > args.top_k:
         print("--min-overlap cannot exceed --top-k", file=sys.stderr)
         return 2
+    if args.output_tokens < 1:
+        print("--output-tokens must be positive", file=sys.stderr)
+        return 2
     if args.bench_runs < 1:
         print("--bench-runs must be positive", file=sys.stderr)
         return 2
@@ -263,6 +347,8 @@ def main():
     print(f"Model: {args.model}")
     print(f"llama-server: {args.llama_server_url}")
     print(f"Top-K: {args.top_k}, required overlap: {args.min_overlap}")
+    if args.check_output_tokens:
+        print(f"Output token parity: enabled, tokens: {args.output_tokens}")
     print("---")
 
     top1_matches = 0
@@ -289,6 +375,36 @@ def main():
     print("---")
     print(f"Top-1 matches: {top1_matches}/{len(prompts)}")
     print(f"Mean top-{args.top_k} overlap: {overlap_total / len(prompts):.2f}")
+
+    if args.check_output_tokens:
+        print("---")
+        token_prompts = 0
+        token_prefix_total = 0
+        token_prefix_compared = 0
+        for prompt in prompts:
+            bitnet_ids = run_bitnet_tokens(args, prompt)
+            llama_ids = llama_tokens(args.llama_server_url, prompt,
+                                     args.output_tokens)
+            token_prompts += 1
+            token_prefix = 0
+            for bitnet_id, llama_id in zip(bitnet_ids, llama_ids):
+                if bitnet_id != llama_id:
+                    break
+                token_prefix += 1
+            token_prefix_total += token_prefix
+            token_prefix_compared += min(len(bitnet_ids), len(llama_ids))
+            ok = (len(bitnet_ids) >= args.output_tokens and
+                  bitnet_ids[:args.output_tokens] == llama_ids)
+            failed += 0 if ok else 1
+            status = "PASS" if ok else "FAIL"
+            print(f"{status} {prompt!r}: token prefix "
+                  f"{token_prefix}/{args.output_tokens}")
+            if not ok:
+                print(f"  bitnet ids: {bitnet_ids[:args.output_tokens]}")
+                print(f"  llama  ids: {llama_ids}")
+        print(f"Generated token-ID prefix matches: "
+              f"{token_prefix_total}/{token_prefix_compared} tokens "
+              f"across {token_prompts} prompts")
 
     if args.benchmark:
         bitnet_samples = [run_bitnet_bench(args, prompts[0])
