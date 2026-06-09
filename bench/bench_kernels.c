@@ -569,12 +569,6 @@ static int bench_cuda_prefill_needs_decode_fallback(const BnConfig *c,
         getenv("BN_CUDA_ENABLE_QWEN2MOE_MOE_FFN") == NULL &&
         getenv("BN_CUDA_ENABLE_UNSAFE_MOE_FFN") == NULL)
         return 1;
-    if ((c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN3) &&
-        c->n_experts <= 0 &&
-        c->full_attn_interval <= 0 &&
-        c->dim <= 2560 &&
-        getenv("BN_CUDA_ENABLE_SMALL_KQUANT_NATIVE") == NULL)
-        return 1;
     if ((c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN) &&
         c->n_experts <= 0 &&
         c->full_attn_interval <= 0 &&

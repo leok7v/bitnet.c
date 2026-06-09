@@ -95,18 +95,6 @@ static int small_dense_cuda_q8_native_by_default(
     return 1;
 }
 
-static int small_dense_cuda_requires_kquant_opt_in(
-    const BnConfig *c,
-    const BnWeights *w) {
-    if (!c || !w)
-        return 0;
-    if (!(c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN3))
-        return 0;
-    if (small_dense_cuda_q8_native_by_default(c, w))
-        return 0;
-    return getenv("BN_CUDA_ENABLE_SMALL_KQUANT_NATIVE") == NULL;
-}
-
 void bn_transformer_gpu_report_fallback(const char *reason) {
     if (!getenv("BN_GPU_DEBUG_FALLBACK"))
         return;
@@ -173,9 +161,7 @@ int bn_transformer_gpu_validate_forward(
 
     if (gpu->kind == BN_GPU_BACKEND_CUDA && c->dim <= 2560 &&
         c->n_experts <= 0 && c->full_attn_interval <= 0) {
-        if (small_dense_cuda_requires_kquant_opt_in(c, w)) {
-            GPU_POLICY_REJECT("qwen3 small dense cuda kquant native disabled");
-        } else if (getenv("BN_CUDA_DISABLE_SMALL_KQUANT_NATIVE")) {
+        if (getenv("BN_CUDA_DISABLE_SMALL_KQUANT_NATIVE")) {
             if (!small_dense_cuda_q8_native_by_default(c, w))
                 GPU_POLICY_REJECT("small dense cuda graph disabled");
         } else if (!small_dense_cuda_native_by_default(c, w)) {
