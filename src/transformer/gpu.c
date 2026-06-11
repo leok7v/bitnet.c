@@ -33,6 +33,23 @@ static int gpu_cuda_qwen2moe_all2_q4q6_model(
     return 0;
 }
 
+static int gpu_cuda_large_hybrid_cpu_attn_safe_default(
+    const BnConfig *c,
+    const BnWeights *w) {
+    if (!c || !w || c->n_experts > 0 || c->dim < 4096 ||
+        getenv("BN_CUDA_ENABLE_LARGE_HYBRID_ATTN") != NULL ||
+        getenv("BN_CUDA_DISABLE_LARGE_HYBRID_CPU_ATTN_SAFE") != NULL)
+        return 0;
+    if (c->full_attn_interval > 0)
+        return 1;
+    for (int l = 0; l < c->n_layers; l++) {
+        const BnLayerWeights *lw = &w->layers[l];
+        if (lw->block_kind == BN_LAYER_BLOCK_ATTENTION && lw->ssm.wqkv.data)
+            return 1;
+    }
+    return 0;
+}
+
 static void gpu_debug_compare_vec_local(const char *label,
                                         int layer,
                                         int pos,
@@ -1147,14 +1164,24 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
     int small_qwen_q8_safe_cpu_attn =
         gpu->kind == BN_GPU_BACKEND_CUDA &&
         bn_transformer_gpu_cuda_small_qwen_q8_cpu_attn_safe_default(c, w);
+    int large_hybrid_safe_cpu_attn =
+        gpu->kind == BN_GPU_BACKEND_CUDA &&
+        gpu_cuda_large_hybrid_cpu_attn_safe_default(c, w);
     if (qwen2moe_safe_cpu_attn &&
         cpu_fallback_layer < 0 && cpu_fallback_from_layer < 0 &&
         cpu_fallback_attn_layer < 0 && cpu_fallback_attn_from_layer < 0)
-        cpu_fallback_attn_from_layer = c->n_layers > 1 ? 1 : 0;
+        cpu_fallback_attn_from_layer = 0;
     if (small_qwen_q8_safe_cpu_attn &&
         cpu_fallback_layer < 0 && cpu_fallback_from_layer < 0 &&
         cpu_fallback_attn_layer < 0 && cpu_fallback_attn_from_layer < 0)
         cpu_fallback_attn_from_layer = 0;
+    if (large_hybrid_safe_cpu_attn &&
+        cpu_fallback_layer < 0 && cpu_fallback_from_layer < 0 &&
+        cpu_fallback_attn_layer < 0 && cpu_fallback_attn_from_layer < 0)
+        cpu_fallback_attn_from_layer = 0;
+    if (argmax_token && large_hybrid_safe_cpu_attn &&
+        getenv("BN_CUDA_ENABLE_LARGE_HYBRID_ARGMAX") == NULL)
+        return NULL;
 
     // Embed token on CPU, upload to GPU x buffer.
     float emb[dim];
@@ -1494,9 +1521,9 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
                 dim <= 2048 &&
                 lw->moe.expert_map.gate_type == BN_GGUF_TENSOR_Q4_K &&
                 lw->moe.expert_map.up_type == BN_GGUF_TENSOR_Q4_K &&
-                lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q6_K &&
-                getenv("BN_CUDA_ENABLE_QWEN2MOE_FAST_MOE_FFN") == NULL &&
-                !qwen2moe_safe_cpu_attn;
+                (lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q6_K ||
+                 lw->moe.expert_map.down_type == BN_GGUF_TENSOR_Q4_K) &&
+                getenv("BN_CUDA_ENABLE_QWEN2MOE_FAST_MOE_FFN") == NULL;
             int use_cpu_moe_fallback =
                 gpu->kind != BN_GPU_BACKEND_CUDA ||
                 getenv("BN_CUDA_DISABLE_MOE_FFN") != NULL ||

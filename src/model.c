@@ -500,6 +500,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv
     w->emb_type = f->tensors[emb_idx].type;
     w->emb_out_i8 = NULL;
     w->emb_out_scales = NULL;
+    memset(&w->tied_embedding_weight, 0, sizeof(w->tied_embedding_weight));
 
     // Untied output weight (if present)
     memset(&w->output_weight, 0, sizeof(w->output_weight));
@@ -532,6 +533,15 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv
         } else {
             w->output_weight.scale = 1.0f;
         }
+    }
+    if (!w->output_weight.data && qweight_type_supported(w->emb_type) &&
+        w->emb_type != BN_GGUF_TENSOR_F16 &&
+        w->emb_type != BN_GGUF_TENSOR_F32) {
+        w->tied_embedding_weight.data = w->token_embedding;
+        w->tied_embedding_weight.type = w->emb_type;
+        w->tied_embedding_weight.rows = c->vocab_size;
+        w->tied_embedding_weight.cols = c->dim;
+        w->tied_embedding_weight.scale = 1.0f;
     }
 
     // #24: Output norm — must exist
@@ -975,6 +985,11 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv
                 char q4k_mb[16]; snprintf(q4k_mb, sizeof(q4k_mb), "%.0f",
                                            (double)built_stats.q4k_scale_bytes / (1024*1024));
                 SH_LOG_INFO("Q4_K scales prepared", "MB", q4k_mb);
+            }
+            if (built_stats.q6k_weight_bytes > 0) {
+                char q6k_mb[16]; snprintf(q6k_mb, sizeof(q6k_mb), "%.0f",
+                                           (double)built_stats.q6k_weight_bytes / (1024*1024));
+                SH_LOG_INFO("Q6_K weights expanded", "MB", q6k_mb);
             }
             if (built_stats.q8_scale_bytes > 0) {
                 char q8_mb[16]; snprintf(q8_mb, sizeof(q8_mb), "%.0f",

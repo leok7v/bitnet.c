@@ -314,7 +314,7 @@ void bn_quant_q5k_avx512_vnni_matmul_4row_range(void *ctx, int group_start, int 
 
             for (int r = 0; r < nrows; r++)
                 for (int ti = 0; ti < tile_n; ti++)
-                    c->out[(size_t)(t0 + ti) * rows + row0 + r] += acc[r][ti];
+                    c->out[(size_t)(t0 + ti) * rows + row0 + r] = acc[r][ti];
         }
     }
 }

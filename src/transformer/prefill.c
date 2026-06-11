@@ -37,6 +37,9 @@ typedef struct {
     double wo_ms;
     double ffn_norm_ms;
     double ffn_ms;
+    double ffn_gateup_ms;
+    double ffn_act_ms;
+    double ffn_down_ms;
     double residual_ms;
     double logits_ms;
 } BnPrefillProfile;
@@ -1412,6 +1415,13 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
         return prefill_decode_tokens(m, sess, tokens, n_tokens, pos0,
                                      all_logits, need_last_logits);
     }
+    if (cuda_hybrid_prefill &&
+        c->n_experts <= 0 &&
+        c->dim >= 4096 &&
+        getenv("BN_CUDA_ENABLE_LARGE_HYBRID_PREFILL") == NULL) {
+        return prefill_decode_tokens(m, sess, tokens, n_tokens, pos0,
+                                     all_logits, need_last_logits);
+    }
     if (c->full_attn_interval > 0 && c->ssm_inner_size > 0 &&
         !cuda_hybrid_prefill && !getenv("BN_PREFILL_ALLOW_HYBRID_BATCH")) {
         float *logits = NULL;
@@ -1473,7 +1483,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
 #ifdef __AVX2__
     int n_bpr_pf = (dim % BN_QK_K == 0) ? dim / BN_QK_K : 0;
     if (n_bpr_pf > 0)
-        arena_size += nt * dim
+        arena_size += nt * (size_t)dim
                     + nt * n_bpr_pf * sizeof(float)
                     + nt * n_bpr_pf * 16 * sizeof(int16_t);
 #endif
@@ -1496,7 +1506,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
     float *pf_xd = NULL;
     int16_t *pf_xbs = NULL;
     if (n_bpr_pf > 0) {
-        pf_xq = (int8_t *)sh_arena_alloc(pf_arena, nt * dim);
+        pf_xq = (int8_t *)sh_arena_alloc(pf_arena, nt * (size_t)dim);
         pf_xd = (float *)sh_arena_alloc(pf_arena, nt * n_bpr_pf * sizeof(float));
         pf_xbs = (int16_t *)sh_arena_alloc(pf_arena, nt * n_bpr_pf * 16 * sizeof(int16_t));
         if (!pf_xq || !pf_xd || !pf_xbs)
@@ -1933,6 +1943,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
 #ifdef __AVX2__
             if (pf_xq && !bn_model_gpu(m) &&
                 prefill_quant_can_preq8k_triple(lw->attn.wq.type, lw->attn.wk.type, lw->attn.wv.type)) {
+                t_prof = prefill_profile_now(&prof);
                 int n_bpr = dim / BN_QK_K;
                 for (int t = 0; t < n_tokens; t++)
                     bn_quant_x_to_q8k(Xb + (size_t)t * dim,
@@ -1946,6 +1957,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                                        n_tokens, pf_xq, pf_xd,
                                                        pf_xbs, Xb);
                 }
+                prefill_profile_add(&prof.qkv_ms, t_prof);
             } else
 #endif
             {
@@ -2460,6 +2472,7 @@ prefill_ssm_done:
                                                 0.0f, 0) == 0) {
                     used_gpu_batch_ffn = 1;
                 } else if (c->has_ffn_gate) {
+                    double t_ffn_step = prefill_profile_now(&prof);
 #ifdef __AVX2__
                 if (pf_xq && !bn_model_gpu(m) &&
                     prefill_quant_can_preq8k_pair(lw->ffn.ffn_gate.type, lw->ffn.ffn_up.type)) {
@@ -2469,13 +2482,11 @@ prefill_ssm_done:
                                           pf_xq + (size_t)t * dim,
                                           pf_xd + (size_t)t * n_bpr,
                                           pf_xbs + (size_t)t * n_bpr * 16, dim);
-                    {
-                        float *gu_out[2] = { Hb, Hb2 };
-                        const BnQWeight *gu_w[2] = { &lw->ffn.ffn_gate, &lw->ffn.ffn_up };
-                        prefill_quant_matmul_preq8k_multi(m, gu_out, gu_w, 2,
-                                                           n_tokens, pf_xq,
-                                                           pf_xd, pf_xbs, Xb);
-                    }
+                    float *gu_out[2] = { Hb, Hb2 };
+                    const BnQWeight *gu_w[2] = { &lw->ffn.ffn_gate, &lw->ffn.ffn_up };
+                    prefill_quant_matmul_preq8k_multi(m, gu_out, gu_w, 2,
+                                                       n_tokens, pf_xq,
+                                                       pf_xd, pf_xbs, Xb);
                 } else
 #endif
                 {
@@ -2486,15 +2497,22 @@ prefill_ssm_done:
                     prefill_quant_matmul_multi(m, gu_out, gu_w, 2, Xb,
                                                n_tokens, s->x_q);
                 }
+                prefill_profile_add(&prof.ffn_gateup_ms, t_ffn_step);
 
+                t_ffn_step = prefill_profile_now(&prof);
                 BnPrefillFFNActCtx act_ctx = { Hb, Hb2, hidden_dim, c->act_type };
                 BnTPTask act_task = { prefill_ffn_activation_range, &act_ctx, n_tokens };
                 bn_tp_dispatch(bn_model_pool(m), &act_task, 1);
+                prefill_profile_add(&prof.ffn_act_ms, t_ffn_step);
             } else {
+                double t_ffn_step = prefill_profile_now(&prof);
                 prefill_quant_matmul_gpu(m, Hb, &lw->ffn.ffn_up, Xb, n_tokens, s->x_q);
+                prefill_profile_add(&prof.ffn_gateup_ms, t_ffn_step);
+                t_ffn_step = prefill_profile_now(&prof);
                 BnPrefillFFNActCtx act_ctx = { Hb, NULL, hidden_dim, c->act_type };
                 BnTPTask act_task = { prefill_ffn_activation_range, &act_ctx, n_tokens };
                 bn_tp_dispatch(bn_model_pool(m), &act_task, 1);
+                prefill_profile_add(&prof.ffn_act_ms, t_ffn_step);
                 }
             }
 
@@ -2506,8 +2524,10 @@ prefill_ssm_done:
                                         lw->norm.ffn_sub_norm, hidden_dim,
                                         c->norm_eps);
 
+                double t_ffn_step = prefill_profile_now(&prof);
                 prefill_quant_matmul_gpu(m, Xb, &lw->ffn.ffn_down, Hb,
                                          n_tokens, s->x_q);
+                prefill_profile_add(&prof.ffn_down_ms, t_ffn_step);
                 if ((c->arch_flags & BN_MODEL_ARCH_FLAG_GEMMA4) &&
                     lw->norm.ffn_post_norm)
                     for (int t = 0; t < n_tokens; t++)
@@ -2552,10 +2572,11 @@ prefill_layers_done:
         prefill_profile_add(&prof.logits_ms, t_prof);
         if (prof.enabled) {
             fprintf(stderr,
-                    "[bn:prefill:profile] tokens=%d layers=%d embed=%.3f attn_norm=%.3f qkv=%.3f attn_cpu=%.3f wo=%.3f ffn_norm=%.3f ffn=%.3f residual=%.3f logits=%.3f\n",
+                    "[bn:prefill:profile] tokens=%d layers=%d embed=%.3f attn_norm=%.3f qkv=%.3f attn_cpu=%.3f wo=%.3f ffn_norm=%.3f ffn=%.3f gateup=%.3f act=%.3f down=%.3f residual=%.3f logits=%.3f\n",
                     n_tokens, c->n_layers, prof.embed_ms, prof.attn_norm_ms,
                     prof.qkv_ms, prof.attn_cpu_ms, prof.wo_ms,
-                    prof.ffn_norm_ms, prof.ffn_ms, prof.residual_ms,
+                    prof.ffn_norm_ms, prof.ffn_ms, prof.ffn_gateup_ms,
+                    prof.ffn_act_ms, prof.ffn_down_ms, prof.residual_ms,
                     prof.logits_ms);
         }
         sh_arena_free(pf_arena);
@@ -2564,10 +2585,11 @@ prefill_layers_done:
 
     if (prof.enabled) {
         fprintf(stderr,
-                "[bn:prefill:profile] tokens=%d layers=%d embed=%.3f attn_norm=%.3f qkv=%.3f attn_cpu=%.3f wo=%.3f ffn_norm=%.3f ffn=%.3f residual=%.3f logits=%.3f\n",
+                "[bn:prefill:profile] tokens=%d layers=%d embed=%.3f attn_norm=%.3f qkv=%.3f attn_cpu=%.3f wo=%.3f ffn_norm=%.3f ffn=%.3f gateup=%.3f act=%.3f down=%.3f residual=%.3f logits=%.3f\n",
                 n_tokens, c->n_layers, prof.embed_ms, prof.attn_norm_ms,
                 prof.qkv_ms, prof.attn_cpu_ms, prof.wo_ms,
-                prof.ffn_norm_ms, prof.ffn_ms, prof.residual_ms,
+                prof.ffn_norm_ms, prof.ffn_ms, prof.ffn_gateup_ms,
+                prof.ffn_act_ms, prof.ffn_down_ms, prof.residual_ms,
                 prof.logits_ms);
     }
     memcpy(s->x, act + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));

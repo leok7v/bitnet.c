@@ -107,6 +107,15 @@ typedef struct {
     uint8_t  qs[BN_QK_K / 2];   // 128 bytes: 4-bit quants (0-15)
 } BnBlockQ4K;                    // 144 bytes total
 
+// Runtime Q4_K layout interleaving 8 output rows for CPU prompt matmul.
+// This mirrors llama.cpp's Q4_Kx8 repack and is not a GGUF disk format.
+typedef struct {
+    uint16_t d[8];
+    uint16_t dmin[8];
+    uint8_t scales[96];
+    uint8_t qs[1024];
+} BnBlockQ4Kx8;
+
 // Q5_K: 5-bit k-quant, 256 elements per block
 // 2 bytes d + 2 bytes dmin + 12 bytes scales + 32 bytes qh + 128 bytes qs = 176 bytes
 typedef struct {
@@ -125,6 +134,12 @@ typedef struct {
     int8_t  scales[BN_QK_K / 16]; // 16 bytes: 8-bit sub-block scales
     uint16_t d;                  //   2 bytes: FP16 super-block scale
 } BnBlockQ6K;                    // 210 bytes total
+
+typedef struct {
+    float d;
+    int8_t scales[BN_QK_K / 16];
+    uint8_t qs[BN_QK_K];
+} BnBlockQ6KPrepared;
 
 // Q8_K: 8-bit k-quant, 256 elements per block
 // 4 bytes d (float32!) + 256 bytes qs + 32 bytes bsums = 292 bytes
@@ -197,13 +212,16 @@ typedef enum {
     BN_PREPARED_WEIGHT_Q4_0_REPACK = 1,
     BN_PREPARED_WEIGHT_Q8_0_F32_SCALES = 2,
     BN_PREPARED_WEIGHT_Q4_K_SCALES = 3,
+    BN_PREPARED_WEIGHT_Q6_K_EXPANDED = 4,
 } BnPreparedWeightKind;
 
 // Backend/runtime-prepared layout for a quantized weight tensor.
 typedef struct BnPreparedWeight {
     uint16_t *scales;
     uint8_t *qs;
+    uint8_t *aux;
     float *f32_scales;
+    size_t aux_size;
     BnPreparedWeightKind kind;
 } BnPreparedWeight;
 
@@ -291,6 +309,10 @@ float    bn_bf16_to_fp32(uint16_t h);
 void     bn_quant_dequant_i2s(const uint8_t *data, float *out, int n, float scale);
 void     bn_quant_matvec(float *out, const BnQWeight *W, const float *x,
                          int8_t *x_q_buf, BnThreadPool *pool);
+void     bn_quant_matvec_prepared(float *out, const BnQWeight *W,
+                                  const BnPreparedWeight *prepared,
+                                  const float *x, int8_t *x_q_buf,
+                                  BnThreadPool *pool);
 
 // Batch matvec: run multiple independent matvecs with a single dispatch
 #define BN_MATVEC_TASK_FORCE_FLOAT_KQUANT 1u

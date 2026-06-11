@@ -187,7 +187,7 @@ void bn_quant_q6k_avx2_sdot_matmul_range(void *ctx, int row_start, int row_end) 
             }
 
             for (int ti = 0; ti < tile_n; ti++)
-                c->out[(size_t)(t0 + ti) * rows + row] += acc[ti];
+                c->out[(size_t)(t0 + ti) * rows + row] = acc[ti];
         }
     }
 }

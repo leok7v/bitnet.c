@@ -33,6 +33,12 @@ static int cuda_prefill_needs_decode_fallback(const BnModel *m,
         c->dim <= 2560 &&
         getenv("BN_CUDA_DISABLE_SMALL_QWEN_PREFILL") != NULL)
         return 1;
+    if (c->n_experts <= 0 &&
+        c->full_attn_interval > 0 &&
+        c->ssm_inner_size > 0 &&
+        c->dim >= 4096 &&
+        getenv("BN_CUDA_ENABLE_LARGE_HYBRID_PREFILL") == NULL)
+        return 1;
     return 0;
 }
 
@@ -238,7 +244,9 @@ int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampl
         if (i + 1 == max_tokens)
             break;
 
+        BnGPUBackend *gpu = bn_model_gpu(model);
         int can_gpu_greedy =
+            gpu && gpu->argmax_activation &&
             top_logits <= 0 && sampler->temperature == 0.0f &&
             sampler->repeat_penalty >= 1.0f;
         if (can_gpu_greedy &&

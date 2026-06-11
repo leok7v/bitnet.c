@@ -497,7 +497,7 @@ static void test_quant_registry(void) {
     assert(!bn_backend_quant_can_gpu_gateup_split_activation(BN_GGUF_TENSOR_Q4_K, 1));
     assert(bn_backend_quant_can_gpu_gateup_split_activation(BN_GGUF_TENSOR_Q4_K, 0));
     assert(bn_quant_format_can_preq8k(BN_GGUF_TENSOR_Q6_K));
-    assert(!bn_quant_format_can_preq8k(BN_GGUF_TENSOR_Q5_K));
+    assert(bn_quant_format_can_preq8k(BN_GGUF_TENSOR_Q5_K));
     assert(!bn_backend_quant_can_gpu_native(BN_GGUF_TENSOR_Q5_K));
     assert(!bn_backend_quant_can_gpu_repack(BN_GGUF_TENSOR_Q5_K));
     assert(!bn_quant_format_can_cpu_repack(BN_GGUF_TENSOR_Q5_K));
@@ -600,6 +600,7 @@ static void test_backend_layout_prepared_qweights(void) {
     assert(bytes > 0);
     assert(stats.q4_repack_bytes == bytes);
     assert(stats.q4k_scale_bytes == 0);
+    assert(stats.q6k_weight_bytes == 0);
     assert(stats.q8_scale_bytes == 0);
 
     SHArena *arena = sh_arena_create(bytes + 4 * SH_ARENA_ALIGN);
@@ -611,6 +612,7 @@ static void test_backend_layout_prepared_qweights(void) {
     bn_backend_layout_prepare_qweights(backend, &config, &weights, arena, &built);
     assert(built.q4_repack_bytes == stats.q4_repack_bytes);
     assert(built.q4k_scale_bytes == 0);
+    assert(built.q6k_weight_bytes == 0);
     assert(built.q8_scale_bytes == 0);
     const BnPreparedWeight *prepared =
         bn_backend_model_prepared_qweight(backend, &layer.attn.wq);
@@ -629,6 +631,7 @@ static void test_backend_layout_prepared_qweights(void) {
     assert(bytes == 0);
     assert(stats.q4_repack_bytes == 0);
     assert(stats.q4k_scale_bytes == 0);
+    assert(stats.q6k_weight_bytes == 0);
     assert(stats.q8_scale_bytes == 0);
 #endif
 
@@ -655,6 +658,7 @@ static void test_backend_layout_prepared_qweights(void) {
     assert(q4k_bytes > 0);
     assert(q4k_stats.q4_repack_bytes == 0);
     assert(q4k_stats.q4k_scale_bytes == q4k_bytes);
+    assert(q4k_stats.q6k_weight_bytes == 0);
     assert(q4k_stats.q8_scale_bytes == 0);
 
     SHArena *q4k_arena = sh_arena_create(q4k_bytes + 4 * SH_ARENA_ALIGN);
@@ -666,6 +670,7 @@ static void test_backend_layout_prepared_qweights(void) {
                                        q4k_arena, &q4k_built);
     assert(q4k_built.q4_repack_bytes == 0);
     assert(q4k_built.q4k_scale_bytes == q4k_stats.q4k_scale_bytes);
+    assert(q4k_built.q6k_weight_bytes == 0);
     assert(q4k_built.q8_scale_bytes == 0);
     const BnPreparedWeight *q4k_prepared =
         bn_backend_model_prepared_qweight(q4k_backend, &q4k_layer.attn.wq);
@@ -679,6 +684,7 @@ static void test_backend_layout_prepared_qweights(void) {
     assert(q4k_bytes == 0);
     assert(q4k_stats.q4_repack_bytes == 0);
     assert(q4k_stats.q4k_scale_bytes == 0);
+    assert(q4k_stats.q6k_weight_bytes == 0);
     assert(q4k_stats.q8_scale_bytes == 0);
 #endif
 

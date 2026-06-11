@@ -94,7 +94,8 @@ void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
                     tasks[t].out, tasks[t].W,
                     x_q_bufs + (size_t)t * cols,
                     q8k_d + t * n_bpr,
-                    q8k_bsums + t * n_bpr * 16
+                    q8k_bsums + t * n_bpr * 16,
+                    tasks[t].prepared
                 };
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
                 void (*fn)(void *, int, int);
@@ -151,7 +152,8 @@ void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
                     tasks[t].out, tasks[t].W,
                     x_q_bufs + (size_t)t * cols,
                     q8k_d + t * n_bpr,
-                    q8k_bsums + t * n_bpr * 16
+                    q8k_bsums + t * n_bpr * 16,
+                    tasks[t].prepared
                 };
                 void (*fn)(void *, int, int);
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
@@ -280,7 +282,8 @@ void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
                         tasks[t].out, tasks[t].W,
                         x_q_bufs + (size_t)t * cols,
                         q8k_d + t * n_bpr,
-                        q8k_bsums + t * n_bpr * 16
+                        q8k_bsums + t * n_bpr * 16,
+                        tasks[t].prepared
                     };
                     bn_tp_fn fn = (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
                         ? bn_quant_q4k_scalar_sdot_range

@@ -226,7 +226,7 @@ void bn_quant_q4k_avx512_vnni_matmul_4row_range(void *ctx,
 
             for (int r = 0; r < nrows; r++) {
                 for (int ti = 0; ti < tile_n; ti++) {
-                    c->out[(size_t)(t0 + ti) * rows + row0 + r] +=
+                    c->out[(size_t)(t0 + ti) * rows + row0 + r] =
                         bn_avx512_hsum_ps(row_acc[r][ti]) - row_corr[r][ti];
                 }
             }

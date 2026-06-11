@@ -105,6 +105,7 @@ typedef struct {
     const int8_t *x_q;
     const float *x_d;
     const int16_t *x_bsums;
+    const BnPreparedWeight *prepared;
 } BnKQuantSdotCtx;
 
 typedef BnKQuantSdotCtx BnQ6KSdotCtx;

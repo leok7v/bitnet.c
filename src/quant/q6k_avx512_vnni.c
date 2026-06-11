@@ -22,11 +22,80 @@ static inline __m512i q6k_join_256(__m256i lo, __m256i hi) {
     return _mm512_inserti64x4(z, hi, 1);
 }
 
+static void q6k_avx512_prepared_4row_range(BnKQuantSdotCtx *c,
+                                            int group_start,
+                                            int group_end) {
+    int cols = c->W->cols;
+    int rows = c->W->rows;
+    int n_bpr = cols / BN_QK_K;
+    const BnBlockQ6KPrepared *blocks =
+        (const BnBlockQ6KPrepared *)c->prepared->aux;
+    const int8_t *x_q = c->x_q;
+    const float *x_d = c->x_d;
+    const int16_t *x_bsums = c->x_bsums;
+
+    for (int g = group_start; g < group_end; g++) {
+        int row0 = g * 4;
+        int nrows = (row0 + 4 <= rows) ? 4 : rows - row0;
+        float row_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int b = 0; b < n_bpr; b++) {
+            float dx = x_d[b];
+            const int16_t *bsums = x_bsums + b * 16;
+
+            __m512i xv[4];
+            const int8_t *xb = x_q + b * BN_QK_K;
+            for (int i = 0; i < 4; i++)
+                xv[i] = _mm512_loadu_si512((const void *)(xb + i * 64));
+
+            for (int r = 0; r < nrows; r++) {
+                const BnBlockQ6KPrepared *blk =
+                    &blocks[(size_t)(row0 + r) * n_bpr + b];
+                const int8_t *sc = blk->scales;
+                __m512i sumi = _mm512_setzero_si512();
+
+                for (int pair = 0; pair < 4; pair++) {
+                    __m256i w0 = _mm256_loadu_si256(
+                        (const __m256i *)(blk->qs + pair * 64));
+                    __m256i w1 = _mm256_loadu_si256(
+                        (const __m256i *)(blk->qs + pair * 64 + 32));
+                    __m512i prod = _mm512_dpbusd_epi32(
+                        _mm512_setzero_si512(), q6k_join_256(w0, w1),
+                        xv[pair]);
+                    prod = _mm512_mullo_epi32(
+                        prod, q6k_scale_quad_i32(sc[pair * 4],
+                                                 sc[pair * 4 + 1],
+                                                 sc[pair * 4 + 2],
+                                                 sc[pair * 4 + 3]));
+                    sumi = _mm512_add_epi32(sumi, prod);
+                }
+
+                int32_t corr = 0;
+                for (int i = 0; i < 16; i++)
+                    corr += (int32_t)sc[i] * (int32_t)bsums[i];
+                int32_t dot = bn_avx512_hsum_epi32(sumi) - 32 * corr;
+                row_sum[r] += blk->d * dx * (float)dot;
+            }
+        }
+
+        for (int r = 0; r < nrows; r++)
+            c->out[row0 + r] = row_sum[r];
+    }
+}
+
 void bn_quant_q6k_avx512_vnni_4row_range(void *ctx, int group_start, int group_end) {
     BnKQuantSdotCtx *c = (BnKQuantSdotCtx *)ctx;
     int cols = c->W->cols;
     int rows = c->W->rows;
     int n_bpr = cols / BN_QK_K;
+    if (c->prepared &&
+        c->prepared->kind == BN_PREPARED_WEIGHT_Q6_K_EXPANDED &&
+        c->prepared->aux &&
+        c->prepared->aux_size >=
+            (size_t)rows * n_bpr * sizeof(BnBlockQ6KPrepared)) {
+        q6k_avx512_prepared_4row_range(c, group_start, group_end);
+        return;
+    }
     const BnBlockQ6K *blocks = (const BnBlockQ6K *)c->W->data;
     const int8_t *x_q = c->x_q;
     const float *x_d = c->x_d;

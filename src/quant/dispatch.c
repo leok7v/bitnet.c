@@ -257,7 +257,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q8k_d[n_sb];
         int16_t q8k_bsums[n_sb * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q8k_d, q8k_bsums, W->cols);
-        BnQ6KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums };
+        BnQ6KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums, prepared };
         BnTPTask task = { bn_quant_q6k_neon_sdot_range, &ctx, W->rows };
 #elif defined(__ARM_NEON)
         (void)x_q_buf;
@@ -269,7 +269,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q6k_d[n_sb_q6k];
         int16_t q6k_bsums[n_sb_q6k * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q6k_d, q6k_bsums, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d, q6k_bsums };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d, q6k_bsums, prepared };
         int n_groups = (W->rows + 3) / 4;
         BnTPTask task = { bn_quant_q6k_avx512_vnni_4row_range, &ctx, n_groups };
 #elif defined(__AVX2__)
@@ -278,7 +278,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q6k_d[n_sb_q6k];
         int16_t q6k_bsums[n_sb_q6k * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q6k_d, q6k_bsums, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d, q6k_bsums };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d, q6k_bsums, prepared };
         int n_groups = (W->rows + 3) / 4;
         BnTPTask task = { bn_quant_q6k_avx2_4row_range, &ctx, n_groups };
 #elif defined(__wasm_relaxed_simd__)
@@ -287,7 +287,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q6k_d_w[n_sb_q6k_w];
         int16_t q6k_bsums_w[n_sb_q6k_w * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q6k_d_w, q6k_bsums_w, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d_w, q6k_bsums_w };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d_w, q6k_bsums_w, prepared };
         BnTPTask task = { bn_quant_q6k_wasm_sdot_range, &ctx, W->rows };
 #elif defined(__wasm_simd128__)
         (void)x_q_buf;
@@ -299,7 +299,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q6k_d_s[n_sb_q6k_s];
         int16_t q6k_bsums_s[n_sb_q6k_s * 16];
         bn_quant_x_to_q8k_scalar(x, x_q_buf, q6k_d_s, q6k_bsums_s, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d_s, q6k_bsums_s };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q6k_d_s, q6k_bsums_s, prepared };
         BnTPTask task = { bn_quant_q6k_scalar_sdot_range, &ctx, W->rows };
 #endif
         bn_tp_dispatch(pool, &task, 1);
@@ -329,7 +329,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q8k_d[n_sb];
         int16_t q8k_bsums[n_sb * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q8k_d, q8k_bsums, W->cols);
-        BnQ4KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums };
+        BnQ4KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums, prepared };
         BnTPTask task = { bn_quant_q4k_neon_sdot_range, &ctx, W->rows };
 #elif defined(__ARM_NEON)
         (void)x_q_buf;
@@ -341,7 +341,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q4k_d[n_sb_q4k];
         int16_t q4k_bsums[n_sb_q4k * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q4k_d, q4k_bsums, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d, q4k_bsums };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d, q4k_bsums, prepared };
         int n_groups = (W->rows + 3) / 4;
         BnTPTask task = { bn_quant_q4k_avx512_vnni_4row_range, &ctx, n_groups };
 #elif defined(__AVX2__)
@@ -350,7 +350,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q4k_d[n_sb_q4k];
         int16_t q4k_bsums[n_sb_q4k * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q4k_d, q4k_bsums, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d, q4k_bsums };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d, q4k_bsums, prepared };
         int n_groups = (W->rows + 3) / 4;
         BnTPTask task = { bn_quant_q4k_avx2_4row_range, &ctx, n_groups };
 #elif defined(__wasm_relaxed_simd__)
@@ -359,7 +359,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q4k_d_w[n_sb_q4k_w];
         int16_t q4k_bsums_w[n_sb_q4k_w * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q4k_d_w, q4k_bsums_w, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d_w, q4k_bsums_w };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d_w, q4k_bsums_w, prepared };
         BnTPTask task = { bn_quant_q4k_wasm_sdot_range, &ctx, W->rows };
 #elif defined(__wasm_simd128__)
         (void)x_q_buf;
@@ -371,7 +371,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q4k_d_s[n_sb_q4k_s];
         int16_t q4k_bsums_s[n_sb_q4k_s * 16];
         bn_quant_x_to_q8k_scalar(x, x_q_buf, q4k_d_s, q4k_bsums_s, W->cols);
-        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d_s, q4k_bsums_s };
+        BnKQuantSdotCtx ctx = { out, W, x_q_buf, q4k_d_s, q4k_bsums_s, prepared };
         BnTPTask task = { bn_quant_q4k_scalar_sdot_range, &ctx, W->rows };
 #endif
         bn_tp_dispatch(pool, &task, 1);
@@ -385,7 +385,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q8k_d[n_sb];
         int16_t q8k_bsums[n_sb * 16];
         bn_quant_x_to_q8k(x, x_q_buf, q8k_d, q8k_bsums, W->cols);
-        BnQ5KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums };
+        BnQ5KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums, prepared };
         BnTPTask task = { bn_quant_q5k_neon_sdot_range, &ctx, W->rows };
 #else
 #if defined(__ARM_NEON)
@@ -400,7 +400,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
             float q8k_d[n_sb];
             int16_t q8k_bsums[n_sb * 16];
             bn_quant_x_to_q8k(x, x_q_buf, q8k_d, q8k_bsums, W->cols);
-            BnQ5KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums };
+            BnQ5KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums, prepared };
             int n_groups = (W->rows + 3) / 4;
             BnTPTask task = { bn_quant_q5k_avx512_vnni_4row_range, &ctx, n_groups };
             bn_tp_dispatch(pool, &task, 1);
@@ -421,7 +421,7 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
         float q8k_d[n_sb];
         int16_t q8k_bsums[n_sb * 16];
         bn_quant_x_to_q8k_scalar(x, x_q_buf, q8k_d, q8k_bsums, W->cols);
-        BnQ5KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums };
+        BnQ5KSdotCtx ctx = { out, W, x_q_buf, q8k_d, q8k_bsums, prepared };
         BnTPTask task = { bn_quant_q5k_scalar_sdot_range, &ctx, W->rows };
 #endif
 #endif
@@ -715,6 +715,13 @@ void bn_quant_matvec_impl(float *out, const BnQWeight *W, const float *x,
 void bn_quant_matvec(float *out, const BnQWeight *W, const float *x,
                      int8_t *x_q_buf, BnThreadPool *pool) {
     bn_quant_matvec_impl(out, W, x, x_q_buf, pool, NULL);
+}
+
+void bn_quant_matvec_prepared(float *out, const BnQWeight *W,
+                              const BnPreparedWeight *prepared,
+                              const float *x, int8_t *x_q_buf,
+                              BnThreadPool *pool) {
+    bn_quant_matvec_impl(out, W, x, x_q_buf, pool, prepared);
 }
 
 // --- Data size computation ---

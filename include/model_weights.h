@@ -74,6 +74,7 @@ typedef struct {
     int emb_type;                 // tensor type (F16, Q4_0, Q8_0, etc.)
     int8_t *emb_out_i8;           // [vocab_size * dim] INT8 copy for logits (NULL if unused)
     float  *emb_out_scales;       // [vocab_size] per-row scales (NULL if unused)
+    BnQWeight tied_embedding_weight; // stable quant descriptor for tied logits
     BnQWeight output_weight;      // untied output projection (data=NULL if tied)
     float *output_norm;           // [dim]
     BnLayerWeights *layers;       // [n_layers]

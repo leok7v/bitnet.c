@@ -50,6 +50,12 @@ void bn_backend_quant_matvec_gpu_buf(float *out, const BnQWeight *W,
                                      void *W_buf, const float *x,
                                      int8_t *x_q_buf, BnThreadPool *pool,
                                      BnGPUBackend *gpu);
+void bn_backend_quant_matvec_gpu_buf_prepared(float *out, const BnQWeight *W,
+                                              const BnPreparedWeight *prepared,
+                                              void *W_buf, const float *x,
+                                              int8_t *x_q_buf,
+                                              BnThreadPool *pool,
+                                              BnGPUBackend *gpu);
 void bn_backend_quant_matvec_batch_gpu(const BnMatvecTask *tasks, int n_tasks,
                                        const float *x, int8_t *x_q_buf,
                                        BnThreadPool *pool, BnGPUBackend *gpu);

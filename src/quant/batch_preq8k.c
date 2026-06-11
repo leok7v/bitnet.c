@@ -30,7 +30,9 @@ void bn_quant_matvec_batch_preq8k(const BnMatvecTask *tasks, int n_tasks,
         int all_kquant = 1;
         for (int t = 0; t < n_tasks; t++) {
             int type = tasks[t].W->type;
-            if (type != BN_GGUF_TENSOR_Q4_K && type != BN_GGUF_TENSOR_Q6_K) {
+            if (type != BN_GGUF_TENSOR_Q4_K &&
+                type != BN_GGUF_TENSOR_Q5_K &&
+                type != BN_GGUF_TENSOR_Q6_K) {
                 all_kquant = 0;
                 break;
             }
@@ -41,17 +43,24 @@ void bn_quant_matvec_batch_preq8k(const BnMatvecTask *tasks, int n_tasks,
             for (int t = 0; t < n_tasks; t++) {
                 ctxs[t] = (BnKQuantSdotCtx){
                     tasks[t].out, tasks[t].W,
-                    (int8_t *)x_q, (float *)x_d, (int16_t *)x_bsums
+                    (int8_t *)x_q, (float *)x_d, (int16_t *)x_bsums,
+                    tasks[t].prepared
                 };
                 bn_tp_fn fn;
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                fn = (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
-                    ? (bn_tp_fn)bn_quant_q4k_avx512_vnni_4row_range
-                    : (bn_tp_fn)bn_quant_q6k_avx512_vnni_4row_range;
+                if (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
+                    fn = (bn_tp_fn)bn_quant_q4k_avx512_vnni_4row_range;
+                else if (tasks[t].W->type == BN_GGUF_TENSOR_Q5_K)
+                    fn = (bn_tp_fn)bn_quant_q5k_avx512_vnni_4row_range;
+                else
+                    fn = (bn_tp_fn)bn_quant_q6k_avx512_vnni_4row_range;
 #else
-                fn = (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
-                    ? (bn_tp_fn)bn_quant_q4k_avx2_4row_range
-                    : (bn_tp_fn)bn_quant_q6k_avx2_4row_range;
+                if (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
+                    fn = (bn_tp_fn)bn_quant_q4k_avx2_4row_range;
+                else if (tasks[t].W->type == BN_GGUF_TENSOR_Q5_K)
+                    fn = (bn_tp_fn)bn_quant_q5k_avx2_4row_range;
+                else
+                    fn = (bn_tp_fn)bn_quant_q6k_avx2_4row_range;
 #endif
                 int n_groups = (tasks[t].W->rows + 3) / 4;
                 tp_tasks[t] = (BnTPTask){ fn, &ctxs[t], n_groups };

@@ -157,8 +157,13 @@ static void logits_quant_matvec_gpu(const BnModel *m,
                                     const BnQWeight *W,
                                     const float *x,
                                     int8_t *x_q_buf) {
-    bn_backend_quant_matvec_gpu_buf(out, W, qweight_backend_buf(bn_model_backend(m), W),
-                                    x, x_q_buf, bn_model_pool(m), bn_model_gpu(m));
+    const BnBackendModel *backend = bn_model_backend(m);
+    const BnPreparedWeight *prepared =
+        bn_backend_model_prepared_qweight(backend, W);
+    bn_backend_quant_matvec_gpu_buf_prepared(out, W, prepared,
+                                             qweight_backend_buf(backend, W),
+                                             x, x_q_buf, bn_model_pool(m),
+                                             bn_model_gpu(m));
 }
 
 static int logits_i8_dispatch(BnModel *m, BnRunState *s, int rows, int dim) {
@@ -243,13 +248,16 @@ float *bn_transformer_forward_logits(BnModel *m, BnSession *sess) {
     } else if (bn_quant_format_supported(w->emb_type) &&
                w->emb_type != BN_GGUF_TENSOR_F16 &&
                w->emb_type != BN_GGUF_TENSOR_F32) {
-        BnQWeight tied = { w->token_embedding, w->emb_type, c->vocab_size, dim, 1.0f };
-        bn_backend_quant_matvec_gpu_buf(
-            s->logits, &tied,
+        const BnQWeight *tied = &w->tied_embedding_weight;
+        const BnBackendModel *backend = bn_model_backend(m);
+        const BnPreparedWeight *prepared =
+            bn_backend_model_prepared_qweight(backend, tied);
+        bn_backend_quant_matvec_gpu_buf_prepared(
+            s->logits, tied, prepared,
             bn_transformer_backend_handle_or(bn_model_backend(m), -1,
                                              BN_BACKEND_HANDLE_TIED_EMBEDDING),
             s->x, s->x_q, bn_model_pool(m), bn_model_gpu(m));
-        logits_refine_small_qwen_cuda_q8(m, s, &tied);
+        logits_refine_small_qwen_cuda_q8(m, s, tied);
     } else if (w->emb_type == BN_GGUF_TENSOR_F16) {
         if (!logits_i8_dispatch(m, s, c->vocab_size, dim))
             logits_f16_dispatch(m, s, (const uint16_t *)w->token_embedding,

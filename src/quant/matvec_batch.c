@@ -175,7 +175,7 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
         BnTPTask tp_tasks[BN_MAX_BATCH];
 
         for (int t = 0; t < n_tasks; t++) {
-            ctxs[t] = (BnQ6KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums };
+            ctxs[t] = (BnQ6KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums, tasks[t].prepared };
             tp_tasks[t] = (BnTPTask){ bn_quant_q6k_neon_sdot_range, &ctxs[t], tasks[t].W->rows };
         }
 
@@ -194,7 +194,7 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
         BnTPTask tp_tasks[BN_MAX_BATCH];
 
         for (int t = 0; t < n_tasks; t++) {
-            ctxs[t] = (BnQ4KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums };
+            ctxs[t] = (BnQ4KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums, tasks[t].prepared };
             tp_tasks[t] = (BnTPTask){ bn_quant_q4k_neon_sdot_range, &ctxs[t], tasks[t].W->rows };
         }
 
@@ -213,7 +213,7 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
         BnTPTask tp_tasks[BN_MAX_BATCH];
 
         for (int t = 0; t < n_tasks; t++) {
-            ctxs[t] = (BnQ5KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums };
+            ctxs[t] = (BnQ5KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums, tasks[t].prepared };
             tp_tasks[t] = (BnTPTask){ bn_quant_q5k_neon_sdot_range, &ctxs[t], tasks[t].W->rows };
         }
 
@@ -350,7 +350,8 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
             BnTPTask tp_tasks[BN_MAX_BATCH];
             for (int t = 0; t < n_tasks; t++) {
                 ctxs[t] = (BnKQuantSdotCtx){ tasks[t].out, tasks[t].W,
-                                              x_q_buf, q8k_d, q8k_bsums };
+                                              x_q_buf, q8k_d, q8k_bsums,
+                                              tasks[t].prepared };
                 bn_tp_fn fn;
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
                 fn = (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
@@ -467,7 +468,7 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
         BnTPTask tp_tasks[BN_MAX_BATCH];
 
         for (int t = 0; t < n_tasks; t++) {
-            ctxs[t] = (BnQ6KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums };
+            ctxs[t] = (BnQ6KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums, tasks[t].prepared };
             tp_tasks[t] = (BnTPTask){ bn_quant_q6k_wasm_sdot_range, &ctxs[t], tasks[t].W->rows };
         }
 
@@ -486,7 +487,7 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
         BnTPTask tp_tasks[BN_MAX_BATCH];
 
         for (int t = 0; t < n_tasks; t++) {
-            ctxs[t] = (BnQ4KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums };
+            ctxs[t] = (BnQ4KSdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, q8k_d, q8k_bsums, tasks[t].prepared };
             tp_tasks[t] = (BnTPTask){ bn_quant_q4k_wasm_sdot_range, &ctxs[t], tasks[t].W->rows };
         }
 
@@ -521,7 +522,8 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
                 BnTPTask tp_tasks[BN_MAX_BATCH];
                 for (int t = 0; t < n_tasks; t++) {
                     ctxs[t] = (BnKQuantSdotCtx){ tasks[t].out, tasks[t].W,
-                                                  x_q_buf, q8k_d, q8k_bsums };
+                                                  x_q_buf, q8k_d, q8k_bsums,
+                                                  tasks[t].prepared };
                     bn_tp_fn fn = bn_quant_q6k_scalar_sdot_range;
                     if (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
                         fn = bn_quant_q4k_scalar_sdot_range;
@@ -557,7 +559,8 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
                 BnTPTask tp_tasks[BN_MAX_BATCH];
                 for (int t = 0; t < n_tasks; t++) {
                     ctxs[t] = (BnKQuantSdotCtx){ tasks[t].out, tasks[t].W,
-                                                  x_q_buf, q8k_d, q8k_bsums };
+                                                  x_q_buf, q8k_d, q8k_bsums,
+                                                  tasks[t].prepared };
                     bn_tp_fn kernel = (tasks[t].W->type == BN_GGUF_TENSOR_Q4_K)
                         ? bn_quant_q4k_scalar_sdot_range
                         : bn_quant_q6k_scalar_sdot_range;
@@ -592,7 +595,8 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
                         BnTPTask tp_tasks[BN_MAX_BATCH];
                         for (int t = 0; t < n_tasks; t++) {
                             ctxs[t] = (BnKQuantSdotCtx){ tasks[t].out, tasks[t].W,
-                                                          x_q_buf, q8k_d, q8k_bsums };
+                                                          x_q_buf, q8k_d, q8k_bsums,
+                                                          tasks[t].prepared };
                             int n_groups = (tasks[t].W->rows + 3) / 4;
                             tp_tasks[t] = (BnTPTask){ bn_quant_q5k_avx512_vnni_4row_range,
                                                       &ctxs[t], n_groups };

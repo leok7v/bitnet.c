@@ -65,16 +65,26 @@ void bn_backend_quant_matmul_gpu(float *out, const BnQWeight *W,
                                     pool, gpu);
 }
 
-void bn_backend_quant_matvec_gpu_buf(float *out, const BnQWeight *W,
-                                     void *W_buf, const float *x,
-                                     int8_t *x_q_buf, BnThreadPool *pool,
-                                     BnGPUBackend *gpu) {
+void bn_backend_quant_matvec_gpu_buf_prepared(float *out, const BnQWeight *W,
+                                              const BnPreparedWeight *prepared,
+                                              void *W_buf, const float *x,
+                                              int8_t *x_q_buf,
+                                              BnThreadPool *pool,
+                                              BnGPUBackend *gpu) {
     if (gpu && W_buf && gpu->matvec) {
         if (gpu->matvec(gpu->ctx, out, W_buf, x,
                         W->rows, W->cols, W->type) == 0)
             return;
     }
-    bn_quant_matvec(out, W, x, x_q_buf, pool);
+    bn_quant_matvec_prepared(out, W, prepared, x, x_q_buf, pool);
+}
+
+void bn_backend_quant_matvec_gpu_buf(float *out, const BnQWeight *W,
+                                     void *W_buf, const float *x,
+                                     int8_t *x_q_buf, BnThreadPool *pool,
+                                     BnGPUBackend *gpu) {
+    bn_backend_quant_matvec_gpu_buf_prepared(out, W, NULL, W_buf, x, x_q_buf,
+                                             pool, gpu);
 }
 
 void bn_backend_quant_matvec_gpu(float *out, const BnQWeight *W,
