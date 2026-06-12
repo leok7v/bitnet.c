@@ -192,9 +192,9 @@ static void test_q4k(void) {
     fill_x(x_q, x_d, x_bsums, n_bpr);
 
     BnQWeight W = { blocks, BN_GGUF_TENSOR_Q4_K, rows, cols, 1.0f };
-    BnKQuantSdotCtx cs = { scalar, &W, x_q, x_d, x_bsums };
-    BnKQuantSdotCtx c2 = { avx2, &W, x_q, x_d, x_bsums };
-    BnKQuantSdotCtx c512 = { avx512, &W, x_q, x_d, x_bsums };
+    BnKQuantSdotCtx cs = { scalar, &W, x_q, x_d, x_bsums, NULL };
+    BnKQuantSdotCtx c2 = { avx2, &W, x_q, x_d, x_bsums, NULL };
+    BnKQuantSdotCtx c512 = { avx512, &W, x_q, x_d, x_bsums, NULL };
     bn_quant_q4k_scalar_sdot_range(&cs, 0, rows);
     bn_quant_q4k_avx2_4row_range(&c2, 0, (rows + 3) / 4);
     bn_quant_q4k_avx512_vnni_4row_range(&c512, 0, (rows + 3) / 4);
@@ -227,7 +227,7 @@ static void test_q5k(void) {
     BnQ5KCtx c2 = { avx2, &W, x };
     BnQ5KCtx c512 = { avx512, &W, x };
     BnQ5KCtx cref = { vnni_ref, &W, x_deq };
-    BnKQuantSdotCtx cvnni = { avx512_vnni, &W, x_q, x_d, x_bsums };
+    BnKQuantSdotCtx cvnni = { avx512_vnni, &W, x_q, x_d, x_bsums, NULL };
     bn_quant_q5k_scalar_range(&cs, 0, rows);
     bn_quant_q5k_avx2_4row_range(&c2, 0, (rows + 3) / 4);
     bn_quant_q5k_avx512_4row_range(&c512, 0, (rows + 3) / 4);
@@ -255,9 +255,9 @@ static void test_q6k(void) {
     fill_x(x_q, x_d, x_bsums, n_bpr);
 
     BnQWeight W = { blocks, BN_GGUF_TENSOR_Q6_K, rows, cols, 1.0f };
-    BnKQuantSdotCtx cs = { scalar, &W, x_q, x_d, x_bsums };
-    BnKQuantSdotCtx c2 = { avx2, &W, x_q, x_d, x_bsums };
-    BnKQuantSdotCtx c512 = { avx512, &W, x_q, x_d, x_bsums };
+    BnKQuantSdotCtx cs = { scalar, &W, x_q, x_d, x_bsums, NULL };
+    BnKQuantSdotCtx c2 = { avx2, &W, x_q, x_d, x_bsums, NULL };
+    BnKQuantSdotCtx c512 = { avx512, &W, x_q, x_d, x_bsums, NULL };
     bn_quant_q6k_scalar_sdot_range(&cs, 0, rows);
     bn_quant_q6k_avx2_4row_range(&c2, 0, (rows + 3) / 4);
     bn_quant_q6k_avx512_vnni_4row_range(&c512, 0, (rows + 3) / 4);

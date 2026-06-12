@@ -1250,6 +1250,7 @@ typedef struct {
     const float *hb2;
     int hidden_dim;
     int act_type;
+    int fast_approx;
 } BnPrefillFFNActCtx;
 
 static void prefill_ffn_activation_range(void *ctx, int start, int end) {
@@ -1285,12 +1286,54 @@ static void prefill_ffn_activation_range(void *ctx, int start, int end) {
                 hb_t[i] = hb2_t ? g * g * hb2_t[i] : g * g;
             }
         } else if (c->act_type == 2) {
-            for (int i = 0; i < hidden_dim; i++) {
+            int i = 0;
+            if (c->fast_approx) {
+#ifdef __ARM_NEON
+                for (; i + 3 < hidden_dim; i += 4) {
+                    float32x4_t v =
+                        bn_neon_fast_gelu_f32(vld1q_f32(hb_t + i));
+                    if (hb2_t)
+                        v = vmulq_f32(v, vld1q_f32(hb2_t + i));
+                    vst1q_f32(hb_t + i, v);
+                }
+#endif
+#ifdef __AVX2__
+                for (; i + 7 < hidden_dim; i += 8) {
+                    __m256 v =
+                        bn_avx2_fast_gelu_ps(_mm256_loadu_ps(hb_t + i));
+                    if (hb2_t)
+                        v = _mm256_mul_ps(v, _mm256_loadu_ps(hb2_t + i));
+                    _mm256_storeu_ps(hb_t + i, v);
+                }
+#endif
+            }
+            for (; i < hidden_dim; i++) {
                 float v = prefill_gelu(hb_t[i]);
                 hb_t[i] = hb2_t ? v * hb2_t[i] : v;
             }
         } else {
-            for (int i = 0; i < hidden_dim; i++) {
+            int i = 0;
+            if (c->fast_approx) {
+#ifdef __ARM_NEON
+                for (; i + 3 < hidden_dim; i += 4) {
+                    float32x4_t v =
+                        bn_neon_fast_silu_f32(vld1q_f32(hb_t + i));
+                    if (hb2_t)
+                        v = vmulq_f32(v, vld1q_f32(hb2_t + i));
+                    vst1q_f32(hb_t + i, v);
+                }
+#endif
+#ifdef __AVX2__
+                for (; i + 7 < hidden_dim; i += 8) {
+                    __m256 v =
+                        bn_avx2_fast_silu_ps(_mm256_loadu_ps(hb_t + i));
+                    if (hb2_t)
+                        v = _mm256_mul_ps(v, _mm256_loadu_ps(hb2_t + i));
+                    _mm256_storeu_ps(hb_t + i, v);
+                }
+#endif
+            }
+            for (; i < hidden_dim; i++) {
                 float v = hb_t[i] / (1.0f + expf(-hb_t[i]));
                 hb_t[i] = hb2_t ? v * hb2_t[i] : v;
             }
@@ -1367,8 +1410,11 @@ static int prefill_dense_chain_min_tokens(const BnConfig *c,
         (c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN) &&
         c->n_experts <= 0 &&
         c->full_attn_interval <= 0 &&
-        c->dim <= 2560)
+        c->dim <= 2560) {
+        if (c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN3)
+            return 7;
         return 2;
+    }
     if (gpu && gpu->kind == BN_GPU_BACKEND_CUDA && c)
         return 16;
     return prefill_gpu_attention_min_tokens();
@@ -2554,7 +2600,10 @@ prefill_ssm_done:
                 prefill_profile_add(&prof.ffn_gateup_ms, t_ffn_step);
 
                 t_ffn_step = prefill_profile_now(&prof);
-                BnPrefillFFNActCtx act_ctx = { Hb, Hb2, hidden_dim, c->act_type };
+                BnPrefillFFNActCtx act_ctx = {
+                    Hb, Hb2, hidden_dim, c->act_type,
+                    (c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN3) != 0
+                };
                 BnTPTask act_task = { prefill_ffn_activation_range, &act_ctx, n_tokens };
                 bn_tp_dispatch(bn_model_pool(m), &act_task, 1);
                 prefill_profile_add(&prof.ffn_act_ms, t_ffn_step);
@@ -2563,7 +2612,10 @@ prefill_ssm_done:
                 prefill_quant_matmul_gpu(m, Hb, &lw->ffn.ffn_up, Xb, n_tokens, s->x_q);
                 prefill_profile_add(&prof.ffn_gateup_ms, t_ffn_step);
                 t_ffn_step = prefill_profile_now(&prof);
-                BnPrefillFFNActCtx act_ctx = { Hb, NULL, hidden_dim, c->act_type };
+                BnPrefillFFNActCtx act_ctx = {
+                    Hb, NULL, hidden_dim, c->act_type,
+                    (c->arch_flags & BN_MODEL_ARCH_FLAG_QWEN3) != 0
+                };
                 BnTPTask act_task = { prefill_ffn_activation_range, &act_ctx, n_tokens };
                 bn_tp_dispatch(bn_model_pool(m), &act_task, 1);
                 prefill_profile_add(&prof.ffn_act_ms, t_ffn_step);
