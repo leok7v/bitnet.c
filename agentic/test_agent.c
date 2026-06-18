@@ -583,7 +583,9 @@ int main(int argc, char **argv) {
                             ? tok.vocab[tok.eos_id] : NULL;
 
     /* Spin up a CPU thread pool: use half the performance cores minus one spare
-       so the main thread and OS stay responsive while the model runs. */
+       so the main thread and OS stay responsive while the model runs.
+       Override with BN_AGENT_THREADS (e.g. =0 lets the engine pick, or set it
+       to hw.logicalcpu to saturate all cores). */
     int n_workers = 0;
 #if defined(__APPLE__)
     {
@@ -598,11 +600,24 @@ int main(int argc, char **argv) {
         if (n > 1) n_workers = (int)(n / 2);
     }
 #endif
+    const char *env_threads = getenv("BN_AGENT_THREADS");
+    if (env_threads) {
+        int t = atoi(env_threads);
+        if (t >= 0) n_workers = t;
+    }
+    fprintf(stderr, "CPU thread pool: %d workers\n", n_workers);
     bn_model_set_thread_pool(&model, bn_tp_create(n_workers), 1);
 
 #ifdef BN_ENABLE_METAL
     if (use_metal) {
         BnGPUBackend *gpu = bn_gpu_metal_create("shaders/metal/");
+        /* Hand the mmap range to Metal so weight upload wraps the mapped file
+           pages zero-copy (newBufferWithBytesNoCopy) instead of allocating a
+           second GPU-resident copy. Without this, unified-memory RSS roughly
+           doubles (mmap weights + private GPU copy). Mirrors main.c. */
+        const BnMappedFile *mf = bn_gguf_primary_file(gf);
+        if (gpu && mf && mf->is_mmap && mf->data)
+            bn_gpu_metal_set_mmap_range(gpu, mf->data, mf->size);
         if (!gpu) {
             fprintf(stderr, "Metal init failed; using CPU\n");
         } else if (bn_model_upload_weights(&model, gpu) != 0) {
