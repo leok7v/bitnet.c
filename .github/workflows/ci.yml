@@ -21,7 +21,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build
         run: make bitnet
@@ -51,7 +51,7 @@ jobs:
         sanitizer: [asan, tsan]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build and test with sanitizer
         run: |
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install cppcheck
         run: sudo apt-get install -y cppcheck
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: AVX2 syntax check
         run: make avx2-check
@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Backend and model matrix dry run
         run: make test_architecture
@@ -109,10 +109,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Emscripten
-        uses: mymindstorm/setup-emsdk@v14
+        uses: mymindstorm/setup-emsdk@v16
 
       - name: Build WASM
         run: wasm/build.sh
