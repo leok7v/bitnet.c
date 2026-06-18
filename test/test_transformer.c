@@ -486,10 +486,13 @@ static void test_model_arch_registry(void) {
     assert(bitnet->activation("bitnet") == 1);
     assert(!bitnet->attention_value_shares_key("bitnet"));
 
+    /* "qwen35" matches the more-specific qwen3 arch (registered before the
+     * generic qwen), which still carries BN_MODEL_ARCH_FLAG_QWEN. */
     const BnModelArchOps *qwen = bn_model_arch_ops_for("qwen35");
     assert(qwen);
-    assert(strcmp(qwen->name, "qwen") == 0);
+    assert(strcmp(qwen->name, "qwen3") == 0);
     assert(qwen->flags & BN_MODEL_ARCH_FLAG_QWEN);
+    assert(qwen->flags & BN_MODEL_ARCH_FLAG_QWEN3);
     assert(strcmp(qwen->prefix("qwen35"), "qwen35") == 0);
     assert(qwen->activation("qwen35") == 0);
     assert(!qwen->attention_value_shares_key("qwen35"));

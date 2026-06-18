@@ -6,6 +6,17 @@
 
 #ifdef __wasm_relaxed_simd__
 
+// Round to nearest, ties away from zero, to match the AVX2 path
+// (bn_avx2_round_half_away_epi32) and the scalar roundf() tail.
+// wasm_f32x4_nearest rounds ties to even, which disagrees on exact .5 cases
+// and breaks cross-backend parity. trunc(v + sign*0.5) reproduces roundf().
+static inline v128_t bn_wasm_round_half_away_i32(v128_t v) {
+    v128_t half = wasm_f32x4_splat(0.5f);
+    v128_t is_neg = wasm_f32x4_lt(v, wasm_f32x4_splat(0.0f));
+    v128_t bias = wasm_v128_bitselect(wasm_f32x4_neg(half), half, is_neg);
+    return wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_add(v, bias));
+}
+
 // Quantize float vector x[n] to int8, returning scale = amax/127.
 float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
     // Find absolute max
@@ -49,10 +60,10 @@ float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
         v128_t f1 = wasm_f32x4_mul(wasm_v128_load(x + i + 4), vinv);
         v128_t f2 = wasm_f32x4_mul(wasm_v128_load(x + i + 8), vinv);
         v128_t f3 = wasm_f32x4_mul(wasm_v128_load(x + i + 12), vinv);
-        v128_t i0 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f0));
-        v128_t i1 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f1));
-        v128_t i2 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f2));
-        v128_t i3 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f3));
+        v128_t i0 = bn_wasm_round_half_away_i32(f0);
+        v128_t i1 = bn_wasm_round_half_away_i32(f1);
+        v128_t i2 = bn_wasm_round_half_away_i32(f2);
+        v128_t i3 = bn_wasm_round_half_away_i32(f3);
         // Narrow i32 -> i16 -> i8 with saturation
         v128_t s01 = wasm_i16x8_narrow_i32x4(i0, i1);
         v128_t s23 = wasm_i16x8_narrow_i32x4(i2, i3);
@@ -175,10 +186,10 @@ void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
             v128_t f1 = wasm_f32x4_mul(wasm_v128_load(fa + 4), vinv);
             v128_t f2 = wasm_f32x4_mul(wasm_v128_load(fa + 8), vinv);
             v128_t f3 = wasm_f32x4_mul(wasm_v128_load(fa + 12), vinv);
-            v128_t i0 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f0));
-            v128_t i1 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f1));
-            v128_t i2 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f2));
-            v128_t i3 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(f3));
+            v128_t i0 = bn_wasm_round_half_away_i32(f0);
+            v128_t i1 = bn_wasm_round_half_away_i32(f1);
+            v128_t i2 = bn_wasm_round_half_away_i32(f2);
+            v128_t i3 = bn_wasm_round_half_away_i32(f3);
             v128_t s01 = wasm_i16x8_narrow_i32x4(i0, i1);
             v128_t s23 = wasm_i16x8_narrow_i32x4(i2, i3);
             v128_t bytes = wasm_i8x16_narrow_i16x8(s01, s23);
@@ -237,10 +248,10 @@ void bn_quant_x_to_q8k(const float *x, int8_t *x_q, float *x_d,
             const float *gx = xb + g * 16;
             int8_t *gq = qb + g * 16;
 
-            v128_t i0 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(wasm_f32x4_mul(wasm_v128_load(gx), vinv)));
-            v128_t i1 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(wasm_f32x4_mul(wasm_v128_load(gx + 4), vinv)));
-            v128_t i2 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(wasm_f32x4_mul(wasm_v128_load(gx + 8), vinv)));
-            v128_t i3 = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_nearest(wasm_f32x4_mul(wasm_v128_load(gx + 12), vinv)));
+            v128_t i0 = bn_wasm_round_half_away_i32(wasm_f32x4_mul(wasm_v128_load(gx), vinv));
+            v128_t i1 = bn_wasm_round_half_away_i32(wasm_f32x4_mul(wasm_v128_load(gx + 4), vinv));
+            v128_t i2 = bn_wasm_round_half_away_i32(wasm_f32x4_mul(wasm_v128_load(gx + 8), vinv));
+            v128_t i3 = bn_wasm_round_half_away_i32(wasm_f32x4_mul(wasm_v128_load(gx + 12), vinv));
 
             // Narrow i32 -> i16 -> i8 with saturation
             v128_t s01 = wasm_i16x8_narrow_i32x4(i0, i1);

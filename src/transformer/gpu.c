@@ -748,6 +748,10 @@ static int gpu_refine_q6k_logits_top(float *logits, int n_logits,
     return n_top;
 }
 
+/* Only referenced from the SIMD path of gpu_refine_q8_logits_top below; guarded
+ * to the same condition so scalar builds do not compile a never-called static. */
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || \
+    defined(__AVX2__) || defined(__wasm_relaxed_simd__)
 static float gpu_exact_q8_row_dot_q8x(const BnQWeight *W, int row,
                                       const int8_t *x_q,
                                       const float *x_scales) {
@@ -766,6 +770,7 @@ static float gpu_exact_q8_row_dot_q8x(const BnQWeight *W, int row,
     }
     return row_sum;
 }
+#endif
 
 static int gpu_refine_q8_logits_top(float *logits, int n_logits,
                                     const BnQWeight *W, const float *x,

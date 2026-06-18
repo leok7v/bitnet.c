@@ -42,6 +42,7 @@ void bn_moe_swiglu_range(void *ctx, int start, int end) {
 void bn_moe_swiglu(float *hb, const float *gate, const float *up, int n,
                    int exact_silu) {
     int i = 0;
+    (void)exact_silu; // only selects the AVX2 fast-silu path; scalar/NEON exact
 #ifdef __AVX2__
     if (!exact_silu) {
         for (; i + 7 < n; i += 8) {

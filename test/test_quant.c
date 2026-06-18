@@ -1038,6 +1038,12 @@ static void test_kquant_preq8k_matmul_correctness(void) {
     bn_quant_matmul_preq8k_multi(multi_out, multi_w, NULL, 3, n_tokens,
                                  x_q, x_d, x_bsums, X, NULL);
 
+    /* The prepared Q4_K layout (BN_PREPARED_WEIGHT_Q4_K_SCALES) only exists on
+     * x86 AVX2/AVX512; on other targets bn_quant_prepared_qweight_size reports
+     * BN_PREPARED_WEIGHT_NONE, so skip the prepared-path checks there. The
+     * portable matvec/preq8k correctness above still runs everywhere. */
+#if defined(__AVX2__) || \
+    (defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__))
     BnPreparedWeight prepared4a = { 0 };
     BnPreparedWeight prepared4b = { 0 };
     BnPreparedWeightKind kind4a = BN_PREPARED_WEIGHT_NONE;
@@ -1058,14 +1064,18 @@ static void test_kquant_preq8k_matmul_correctness(void) {
     const BnPreparedWeight *prepared[2] = { &prepared4a, &prepared4b };
     bn_quant_matmul_preq8k_multi(prepared_out, prepared_w, prepared, 2,
                                  n_tokens, x_q, x_d, x_bsums, X, NULL);
+#endif
 
     for (int i = 0; i < rows * n_tokens; i++) {
         assert(fabsf(out4[i] - ref4[i]) < 1e-3f);
         assert(fabsf(out6[i] - ref6[i]) < 1e-3f);
         assert(fabsf(out4[i] - force4[i]) < 1e-3f);
         assert(fabsf(out6[i] - force6[i]) < 1e-3f);
+#if defined(__AVX2__) || \
+    (defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__))
         assert(fabsf(out4_prepared[i] - out4[i]) < 1e-5f);
         assert(fabsf(out4b_prepared[i] - out4b[i]) < 1e-5f);
+#endif
     }
 
     free(q4a); free(q4b); free(q6);
@@ -1073,7 +1083,10 @@ static void test_kquant_preq8k_matmul_correctness(void) {
     free(ref4); free(ref6); free(force4); free(force6);
     free(out4); free(out4b); free(out6);
     free(out4_prepared); free(out4b_prepared);
+#if defined(__AVX2__) || \
+    (defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__))
     sh_arena_free(prep_arena);
+#endif
     printf("PASSED\n");
 }
 

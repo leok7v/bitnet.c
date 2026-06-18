@@ -4,6 +4,17 @@
 #include <assert.h>
 #include <math.h>
 
+// Round to nearest, ties away from zero, to match the AVX2 path
+// (bn_avx2_round_half_away_epi32) and the scalar roundf() tail. NEON's
+// vcvtnq_s32_f32 rounds ties to even, which disagrees on exact .5 cases and
+// breaks cross-backend parity. trunc(v + sign*0.5) reproduces roundf().
+static inline int32x4_t bn_neon_round_half_away_s32(float32x4_t v) {
+    float32x4_t half = vdupq_n_f32(0.5f);
+    uint32x4_t is_neg = vcltq_f32(v, vdupq_n_f32(0.0f));
+    float32x4_t bias = vbslq_f32(is_neg, vnegq_f32(half), half);
+    return vcvtq_s32_f32(vaddq_f32(v, bias)); // vcvtq truncates toward zero
+}
+
 // Quantize float vector x[n] to int8, returning scale = amax/127.
 // x_q[n] = round(x[i] / scale), clamped to [-127, 127].
 float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
@@ -35,10 +46,10 @@ float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
 
     i = 0;
     for (; i + 15 < n; i += 16) {
-        int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i),      vinv));
-        int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 4),  vinv));
-        int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 8),  vinv));
-        int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 12), vinv));
+        int32x4_t i0 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(x + i),      vinv));
+        int32x4_t i1 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(x + i + 4),  vinv));
+        int32x4_t i2 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(x + i + 8),  vinv));
+        int32x4_t i3 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(x + i + 12), vinv));
         int16x4_t s0 = vqmovn_s32(i0);
         int16x4_t s1 = vqmovn_s32(i1);
         int16x4_t s2 = vqmovn_s32(i2);
@@ -94,10 +105,10 @@ void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
         for (; d + 15 < dim; d += 16) {
             float16x8_t h0 = vreinterpretq_f16_u16(vld1q_u16(row + d));
             float16x8_t h1 = vreinterpretq_f16_u16(vld1q_u16(row + d + 8));
-            int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vcvt_f32_f16(vget_low_f16(h0)), vinv));
-            int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vcvt_f32_f16(vget_high_f16(h0)), vinv));
-            int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vcvt_f32_f16(vget_low_f16(h1)), vinv));
-            int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vcvt_f32_f16(vget_high_f16(h1)), vinv));
+            int32x4_t i0 = bn_neon_round_half_away_s32(vmulq_f32(vcvt_f32_f16(vget_low_f16(h0)), vinv));
+            int32x4_t i1 = bn_neon_round_half_away_s32(vmulq_f32(vcvt_f32_f16(vget_high_f16(h0)), vinv));
+            int32x4_t i2 = bn_neon_round_half_away_s32(vmulq_f32(vcvt_f32_f16(vget_low_f16(h1)), vinv));
+            int32x4_t i3 = bn_neon_round_half_away_s32(vmulq_f32(vcvt_f32_f16(vget_high_f16(h1)), vinv));
             int16x4_t s0 = vqmovn_s32(i0);
             int16x4_t s1 = vqmovn_s32(i1);
             int16x4_t s2 = vqmovn_s32(i2);
@@ -155,10 +166,10 @@ void bn_quant_x_to_q8k(const float *x, int8_t *x_q, float *x_d,
             const float *gx = xb + g * 16;
             int8_t *gq = qb + g * 16;
 
-            int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(gx),      vinv));
-            int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(gx + 4),  vinv));
-            int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(gx + 8),  vinv));
-            int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(gx + 12), vinv));
+            int32x4_t i0 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(gx),      vinv));
+            int32x4_t i1 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(gx + 4),  vinv));
+            int32x4_t i2 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(gx + 8),  vinv));
+            int32x4_t i3 = bn_neon_round_half_away_s32(vmulq_f32(vld1q_f32(gx + 12), vinv));
 
             int8x8_t r0 = vqmovn_s16(vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1)));
             int8x8_t r1 = vqmovn_s16(vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3)));

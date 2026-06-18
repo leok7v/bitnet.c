@@ -372,7 +372,7 @@ fallback_loop:
                               xd_all + (size_t)t * n_bpr,
                               xbs_all + (size_t)t * n_bpr * 16, cols);
         memset(out, 0, (size_t)n_tokens * rows * sizeof(float));
-        BnKQuantMatmulCtx ctx = { out, W, xq_all, xd_all, xbs_all, n_tokens, cols };
+        BnKQuantMatmulCtx ctx = { out, W, xq_all, xd_all, xbs_all, n_tokens, cols, NULL };
         BnTPTask task = { bn_quant_q4k_scalar_sdot_matmul_range, &ctx, rows };
         bn_tp_dispatch(pool, &task, 1);
         free(xq_all);
@@ -400,7 +400,7 @@ fallback_loop:
                                   xd_all + (size_t)t * n_bpr,
                                   xbs_all + (size_t)t * n_bpr * 16, cols);
         memset(out, 0, (size_t)n_tokens * rows * sizeof(float));
-        BnKQuantMatmulCtx ctx = { out, W, xq_all, xd_all, xbs_all, n_tokens, cols };
+        BnKQuantMatmulCtx ctx = { out, W, xq_all, xd_all, xbs_all, n_tokens, cols, NULL };
         BnTPTask task = { bn_quant_q5k_scalar_sdot_matmul_range, &ctx, rows };
         bn_tp_dispatch(pool, &task, 1);
         free(xq_all);
@@ -428,7 +428,7 @@ fallback_loop:
                               xd_all + (size_t)t * n_bpr,
                               xbs_all + (size_t)t * n_bpr * 16, cols);
         memset(out, 0, (size_t)n_tokens * rows * sizeof(float));
-        BnKQuantMatmulCtx ctx = { out, W, xq_all, xd_all, xbs_all, n_tokens, cols };
+        BnKQuantMatmulCtx ctx = { out, W, xq_all, xd_all, xbs_all, n_tokens, cols, NULL };
         BnTPTask task = { bn_quant_q6k_scalar_sdot_matmul_range, &ctx, rows };
         bn_tp_dispatch(pool, &task, 1);
         free(xq_all);
@@ -628,6 +628,7 @@ void bn_quant_matmul_preq8k_multi(float **out, const BnQWeight **W,
                                   int n_tokens, const int8_t *x_q,
                                   const float *x_d, const int16_t *x_bsums,
                                   const float *x_float, BnThreadPool *pool) {
+    (void)prepared; // only consulted on the AVX2/AVX512 K-quant path below
     if (n <= 0 || n > BN_MAX_MULTI_MATMUL) {
         for (int i = 0; i < n; i++)
             bn_quant_matmul_preq8k(out[i], W[i], n_tokens, x_q, x_d, x_bsums,

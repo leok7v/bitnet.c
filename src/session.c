@@ -214,6 +214,14 @@ void bn_session_reset(BnSession *s, const BnModel *model) {
     size_t kv_elem = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
     size_t kv_bytes = 0;
     if (checked_mul_size(kv_size, kv_elem, &kv_bytes) != 0) return;
+    // Reset the mmap-backed KV cache so it both drops its resident pages and
+    // reads back as zero, WITHOUT faulting the whole (up to 256K-context)
+    // cache into RSS. On Linux MADV_DONTNEED gives exactly that. On Darwin/BSD
+    // MADV_DONTNEED is only a hint and does NOT zero, so re-map the region with
+    // MAP_FIXED|MAP_ANON instead: the kernel hands back fresh zero pages lazily
+    // and frees the old ones. A plain memset would be correct but would commit
+    // every page, spiking RSS to the full cache size on each reset.
+#if defined(__linux__)
     if (rs->key_cache_alloc_bytes > 0)
         (void)madvise(rs->key_cache, rs->key_cache_alloc_bytes, MADV_DONTNEED);
     else
@@ -222,6 +230,20 @@ void bn_session_reset(BnSession *s, const BnModel *model) {
         (void)madvise(rs->value_cache, rs->value_cache_alloc_bytes, MADV_DONTNEED);
     else
         memset(rs->value_cache, 0, kv_bytes);
+#else
+    if (rs->key_cache_alloc_bytes > 0)
+        (void)mmap(rs->key_cache, rs->key_cache_alloc_bytes,
+                   PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE,
+                   -1, 0);
+    else
+        memset(rs->key_cache, 0, kv_bytes);
+    if (rs->value_cache_alloc_bytes > 0)
+        (void)mmap(rs->value_cache, rs->value_cache_alloc_bytes,
+                   PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE,
+                   -1, 0);
+    else
+        memset(rs->value_cache, 0, kv_bytes);
+#endif
 
     // TQ compressed KV cache
     if (rs->key_cache_tq && rs->value_cache_tq && c->kv_tq_bits > 0 && bn_model_tq_state(model)) {
