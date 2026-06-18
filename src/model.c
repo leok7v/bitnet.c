@@ -291,7 +291,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv
 
 int bn_model_load_ex(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16,
                      int kv_tq_bits, const BnModelLoadOpts *opts) {
-    int skip_q4_0_repack = (opts && opts->gpu_native_q4_0) ? 1 : 0;
+    int skip_cpu_quant_prepare = (opts && opts->gpu_native_quant) ? 1 : 0;
     memset(m, 0, sizeof(BnModel));
     if (model_ensure_runtime(m) != 0 ||
         model_ensure_io(m) != 0 ||
@@ -899,7 +899,7 @@ int bn_model_load_ex(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16,
 
     BnBackendLayoutPreparedStats prepared_stats = { 0 };
     size_t prepared_weight_bytes =
-        bn_backend_layout_prepared_qweights_size(c, w, skip_q4_0_repack,
+        bn_backend_layout_prepared_qweights_size(c, w, skip_cpu_quant_prepare,
                                                  &prepared_stats);
     size_t shared_gate_float_bytes = 0;
     if (c->has_shared_expert) {
@@ -981,7 +981,7 @@ int bn_model_load_ex(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16,
         if (prepared_weight_bytes > 0) {
             BnBackendLayoutPreparedStats built_stats = { 0 };
             bn_backend_layout_prepare_qweights(m->backend_state->backend, c, w,
-                                               skip_q4_0_repack,
+                                               skip_cpu_quant_prepare,
                                                m->runtime->weight_arena,
                                                &built_stats);
             if (built_stats.q4_repack_bytes > 0) {

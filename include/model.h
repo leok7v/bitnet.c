@@ -27,12 +27,12 @@ typedef struct BnModel {
 
 /* Optional load-time hints. Zero-initialized = current default behavior. */
 typedef struct BnModelLoadOpts {
-    /* A GPU backend will own quantized matmuls and reads native Q4_0 blocks
-     * directly (Metal default; opt out via BN_METAL_DISABLE_Q4_NATIVE), so the
-     * CPU SIMD Q4_0 repack
-     * arena is not built. CPU Q4_0 matmul still works from raw blocks, so this
-     * stays correct even if the GPU is later unavailable. */
-    int gpu_native_q4_0;
+    /* A GPU backend owns the quantized matmuls and reads the raw GGUF blocks
+     * directly (e.g. Metal), so the CPU SIMD "prepared" weight arenas (Q4_0
+     * repack, Q4_K scales, Q6_K expanded, Q8_0 scales) are not built. CPU quant
+     * matmul/matvec still works from raw blocks, so this stays correct even if
+     * the GPU is later unavailable. */
+    int gpu_native_quant;
 } BnModelLoadOpts;
 
 int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv_tq_bits);

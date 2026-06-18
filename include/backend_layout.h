@@ -74,19 +74,22 @@ void *bn_backend_layout_upload_stacked3_qkv(BnGPUBackend *gpu,
                                             int k_bias_fused,
                                             int v_bias_fused);
 
-/* skip_q4_0_repack: when nonzero, the CPU SIMD Q4_0 repack is neither sized nor
- * built (a GPU backend reads native Q4_0 blocks). CPU Q4_0 matmul still works
- * from raw blocks, so this is safe even if the GPU is later unavailable. Other
- * prepared kinds (Q4_K/Q6_K/Q8_0) are unaffected. */
+/* skip_cpu_quant_prepare: when nonzero, the CPU SIMD "prepared" weight arenas
+ * (Q4_0 repack, Q4_K scales, Q6_K expanded, Q8_0 scales) are neither sized nor
+ * built. Use when a GPU backend owns the quantized matmuls and reads the raw
+ * GGUF blocks directly (e.g. Metal): the prepared arenas would never be read.
+ * Safe even if the GPU is later unavailable -- every CPU quant matmul/matvec
+ * path falls back to computing from the raw blocks when no prepared weight
+ * exists (just slower). */
 size_t bn_backend_layout_prepared_qweights_size(const BnConfig *config,
                                                 const BnWeights *weights,
-                                                int skip_q4_0_repack,
+                                                int skip_cpu_quant_prepare,
                                                 BnBackendLayoutPreparedStats *stats);
 
 void bn_backend_layout_prepare_qweights(BnBackendModel *backend,
                                         const BnConfig *config,
                                         const BnWeights *weights,
-                                        int skip_q4_0_repack,
+                                        int skip_cpu_quant_prepare,
                                         SHArena *arena,
                                         BnBackendLayoutPreparedStats *stats);
 

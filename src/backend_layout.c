@@ -39,39 +39,35 @@ static void prepared_stats_add_bytes(BnBackendLayoutPreparedStats *stats,
 }
 
 static void prepared_qweight_size_one(const BnQWeight *w,
-                                      int skip_q4_0_repack,
+                                      int skip_cpu_quant_prepare,
                                       BnBackendLayoutPreparedStats *stats) {
     if (!stats) return;
+    if (skip_cpu_quant_prepare) return;
     BnPreparedWeightKind kind = BN_PREPARED_WEIGHT_NONE;
     size_t bytes = bn_quant_prepared_qweight_size(w, &kind);
-    if (skip_q4_0_repack && kind == BN_PREPARED_WEIGHT_Q4_0_REPACK) return;
     prepared_stats_add_bytes(stats, kind, bytes);
 }
 
 static void prepared_qweight_size_layer(const BnLayerWeights *lw,
-                                        int skip_q4_0_repack,
+                                        int skip_cpu_quant_prepare,
                                         BnBackendLayoutPreparedStats *stats) {
-    prepared_qweight_size_one(&lw->attn.wq, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->attn.wk, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->attn.wv, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->attn.wo, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->ssm.wqkv, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->ssm.wz, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->ssm.ssm_out, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->ffn.ffn_gate, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->ffn.ffn_up, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&lw->ffn.ffn_down, skip_q4_0_repack, stats);
+    prepared_qweight_size_one(&lw->attn.wq, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->attn.wk, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->attn.wv, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->attn.wo, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->ssm.wqkv, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->ssm.wz, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->ssm.ssm_out, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->ffn.ffn_gate, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->ffn.ffn_up, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&lw->ffn.ffn_down, skip_cpu_quant_prepare, stats);
 }
 
 static void prepared_qweight_prepare_one(BnBackendModel *backend,
                                          const BnQWeight *w,
-                                         int skip_q4_0_repack,
+                                         int skip_cpu_quant_prepare,
                                          SHArena *arena) {
-    if (skip_q4_0_repack) {
-        BnPreparedWeightKind kind = BN_PREPARED_WEIGHT_NONE;
-        (void)bn_quant_prepared_qweight_size(w, &kind);
-        if (kind == BN_PREPARED_WEIGHT_Q4_0_REPACK) return;
-    }
+    if (skip_cpu_quant_prepare) return;
     BnPreparedWeight prepared = { 0 };
     if (bn_quant_prepare_qweight(&prepared, w, arena) == 0)
         (void)bn_backend_model_register_prepared_qweight(backend, w,
@@ -80,18 +76,18 @@ static void prepared_qweight_prepare_one(BnBackendModel *backend,
 
 static void prepared_qweight_prepare_layer(BnBackendModel *backend,
                                            const BnLayerWeights *lw,
-                                           int skip_q4_0_repack,
+                                           int skip_cpu_quant_prepare,
                                            SHArena *arena) {
-    prepared_qweight_prepare_one(backend, &lw->attn.wq, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->attn.wk, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->attn.wv, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->attn.wo, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->ssm.wqkv, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->ssm.wz, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->ssm.ssm_out, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->ffn.ffn_gate, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->ffn.ffn_up, skip_q4_0_repack, arena);
-    prepared_qweight_prepare_one(backend, &lw->ffn.ffn_down, skip_q4_0_repack, arena);
+    prepared_qweight_prepare_one(backend, &lw->attn.wq, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->attn.wk, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->attn.wv, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->attn.wo, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->ssm.wqkv, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->ssm.wz, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->ssm.ssm_out, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->ffn.ffn_gate, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->ffn.ffn_up, skip_cpu_quant_prepare, arena);
+    prepared_qweight_prepare_one(backend, &lw->ffn.ffn_down, skip_cpu_quant_prepare, arena);
 }
 
 static void *upload_stacked_quant_layout(BnGPUBackend *gpu,
@@ -299,7 +295,7 @@ void *bn_backend_layout_upload_stacked3_qkv(BnGPUBackend *gpu,
 
 size_t bn_backend_layout_prepared_qweights_size(const BnConfig *config,
                                                 const BnWeights *weights,
-                                                int skip_q4_0_repack,
+                                                int skip_cpu_quant_prepare,
                                                 BnBackendLayoutPreparedStats *stats) {
     BnBackendLayoutPreparedStats local = { 0 };
     if (!stats) stats = &local;
@@ -307,9 +303,9 @@ size_t bn_backend_layout_prepared_qweights_size(const BnConfig *config,
     if (!config || !weights) return 0;
 
     for (int i = 0; i < config->n_layers; i++)
-        prepared_qweight_size_layer(&weights->layers[i], skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&weights->output_weight, skip_q4_0_repack, stats);
-    prepared_qweight_size_one(&weights->tied_embedding_weight, skip_q4_0_repack, stats);
+        prepared_qweight_size_layer(&weights->layers[i], skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&weights->output_weight, skip_cpu_quant_prepare, stats);
+    prepared_qweight_size_one(&weights->tied_embedding_weight, skip_cpu_quant_prepare, stats);
 
     return stats->q4_repack_bytes + stats->q4k_scale_bytes +
            stats->q6k_weight_bytes +
@@ -319,7 +315,7 @@ size_t bn_backend_layout_prepared_qweights_size(const BnConfig *config,
 void bn_backend_layout_prepare_qweights(BnBackendModel *backend,
                                         const BnConfig *config,
                                         const BnWeights *weights,
-                                        int skip_q4_0_repack,
+                                        int skip_cpu_quant_prepare,
                                         SHArena *arena,
                                         BnBackendLayoutPreparedStats *stats) {
     BnBackendLayoutPreparedStats local = { 0 };
@@ -329,7 +325,7 @@ void bn_backend_layout_prepare_qweights(BnBackendModel *backend,
     }
 
     (void)bn_backend_layout_prepared_qweights_size(config, weights,
-                                                   skip_q4_0_repack, &local);
+                                                   skip_cpu_quant_prepare, &local);
     if (stats) {
         prepared_stats_clear(stats);
         prepared_stats_add(stats, &local);
@@ -337,9 +333,9 @@ void bn_backend_layout_prepare_qweights(BnBackendModel *backend,
 
     for (int i = 0; i < config->n_layers; i++)
         prepared_qweight_prepare_layer(backend, &weights->layers[i],
-                                       skip_q4_0_repack, arena);
+                                       skip_cpu_quant_prepare, arena);
     prepared_qweight_prepare_one(backend, &weights->output_weight,
-                                 skip_q4_0_repack, arena);
+                                 skip_cpu_quant_prepare, arena);
     prepared_qweight_prepare_one(backend, &weights->tied_embedding_weight,
-                                 skip_q4_0_repack, arena);
+                                 skip_cpu_quant_prepare, arena);
 }

@@ -815,12 +815,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Load model. Metal reads native Q4_0 blocks by default, so skip the CPU
-    // SIMD Q4_0 repack arena (large; never read on a Metal-native run -- e.g.
-    // it is what made 27B Q4_0 fit). Opt out with BN_METAL_DISABLE_Q4_NATIVE.
-    // CPU Q4_0 matmul still works from raw blocks, so this stays safe.
+    // Load model. Metal reads quantized weights from the raw GGUF blocks, so
+    // skip the CPU SIMD "prepared" weight arenas (Q4_0 repack, Q4_K scales,
+    // Q6_K expanded) -- they are never read on a Metal run and are large
+    // (e.g. skipping them is what made 27B Q4_0 fit on 24 GB). Opt out with
+    // BN_METAL_DISABLE_Q4_NATIVE. CPU quant matmul still works from raw blocks,
+    // so this stays safe even if the Metal device is unavailable.
     BnModelLoadOpts load_opts = {
-        .gpu_native_q4_0 =
+        .gpu_native_quant =
             (args.metal && !getenv("BN_METAL_DISABLE_Q4_NATIVE")) ? 1 : 0,
     };
     BnModel model;

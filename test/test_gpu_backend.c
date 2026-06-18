@@ -603,7 +603,8 @@ static void test_backend_layout_prepared_qweights(void) {
     assert(stats.q6k_weight_bytes == 0);
     assert(stats.q8_scale_bytes == 0);
 
-    /* skip_q4_0_repack=1 (GPU reads native Q4_0) drops the Q4_0 repack. */
+    /* skip_cpu_quant_prepare=1 (GPU reads raw quant blocks) builds no prepared
+     * arena at all. */
     BnBackendLayoutPreparedStats skip_stats = {0};
     size_t skip_bytes = bn_backend_layout_prepared_qweights_size(
         &config, &weights, 1, &skip_stats);
