@@ -23,6 +23,7 @@ emcc \
     "$PROJECT_DIR/src/quant/dequant.c" \
     "$PROJECT_DIR/src/quant/registry.c" \
     "$PROJECT_DIR/src/quant/kernel_select.c" \
+    "$PROJECT_DIR/src/quant/prepared.c" \
     "$PROJECT_DIR/src/quant/dispatch.c" \
     "$PROJECT_DIR/src/quant/matvec_batch.c" \
     "$PROJECT_DIR/src/quant/matmul.c" \
