@@ -5,7 +5,11 @@
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
 
 static inline __m512i q8_join_256_zero(__m256i lo) {
-    return _mm512_castsi256_si512(lo);
+    // Zero-extend: castsi256_si512 leaves the upper 256 bits UNDEFINED, and
+    // the result feeds _mm512_dpbusd_epi32 directly, so garbage in the upper 8
+    // int32 lanes corrupts the dot product. gcc happened to zero them; clang
+    // did not -- which is why the AVX512 Q8_0 matvec diverged under clang.
+    return _mm512_zextsi256_si512(lo);
 }
 
 void bn_quant_q8_avx512_vnni_4row_range(void *ctx, int group_start, int group_end) {

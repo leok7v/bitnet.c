@@ -5,7 +5,10 @@
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
 
 static inline __m512i q4_join_256_zero(__m256i lo) {
-    return _mm512_castsi256_si512(lo);
+    // Zero-extend, not cast: castsi256_si512 leaves the upper 256 bits
+    // UNDEFINED and the result feeds _mm512_dpbusd_epi32 directly, so garbage
+    // in the upper int32 lanes corrupts the dot product (clang-dependent).
+    return _mm512_zextsi256_si512(lo);
 }
 
 void bn_quant_q4_avx512_vnni_4row_range(void *ctx, int group_start, int group_end) {
