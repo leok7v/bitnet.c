@@ -162,8 +162,8 @@ else
   LINK := $(CC)
 endif
 
-SRCS = src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
-       $(TRANSFORMER_SRCS) src/tokenizer.c src/sampler.c \
+SRCS = src/platform.c src/gguf.c src/jinja.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
+       $(TRANSFORMER_SRCS) src/tokenizer.c src/chat_template.c src/sampler.c \
        src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c src/prompt_cache.c src/generate.c $(WEBGPU_SRCS) src/main.c
 CFLAGS += $(WEBGPU_CFLAGS) $(METAL_CFLAGS) $(CUDA_CFLAGS)
 LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS) $(CUDA_LDFLAGS)
@@ -250,9 +250,9 @@ SCALAR_TRANSFORMER_BACKEND = src/transformer/rmsnorm_scalar.c \
     src/transformer/kv.c src/transformer/prefill.c \
     src/transformer/ssm_scalar.c
 
-SCALAR_SRCS = src/platform.c src/gguf.c $(QUANT_COMMON) $(SCALAR_QUANT_BACKEND) \
+SCALAR_SRCS = src/platform.c src/gguf.c src/jinja.c $(QUANT_COMMON) $(SCALAR_QUANT_BACKEND) \
        src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) src/transformer.c src/gpu_moe_cache.c src/gpu_moe_bridge.c \
-       $(SCALAR_TRANSFORMER_BACKEND) src/tokenizer.c src/sampler.c \
+       $(SCALAR_TRANSFORMER_BACKEND) src/tokenizer.c src/chat_template.c src/sampler.c \
        src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c \
        src/prompt_cache.c src/generate.c src/main.c
 
@@ -312,7 +312,7 @@ bench_llama_topk_server: bitnet
 
 bench_kernels_run: bench_kernels
 
-test: test_architecture test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_ssm test_gguf_fuzz test_moe test_qwen36 test_gemma4 test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend
+test: test_architecture test_gguf test_quant test_tokenizer test_chat_template test_jinja test_builtins test_transformer test_threadpool test_safety test_arena test_ssm test_gguf_fuzz test_moe test_qwen36 test_gemma4 test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend
 
 test_architecture: test_backend_matrix test_model_matrix
 
@@ -340,6 +340,21 @@ else
 endif
 
 test_tokenizer: test/test_tokenizer.c src/tokenizer.c src/gguf.c src/platform.c src/sh_log.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
+
+# Chat-template parity (jinja module vs the qwen35 oracle) + special-encode.
+# Pass a GGUF path as argv[1] to also run the special-encode check.
+# Self-contained: BnTpl host + jinja render + special-encode (no model needed).
+test_chat_template: test/test_chat_template.c src/chat_template.c src/jinja.c \
+                    src/tokenizer.c src/gguf.c src/platform.c src/sh_log.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
+
+# jinja engine golden test (expected values baked from real Jinja2 3.1.x).
+test_jinja: test/test_jinja.c src/jinja.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
+
+# jinja builtins (comparison family, strftime_now, is-defined for globals).
+test_builtins: test/test_builtins.c src/jinja.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 test_transformer: test/test_transformer.c $(TRANSFORMER_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \

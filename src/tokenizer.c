@@ -61,6 +61,66 @@ static int vocab_lookup(const BnTokenizer *t, const char *str) {
     return -1;
 }
 
+// GGUF tokenizer.ggml.token_type values (llama.cpp convention).
+enum { BN_TOKEN_TYPE_CONTROL = 3, BN_TOKEN_TYPE_USER_DEFINED = 4 };
+
+typedef struct { int id; int len; } bn_special_entry;
+
+static int cmp_special_len_desc(const void *a, const void *b) {
+    const bn_special_entry *ea = (const bn_special_entry *)a;
+    const bn_special_entry *eb = (const bn_special_entry *)b;
+    return eb->len - ea->len;  // longest literal first → longest-match wins
+}
+
+// Heuristic for GGUFs that lack token_type: treat <...> markers as special,
+// excluding byte fallbacks like <0x0A>.
+static int is_marker_fallback(const char *s) {
+    size_t n = strlen(s);
+    return n >= 3 && s[0] == '<' && s[n - 1] == '>' && strncmp(s, "<0x", 3) != 0;
+}
+
+// Build t->special_ids: control/user-defined token ids sorted by descending
+// literal length, so encode_special can split markers out before BPE.
+// Best-effort — on allocation failure encode_special degrades to plain BPE.
+static void build_special_ids(BnTokenizer *t, BnGGUFFile *f) {
+    int tt_idx = bn_gguf_find_key(f, "tokenizer.ggml.token_type");
+    const int32_t *types = NULL;
+    if (tt_idx >= 0 && f->kvs[tt_idx].type == BN_GGUF_TYPE_ARRAY &&
+        f->kvs[tt_idx].value.arr.elem_type == BN_GGUF_TYPE_INT32 &&
+        f->kvs[tt_idx].value.arr.n >= (uint64_t)t->vocab_size) {
+        types = (const int32_t *)f->kvs[tt_idx].value.arr.data;
+    }
+
+    bn_special_entry *tmp =
+        (bn_special_entry *)malloc((size_t)t->vocab_size * sizeof(*tmp));
+    if (!tmp) return;
+
+    int n = 0;
+    for (int i = 0; i < t->vocab_size; i++) {
+        const char *s = t->vocab[i];
+        int len = (int)strlen(s);
+        int special = types
+            ? (len > 0 && (types[i] == BN_TOKEN_TYPE_CONTROL ||
+                           types[i] == BN_TOKEN_TYPE_USER_DEFINED))
+            : is_marker_fallback(s);
+        if (special) {
+            tmp[n].id = i;
+            tmp[n].len = len;
+            n++;
+        }
+    }
+
+    if (n > 0) {
+        qsort(tmp, (size_t)n, sizeof(*tmp), cmp_special_len_desc);
+        t->special_ids = (int *)malloc((size_t)n * sizeof(int));
+        if (t->special_ids) {
+            for (int i = 0; i < n; i++) t->special_ids[i] = tmp[i].id;
+            t->n_special = n;
+        }
+    }
+    free(tmp);
+}
+
 int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
     memset(t, 0, sizeof(BnTokenizer));
 
@@ -162,6 +222,8 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
 
     t->endoftext_id = vocab_lookup(t, "<|endoftext|>");
 
+    build_special_ids(t, f);
+
     return 0;
 }
 
@@ -173,6 +235,7 @@ void bn_tokenizer_free(BnTokenizer *t) {
     }
     free(t->scores);
     free(t->sorted_indices);
+    free(t->special_ids);
 }
 
 static int tokenizer_init_metaspace_work(const BnTokenizer *t, const char *text,
@@ -354,6 +417,69 @@ int bn_tokenizer_encode(const BnTokenizer *t, const char *text, int add_bos,
 
     free(work);
     return n_tokens;
+}
+
+// Longest special-token literal matching at p. special_ids is sorted by
+// descending length, so the first hit is the longest match.
+static int match_special_at(const BnTokenizer *t, const char *p, int *out_id) {
+    for (int k = 0; k < t->n_special; k++) {
+        int id = t->special_ids[k];
+        const char *lit = t->vocab[id];
+        if (lit[0] != p[0]) continue;
+        size_t n = strlen(lit);
+        if (strncmp(p, lit, n) == 0) {
+            *out_id = id;
+            return (int)n;
+        }
+    }
+    return 0;
+}
+
+int bn_tokenizer_encode_special(const BnTokenizer *t, const char *text,
+                                int add_bos, int *tokens, int max_tokens) {
+    if (!text || !tokens || max_tokens <= 0) return 0;
+
+    int n = 0;
+    if (add_bos && n < max_tokens) tokens[n++] = t->bos_id;
+
+    size_t len = strlen(text);
+    size_t span_start = 0;
+    size_t cursor = 0;
+
+    while (cursor <= len) {
+        int sid = -1;
+        int match_len = 0;
+        if (cursor < len) match_len = match_special_at(t, text + cursor, &sid);
+        int at_end = (cursor == len);
+
+        if (match_len == 0 && !at_end) {
+            cursor++;
+            continue;
+        }
+
+        // Byte-encode the plain run preceding this special token / end of text.
+        if (span_start < cursor) {
+            size_t span = cursor - span_start;
+            char *chunk = (char *)malloc(span + 1);
+            if (!chunk) return -1;
+            memcpy(chunk, text + span_start, span);
+            chunk[span] = '\0';
+            int got = bn_tokenizer_encode(t, chunk, 0, tokens + n,
+                                          max_tokens - n);
+            free(chunk);
+            if (got < 0) return -1;
+            n += got;
+        }
+
+        if (at_end) break;
+
+        if (n >= max_tokens) return -1;
+        tokens[n++] = sid;
+        cursor += (size_t)match_len;
+        span_start = cursor;
+    }
+
+    return n;
 }
 
 int bn_tokenizer_lookup(const BnTokenizer *t, const char *str) {

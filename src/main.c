@@ -6,6 +6,7 @@
 #include "generate.h"
 #include "transformer.h"
 #include "tokenizer.h"
+#include "chat_template.h"
 #include "sampler.h"
 #include "threadpool.h"
 #include "session.h"
@@ -49,6 +50,7 @@ typedef struct {
     int max_seq_len_set;
     int flash_attn;
     int chat;
+    int think;          // enable_thinking flag passed to the chat template
     int temp_set;       // whether user explicitly set --temp
     float repeat_penalty;
     int repeat_set;     // whether user explicitly set --repeat-penalty
@@ -110,7 +112,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --seed <int>    Random seed (default: 42)\n");
     fprintf(stderr, "  --maxseq <int>  Max sequence length (default: model max; GPU auto-caps large contexts to 4096)\n");
     fprintf(stderr, "  --flash         Use flash attention (online softmax)\n");
-    fprintf(stderr, "  --chat          Interactive chat REPL mode\n");
+    fprintf(stderr, "  --chat          Interactive chat REPL mode (uses the GGUF tokenizer.chat_template)\n");
+    fprintf(stderr, "  --think         Enable model thinking/reasoning in --chat (enable_thinking)\n");
     fprintf(stderr, "  --repeat-penalty <float>  Repetition penalty (default: 1.1)\n");
     fprintf(stderr, "  --kv16          Store KV cache in FP16 (halves attention DRAM bandwidth)\n");
     fprintf(stderr, "  --kv-tq <bits>  TurboQuant KV compression (2, 3, or 4 bits)\n");
@@ -245,6 +248,8 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.flash_attn = 1;
         } else if (strcmp(argv[i], "--chat") == 0) {
             args.chat = 1;
+        } else if (strcmp(argv[i], "--think") == 0) {
+            args.think = 1;
         } else if (strcmp(argv[i], "--kv16") == 0) {
             args.kv_f16 = 1;
         } else if (strcmp(argv[i], "--no-prefill") == 0) {
@@ -586,6 +591,46 @@ static int print_token(const char *piece, int token_id, void *user_data) {
     printf("%s", piece);
     if (user_data || isatty(STDOUT_FILENO))
         fflush(stdout);
+    return 0;
+}
+
+// Chat turn capture (template-driven --chat): records generated tokens into the
+// KV-mirror history (for prefix diffing) and accumulates the decoded assistant
+// text, so the next turn can re-render the full conversation.
+typedef struct {
+    int   *history;
+    int    history_len;
+    int    history_cap;
+    int    token_ids;
+    char  *content;
+    size_t content_len;
+    size_t content_cap;
+} BnChatTurn;
+
+static int chat_capture_token(const char *piece, int token_id, void *user_data) {
+    BnChatTurn *t = (BnChatTurn *)user_data;
+    if (t->history && t->history_len < t->history_cap)
+        t->history[t->history_len++] = token_id;
+    if (t->token_ids)
+        fprintf(stderr, "token_id=%d\n", token_id);
+
+    size_t plen = piece ? strlen(piece) : 0;
+    if (plen > 0) {
+        if (t->content_len + plen + 1 > t->content_cap) {
+            size_t ncap = t->content_cap ? t->content_cap * 2 : 256;
+            while (ncap < t->content_len + plen + 1) ncap *= 2;
+            char *grown = (char *)realloc(t->content, ncap);
+            if (grown) { t->content = grown; t->content_cap = ncap; }
+        }
+        if (t->content_len + plen + 1 <= t->content_cap) {
+            memcpy(t->content + t->content_len, piece, plen);
+            t->content_len += plen;
+            t->content[t->content_len] = '\0';
+        }
+    }
+
+    if (piece) printf("%s", piece);
+    fflush(stdout);
     return 0;
 }
 
@@ -1072,11 +1117,13 @@ int main(int argc, char **argv) {
     }
 
     if (args.chat) {
-        // --- Chat REPL mode ---
-        int max_tokens = 4096 + 64;  // generous buffer for encoded turns
-        int *tokens = (int *)malloc(max_tokens * sizeof(int));
-        if (!tokens) {
-            SH_LOG_ERROR("Failed to allocate token buffer");
+        // --- Chat REPL mode (GGUF tokenizer.chat_template rendered via jinja) ---
+        enum { CHAT_MAX_MSGS = 512 };
+        const char *chat_tmpl = bn_gguf_get_str(gf, "tokenizer.chat_template");
+        if (!chat_tmpl) {
+            SH_LOG_ERROR("--chat requires tokenizer.chat_template in the GGUF");
+            fprintf(stderr, "This model has no embedded chat template; "
+                            "cannot format chat turns.\n");
             bn_sampler_free(&sampler);
             bn_tokenizer_free(&tokenizer);
             bn_model_free(&model);
@@ -1084,27 +1131,32 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        // Prompt cache: saves KV prefix for fast /reset and context overflow recovery
-        BnPromptCache *prompt_cache = bn_prompt_cache_create(0, NULL);
+        // bos/eos literals for templates that reference them (Llama-family etc.).
+        const char *bos_token =
+            (tokenizer.bos_id >= 0 && tokenizer.bos_id < tokenizer.vocab_size)
+                ? tokenizer.vocab[tokenizer.bos_id] : NULL;
+        const char *eos_token =
+            (tokenizer.eos_id >= 0 && tokenizer.eos_id < tokenizer.vocab_size)
+                ? tokenizer.vocab[tokenizer.eos_id] : NULL;
+
+        int seq_len = cfg->seq_len;
+        int *tokens = (int *)malloc((size_t)seq_len * sizeof(int));   // full render
+        int *history = (int *)malloc((size_t)seq_len * sizeof(int));  // KV mirror
+        BnTplMessage *msgs =
+            (BnTplMessage *)calloc(CHAT_MAX_MSGS, sizeof(BnTplMessage));
+        if (!tokens || !history || !msgs) {
+            SH_LOG_ERROR("Failed to allocate chat buffers");
+            free(tokens); free(history); free(msgs);
+            bn_sampler_free(&sampler);
+            bn_tokenizer_free(&tokenizer);
+            bn_model_free(&model);
+            bn_gguf_free(gf);
+            return 1;
+        }
 
         int pos = 0;
-        int seq_len = cfg->seq_len;
-
-        // Token history for prompt cache keying
-        int *history = (int *)malloc((size_t)seq_len * sizeof(int));
         int history_len = 0;
-
-        // Feed BOS at pos=0 (skip if model says not to)
-        if (tokenizer.add_bos) {
-            bn_transformer_forward(&model, session, tokenizer.bos_id, pos);
-            pos++;
-            // Track in history and cache
-            if (history) { history[0] = tokenizer.bos_id; history_len = 1; }
-            if (prompt_cache) {
-                int bos_tok = tokenizer.bos_id;
-                bn_prompt_cache_store(prompt_cache, &model, session, &bos_tok, 1);
-            }
-        }
+        int n_msgs = 0;
 
         char line[4096];
         while (1) {
@@ -1112,7 +1164,6 @@ int main(int argc, char **argv) {
             fflush(stdout);
             if (!fgets(line, sizeof(line), stdin)) break;
 
-            // Strip trailing newline
             size_t len = strlen(line);
             while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
                 line[--len] = '\0';
@@ -1120,105 +1171,107 @@ int main(int argc, char **argv) {
             if (len == 0) continue;
             if (strcmp(line, "/quit") == 0) break;
             if (strcmp(line, "/reset") == 0) {
-                // Try to restore BOS state from cache (avoids re-prefilling)
-                int restored = 0;
-                if (prompt_cache && history && history_len > 0) {
-                    restored = bn_prompt_cache_restore(prompt_cache, &model, session,
-                                                        history, history_len);
-                }
-                if (restored > 0) {
-                    pos = restored;
-                    history_len = restored;
-                } else {
-                    bn_session_reset(session, &model);
-                    pos = 0;
-                    history_len = 0;
-                    if (tokenizer.add_bos) {
-                        bn_transformer_forward(&model, session, tokenizer.bos_id, pos);
-                        pos++;
-                        if (history) { history[0] = tokenizer.bos_id; history_len = 1; }
-                    }
-                }
+                for (int i = 0; i < n_msgs; i++) free((char *)msgs[i].content);
+                n_msgs = 0;
+                bn_session_reset(session, &model);
+                pos = 0;
+                history_len = 0;
                 bn_sampler_reset_recent(&sampler);
                 printf("[conversation reset]\n");
                 continue;
             }
 
-            // Format user message into chat turn tokens
-            int n = bn_chat_format_turn(&tokenizer, BN_CHAT_AUTO, line, tokens, max_tokens, NULL);
+            if (n_msgs >= CHAT_MAX_MSGS) {
+                printf("[history full — use /reset]\n");
+                continue;
+            }
 
-            // Context overflow: reset and try restoring cached prefix
-            if (pos + n > seq_len) {
-                printf("[context full — resetting]\n");
+            // Append the user turn.
+            msgs[n_msgs].role = BN_TPL_ROLE_USER;
+            msgs[n_msgs].content = strdup(line);
+            n_msgs++;
+
+            // Render the whole conversation + generation prompt, then tokenize
+            // (special-token aware). Drop oldest turns until it fits the context.
+            int n_full = bn_chat_template_encode(&tokenizer, chat_tmpl, msgs,
+                                                 n_msgs, NULL, 0, args.think, 1,
+                                                 bos_token, eos_token,
+                                                 tokens, seq_len);
+            while (n_full > seq_len - 1 && n_msgs > 1) {
+                free((char *)msgs[0].content);
+                memmove(&msgs[0], &msgs[1],
+                        (size_t)(n_msgs - 1) * sizeof(BnTplMessage));
+                n_msgs--;
                 bn_session_reset(session, &model);
                 pos = 0;
                 history_len = 0;
-                if (tokenizer.add_bos) {
-                    bn_transformer_forward(&model, session, tokenizer.bos_id, pos);
-                    pos++;
-                    if (history) { history[0] = tokenizer.bos_id; history_len = 1; }
-                }
+                bn_sampler_reset_recent(&sampler);
+                printf("[context full — dropped oldest turn]\n");
+                n_full = bn_chat_template_encode(&tokenizer, chat_tmpl, msgs,
+                                                 n_msgs, NULL, 0, args.think, 1,
+                                                 bos_token, eos_token,
+                                                 tokens, seq_len);
+            }
+            if (n_full < 0 || n_full > seq_len - 1) {
+                printf("[chat template failed or turn too large]\n");
+                free((char *)msgs[--n_msgs].content);
+                continue;
+            }
+
+            // Feed only the tokens past the prefix already resident in KV.
+            int common = 0;
+            while (common < history_len && common < n_full &&
+                   history[common] == tokens[common])
+                common++;
+            if (common < history_len) {
+                // Divergence from cached KV: recompute from scratch — always
+                // correct, including SSM/hybrid models that cannot rewind.
+                bn_session_reset(session, &model);
+                pos = 0;
+                common = 0;
                 bn_sampler_reset_recent(&sampler);
             }
+            if (common >= n_full) common = n_full - 1;  // always refresh logits
 
-            // Append turn tokens to history
-            if (history && history_len + n <= seq_len) {
-                memcpy(history + history_len, tokens, (size_t)n * sizeof(int));
-            }
-
-            // Feed prompt tokens through forward pass
-            float *logits = bn_prefill(&model, session, tokens, n, pos, args.no_prefill);
-            pos += n;
-            if (history && history_len + n <= seq_len) history_len += n;
-
+            float *logits = bn_prefill(&model, session, tokens + common,
+                                       n_full - common, common, args.no_prefill);
             if (!logits) {
                 SH_LOG_ERROR("Forward pass returned NULL during prompt");
                 break;
             }
-            for (int i = 0; i < n; i++) {
+            pos = n_full;
+            memcpy(history, tokens, (size_t)n_full * sizeof(int));
+            history_len = n_full;
+            for (int i = common; i < n_full; i++)
                 bn_sampler_accept(&sampler, tokens[i]);
-            }
 
-            // Cap generation to remaining context
+            // Cap generation to remaining context.
             int max_gen = args.n_tokens;
             int remaining = seq_len - pos - 1;
             if (remaining < max_gen) max_gen = remaining;
             if (max_gen < 1) max_gen = 1;
 
-            BnChatHistory hist_ctx = { history, history_len, seq_len, args.token_ids };
+            BnChatTurn turn = { history, history_len, seq_len, args.token_ids,
+                                NULL, 0, 0 };
             int gen_count = bn_generate(&model, session, &tokenizer, &sampler,
-                                         max_gen, &pos,
-                                         print_token, &hist_ctx, NULL, NULL);
-            history_len = hist_ctx.history_len;
+                                        max_gen, &pos,
+                                        chat_capture_token, &turn, NULL, NULL);
+            history_len = turn.history_len;
 
-            // Feed end-of-turn token into KV cache to close the assistant turn
-            int turn_end_id = bn_chat_turn_end_id(&tokenizer, BN_CHAT_AUTO);
-            if (turn_end_id >= 0 && pos < seq_len) {
-                bn_transformer_forward(&model, session, turn_end_id, pos);
-                pos++;
-                if (history && history_len < seq_len) history[history_len++] = turn_end_id;
-            }
-
-            // Cache KV state after this complete turn for prefix reuse
-            if (prompt_cache && history && history_len > 1) {
-                bn_prompt_cache_store(prompt_cache, &model, session, history, history_len);
-            }
+            // Record the assistant message so the next turn re-renders it.
+            msgs[n_msgs].role = BN_TPL_ROLE_ASSISTANT;
+            msgs[n_msgs].content = turn.content ? turn.content : strdup("");
+            n_msgs++;
 
             printf("\n");
-
-            if (gen_count < 0) {
-                printf("[loop detected]\n");
-            }
-
-            // Context usage indicator when >75% full
-            if (pos * 4 > seq_len * 3) {
-                printf("[%d/%d]\n", pos, seq_len);
-            }
+            if (gen_count < 0) printf("[loop detected]\n");
+            if (pos * 4 > seq_len * 3) printf("[%d/%d]\n", pos, seq_len);
         }
 
+        for (int i = 0; i < n_msgs; i++) free((char *)msgs[i].content);
+        free(msgs);
         free(tokens);
         free(history);
-        bn_prompt_cache_free(prompt_cache);
     } else {
         // --- Single-shot generation ---
         int max_prompt_tokens = args.prompt_token_ids

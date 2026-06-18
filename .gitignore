@@ -32,6 +32,8 @@ test_gpu_validate
 bitnet_test_*
 test_*
 !test/*.c
+!test/*.py
+!agentic/test_agent.c
 
 # Bench binaries
 bench_kernels
@@ -77,3 +79,6 @@ Thumbs.db
 
 # Python
 __pycache__/
+
+# Scratch dumps / analysis (not tracked)
+tmp/

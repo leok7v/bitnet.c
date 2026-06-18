@@ -19,12 +19,22 @@ typedef struct {
     int     max_token_length;
     // internal: sorted index for binary search during encoding
     int    *sorted_indices;
+    // internal: control/user-defined token ids, sorted by descending string
+    // length, used to split special markers out before BPE (see encode_special)
+    int    *special_ids;
+    int     n_special;
 } BnTokenizer;
 
 int         bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f);
 void        bn_tokenizer_free(BnTokenizer *t);
 int         bn_tokenizer_encode(const BnTokenizer *t, const char *text, int add_bos,
                              int *tokens, int max_tokens);
+// Like bn_tokenizer_encode, but recognizes special/control token literals
+// (e.g. "<|im_start|>") embedded in the text and emits their single token id
+// rather than byte-encoding them. Required for tokenizing rendered chat
+// templates. Returns token count, or -1 on overflow/allocation failure.
+int         bn_tokenizer_encode_special(const BnTokenizer *t, const char *text,
+                             int add_bos, int *tokens, int max_tokens);
 const char *bn_tokenizer_decode(const BnTokenizer *t, int token);
 int         bn_tokenizer_lookup(const BnTokenizer *t, const char *str);
 
