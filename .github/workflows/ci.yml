@@ -77,8 +77,14 @@ jobs:
         run: sudo apt-get install -y cppcheck
 
       - name: Run cppcheck
+        # --max-configs=1: the SIMD feature macros (__AVX2__, __ARM_NEON,
+        # __AVX512F__, __wasm_relaxed_simd__, ...) gave cppcheck a combinatorial
+        # #ifdef space it tried to enumerate, taking 20+ min. One config plus
+        # -j parallelism brings it to ~1 min; the build matrix already compiles
+        # every SIMD path. -q drops the per-file progress spam.
         run: >
-          cppcheck --error-exitcode=1 --enable=warning,performance
+          cppcheck --quiet --error-exitcode=1 --enable=warning,performance
+          --max-configs=1 -j $(nproc)
           --suppress=missingIncludeSystem
           --suppress=duplicateAssignExpression
           -Iinclude src/
