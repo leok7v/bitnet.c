@@ -122,22 +122,31 @@ static int parse_tool_call(const char *block, size_t block_len,
     if (!out->function_name) return -1;
 
     p = fn_close + 1;
-    const char *param_open = "<parameter=";
     const char *param_close = "</parameter>";
+    const char *param_prefix = "parameter=";
+    // Each value is terminated by </parameter>; anchor on that. The opening tag
+    // is either the well-formed <parameter=KEY> or, from smaller models, a bare
+    // <KEY> (Qwen3.5 4B emits e.g. <path>...</parameter>). Take the first tag
+    // before the close as the opener and strip an optional "parameter=" prefix,
+    // so both shapes parse. Anchoring on the close (not "<parameter=") is what
+    // makes the bare-key form work; the rnd prototype tolerated it too.
     while (out->n_params < MAX_PARAMS_PER_TOOL_CALL) {
-        const char *po = memmem(p, end - p, param_open, strlen(param_open));
-        if (!po) break;
-        po += strlen(param_open);
-        const char *gt = memchr(po, '>', end - po);
-        if (!gt) break;
-        char *key = strndup(po, gt - po);
+        const char *pc = memmem(p, end - p, param_close, strlen(param_close));
+        if (!pc) break;
+        const char *lt = memchr(p, '<', pc - p);
+        if (!lt) { p = pc + strlen(param_close); continue; }
+        const char *gt = memchr(lt, '>', pc - lt);
+        if (!gt) { p = pc + strlen(param_close); continue; }
+        char *key = strndup(lt + 1, gt - (lt + 1));
         const char *vstart = gt + 1;
-        if (*vstart == '\n') vstart++;
-        const char *pc = memmem(vstart, end - vstart, param_close, strlen(param_close));
-        if (!pc) { free(key); break; }
+        if (vstart < pc && *vstart == '\n') vstart++;
         const char *vend = pc;
         if (vend > vstart && vend[-1] == '\n') vend--;
         char *val = strndup(vstart, vend - vstart);
+        // Unify <parameter=KEY> with the bare <KEY> form by dropping the prefix.
+        if (key && strncmp(key, param_prefix, strlen(param_prefix)) == 0)
+            memmove(key, key + strlen(param_prefix),
+                    strlen(key + strlen(param_prefix)) + 1);
         // Tolerate the small-model malformation <parameter=name="value"> (kwarg
         // jammed into the name slot, empty body) instead of the well-formed
         // <parameter=name>value</parameter>. A real parameter name never holds
