@@ -111,6 +111,7 @@ emcc \
     "$PROJECT_DIR/src/transformer/gqa_wasm.c" \
     "$PROJECT_DIR/src/transformer/gqa_scalar.c" \
     "$PROJECT_DIR/src/transformer/gqa_tq_scalar.c" \
+    "$PROJECT_DIR/src/transformer/batched_attn_scalar.c" \
     "$PROJECT_DIR/src/transformer/logits_wasm.c" \
     "$PROJECT_DIR/src/transformer/logits_scalar.c" \
     "$PROJECT_DIR/src/transformer/ssm_wasm.c" \
