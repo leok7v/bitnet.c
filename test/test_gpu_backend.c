@@ -594,7 +594,7 @@ static void test_backend_layout_prepared_qweights(void) {
     layer.attn.wq.cols = 32;
 
     BnBackendLayoutPreparedStats stats = {0};
-    size_t bytes = bn_backend_layout_prepared_qweights_size(&config, &weights, &stats);
+    size_t bytes = bn_backend_layout_prepared_qweights_size(&config, &weights, 0, &stats);
 
 #if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__wasm_relaxed_simd__)
     assert(bytes > 0);
@@ -603,13 +603,20 @@ static void test_backend_layout_prepared_qweights(void) {
     assert(stats.q6k_weight_bytes == 0);
     assert(stats.q8_scale_bytes == 0);
 
+    /* skip_q4_0_repack=1 (GPU reads native Q4_0) drops the Q4_0 repack. */
+    BnBackendLayoutPreparedStats skip_stats = {0};
+    size_t skip_bytes = bn_backend_layout_prepared_qweights_size(
+        &config, &weights, 1, &skip_stats);
+    assert(skip_bytes == 0);
+    assert(skip_stats.q4_repack_bytes == 0);
+
     SHArena *arena = sh_arena_create(bytes + 4 * SH_ARENA_ALIGN);
     assert(arena != NULL);
     BnBackendModel *backend = bn_backend_model_create();
     assert(backend != NULL);
 
     BnBackendLayoutPreparedStats built = {0};
-    bn_backend_layout_prepare_qweights(backend, &config, &weights, arena, &built);
+    bn_backend_layout_prepare_qweights(backend, &config, &weights, 0, arena, &built);
     assert(built.q4_repack_bytes == stats.q4_repack_bytes);
     assert(built.q4k_scale_bytes == 0);
     assert(built.q6k_weight_bytes == 0);
@@ -652,7 +659,7 @@ static void test_backend_layout_prepared_qweights(void) {
 
     BnBackendLayoutPreparedStats q4k_stats = {0};
     size_t q4k_bytes =
-        bn_backend_layout_prepared_qweights_size(&config, &q4k_weights,
+        bn_backend_layout_prepared_qweights_size(&config, &q4k_weights, 0,
                                                  &q4k_stats);
 #if defined(__AVX2__)
     assert(q4k_bytes > 0);
@@ -666,7 +673,7 @@ static void test_backend_layout_prepared_qweights(void) {
     BnBackendModel *q4k_backend = bn_backend_model_create();
     assert(q4k_backend != NULL);
     BnBackendLayoutPreparedStats q4k_built = {0};
-    bn_backend_layout_prepare_qweights(q4k_backend, &config, &q4k_weights,
+    bn_backend_layout_prepare_qweights(q4k_backend, &config, &q4k_weights, 0,
                                        q4k_arena, &q4k_built);
     assert(q4k_built.q4_repack_bytes == 0);
     assert(q4k_built.q4k_scale_bytes == q4k_stats.q4k_scale_bytes);

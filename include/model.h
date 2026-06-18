@@ -25,7 +25,19 @@ typedef struct BnModel {
     BnModelBackendState *backend_state;
 } BnModel;
 
+/* Optional load-time hints. Zero-initialized = current default behavior. */
+typedef struct BnModelLoadOpts {
+    /* A GPU backend will own quantized matmuls and reads native Q4_0 blocks
+     * directly (Metal default; opt out via BN_METAL_DISABLE_Q4_NATIVE), so the
+     * CPU SIMD Q4_0 repack
+     * arena is not built. CPU Q4_0 matmul still works from raw blocks, so this
+     * stays correct even if the GPU is later unavailable. */
+    int gpu_native_q4_0;
+} BnModelLoadOpts;
+
 int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv_tq_bits);
+int  bn_model_load_ex(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16,
+                      int kv_tq_bits, const BnModelLoadOpts *opts);
 void bn_model_free(BnModel *m);
 void bn_model_embed_token(const BnModel *m, float *out, int token);
 void bn_model_set_file(BnModel *model, BnMappedFile file);

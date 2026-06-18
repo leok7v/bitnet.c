@@ -286,6 +286,12 @@ static int tensor_dim0(BnGGUFFile *f, const char *name) {
 // --- Model loading ---
 
 int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv_tq_bits) {
+    return bn_model_load_ex(m, f, max_seq_len, kv_f16, kv_tq_bits, NULL);
+}
+
+int bn_model_load_ex(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16,
+                     int kv_tq_bits, const BnModelLoadOpts *opts) {
+    int skip_q4_0_repack = (opts && opts->gpu_native_q4_0) ? 1 : 0;
     memset(m, 0, sizeof(BnModel));
     if (model_ensure_runtime(m) != 0 ||
         model_ensure_io(m) != 0 ||
@@ -893,7 +899,8 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv
 
     BnBackendLayoutPreparedStats prepared_stats = { 0 };
     size_t prepared_weight_bytes =
-        bn_backend_layout_prepared_qweights_size(c, w, &prepared_stats);
+        bn_backend_layout_prepared_qweights_size(c, w, skip_q4_0_repack,
+                                                 &prepared_stats);
     size_t shared_gate_float_bytes = 0;
     if (c->has_shared_expert) {
         for (int i = 0; i < c->n_layers; i++) {
@@ -974,6 +981,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv
         if (prepared_weight_bytes > 0) {
             BnBackendLayoutPreparedStats built_stats = { 0 };
             bn_backend_layout_prepare_qweights(m->backend_state->backend, c, w,
+                                               skip_q4_0_repack,
                                                m->runtime->weight_arena,
                                                &built_stats);
             if (built_stats.q4_repack_bytes > 0) {

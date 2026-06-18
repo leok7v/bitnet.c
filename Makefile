@@ -682,5 +682,17 @@ test_coherence: $(COHERENCE_SRCS) $(COHERENCE_EXTRA_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 endif
 
+# Native-Q4_0 Metal matvec parity (synthetic; no model). Build with
+# BN_ENABLE_METAL=1; without it the test compiles to a SKIP stub.
+Q4NATIVE_SRCS = test/test_metal_q4_native.c $(filter-out test/test_coherence.c,$(COHERENCE_SRCS))
+ifdef BN_ENABLE_METAL
+test_metal_q4_native: $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS) src/gpu_metal.m
+	$(CC) $(CFLAGS) -c -o /tmp/bn_q4native_metal.o src/gpu_metal.m -fobjc-arc
+	$(CC) $(CFLAGS) -o $@ $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS) /tmp/bn_q4native_metal.o $(LDFLAGS) && ./$@
+else
+test_metal_q4_native: $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
+endif
+
 clean:
 	rm -f bitnet bitnet_scalar bench_kernels bench_prefill bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence test_e2e test_prefill test_kv_f16 default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda src/gpu_metal.o $(BUILD_CONFIG_STAMP)

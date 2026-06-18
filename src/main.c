@@ -815,9 +815,17 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Load model
+    // Load model. Metal reads native Q4_0 blocks by default, so skip the CPU
+    // SIMD Q4_0 repack arena (large; never read on a Metal-native run -- e.g.
+    // it is what made 27B Q4_0 fit). Opt out with BN_METAL_DISABLE_Q4_NATIVE.
+    // CPU Q4_0 matmul still works from raw blocks, so this stays safe.
+    BnModelLoadOpts load_opts = {
+        .gpu_native_q4_0 =
+            (args.metal && !getenv("BN_METAL_DISABLE_Q4_NATIVE")) ? 1 : 0,
+    };
     BnModel model;
-    if (bn_model_load(&model, gf, args.max_seq_len, args.kv_f16, args.kv_tq_bits) != 0) {
+    if (bn_model_load_ex(&model, gf, args.max_seq_len, args.kv_f16,
+                         args.kv_tq_bits, &load_opts) != 0) {
         SH_LOG_ERROR("Failed to load model");
         bn_gguf_free(gf);
         return 1;
@@ -928,8 +936,13 @@ int main(int argc, char **argv) {
         const char *sd = args.metal_shader_dir ? args.metal_shader_dir : "shaders/metal/";
         BnGPUBackend *gpu = bn_gpu_metal_create(sd);
         if (gpu) {
-            // Zero-copy: let Metal wrap mmap'd weight data when explicitly enabled.
-            if (gf->n_shards <= 1 && getenv("BN_METAL_ENABLE_MMAP_ZERO_COPY") &&
+            // Zero-copy by default: wrap mmap'd weight data so Metal does not
+            // allocate a second (Private) GPU copy of every weight. Without it,
+            // unified-memory use ~doubles (mmap source + device copy) and large
+            // models swap (e.g. 9B Q8_0 hit 0.08 tok/s). Native Q4_0 is wrapped
+            // here too; only the legacy repacked-Q4_0 path keeps its own copy.
+            // Opt out with BN_METAL_DISABLE_MMAP_ZERO_COPY.
+            if (gf->n_shards <= 1 && !getenv("BN_METAL_DISABLE_MMAP_ZERO_COPY") &&
                 mf && mf->is_mmap && mf->data)
                 bn_gpu_metal_set_mmap_range(gpu, mf->data, mf->size);
             double gpu_t0 = bn_platform_time_ms();
@@ -1065,7 +1078,8 @@ int main(int argc, char **argv) {
             bn_gguf_free(gf);
             return 1;
         }
-        if (bn_model_load(&draft_model, draft_gf, args.max_seq_len, args.kv_f16, args.kv_tq_bits) != 0) {
+        if (bn_model_load_ex(&draft_model, draft_gf, args.max_seq_len,
+                             args.kv_f16, args.kv_tq_bits, &load_opts) != 0) {
             SH_LOG_ERROR("Failed to load draft model");
             bn_gguf_free(draft_gf);
             bn_sampler_free(&sampler);

@@ -62,6 +62,7 @@ typedef struct {
     id<MTLComputePipelineState> q6k_mul_mm_pipeline;
     id<MTLComputePipelineState> q8_0_mul_mm_pipeline;
     id<MTLComputePipelineState> q4_0_mul_mm_pipeline;
+    id<MTLComputePipelineState> q4_native_mul_mm_pipeline;
     id<MTLComputePipelineState> q4_1_mul_mm_pipeline;
     id<MTLComputePipelineState> q3k_mul_mm_pipeline;
     id<MTLComputePipelineState> q2k_mul_mm_pipeline;
@@ -87,6 +88,7 @@ typedef struct {
     id<MTLComputePipelineState> prefill_kv_prep_pipeline;
     int ssm_prefill_enabled;
     int q4_q8_enabled;
+    int q4_native_enabled;  /* read native GGUF Q4_0 (no repack copy); decode-only */
     int q8_barriers_enabled;
     int cpu_order_rmsnorm_enabled;
 
@@ -142,6 +144,10 @@ typedef struct {
     /* Zero-copy mmap range (Phase 5) */
     const void   *mmap_base;
     size_t        mmap_size;
+    /* Bytes wrapped via newBufferWithBytesNoCopy (mmap weights). These do not
+     * show up in [device currentAllocatedSize], so track them for the memory
+     * budget used by the optional-layout guard. */
+    size_t        nocopy_bytes;
 } BnMetalCtx;
 
 typedef struct {
@@ -636,13 +642,59 @@ static BnMetalBuf *metal_repack_q4_0_for_gpu(BnMetalCtx *ctx,
     return buf;
 }
 
+/* Native Q4_0 buffer: concatenate raw 18-byte-block parts verbatim (no repack)
+ * and optionally append fp32 bias on a 4-byte boundary so q4_native_matvec can
+ * read it via p[4]=bias_offset (uint32 units). Used when native Q4_0 is on
+ * (the default), for the biased / stacked weight-create entry points. */
+static BnMetalBuf *metal_q4_native_buffer(BnMetalCtx *ctx,
+                                          const void *const *parts,
+                                          const size_t *part_sizes,
+                                          int n_parts, int rows, int cols,
+                                          const float *bias, int bias_len)
+{
+    if (!ctx || n_parts <= 0 || rows <= 0 || cols <= 0) return NULL;
+    size_t wbytes = 0;
+    for (int i = 0; i < n_parts; i++) wbytes += part_sizes[i];
+    size_t bias_off_bytes = (wbytes + 3) & ~(size_t)3;
+    size_t bias_bytes =
+        (bias && bias_len > 0) ? (size_t)bias_len * sizeof(float) : 0;
+    size_t total = bias_off_bytes + bias_bytes;
+
+    uint8_t *blob = (uint8_t *)calloc(1, total ? total : 1);
+    if (!blob) return NULL;
+    size_t off = 0;
+    for (int i = 0; i < n_parts; i++) {
+        memcpy(blob + off, parts[i], part_sizes[i]);
+        off += part_sizes[i];
+    }
+    uint32_t bias_offset = 0;
+    if (bias_bytes) {
+        bias_offset = (uint32_t)(bias_off_bytes / sizeof(uint32_t));
+        memcpy(blob + bias_off_bytes, bias, bias_bytes);
+    }
+
+    BnMetalBuf *buf = (BnMetalBuf *)calloc(1, sizeof(BnMetalBuf));
+    if (!buf) { free(blob); return NULL; }
+    buf->buf = metal_new_weight_buffer(ctx, blob, total);
+    free(blob);
+    if (!buf->buf) { free(buf); return NULL; }
+    buf->size = total;
+    buf->offset = 0;
+    buf->type = BN_GGUF_TENSOR_Q4_0;
+    buf->rows = rows;
+    buf->cols = cols;
+    buf->bias_offset = bias_offset;
+    /* native layout: q4_repacked / q4_prepared stay 0 */
+    return buf;
+}
+
 static void *metal_buffer_create(void *vctx, const void *data, size_t size,
                                   int type, int rows, int cols)
 {
     BnMetalCtx *ctx = (BnMetalCtx *)vctx;
     if (!ctx || !data || size == 0) return NULL;
 
-    if (type == BN_GGUF_TENSOR_Q4_0)
+    if (type == BN_GGUF_TENSOR_Q4_0 && !ctx->q4_native_enabled)
         return metal_repack_q4_0_for_gpu(ctx, data, size, rows, cols, NULL, 0, 1);
 
     BnMetalBuf *buf = (BnMetalBuf *)calloc(1, sizeof(BnMetalBuf));
@@ -688,6 +740,7 @@ static void *metal_buffer_create(void *vctx, const void *data, size_t size,
                 buf->rows = rows;
                 buf->cols = cols;
                 buf->is_slab = 0;
+                ctx->nocopy_bytes += size; /* counted in the GPU memory budget */
                 return buf;
             }
             /* Fall through to copy path if NoCopy fails */
@@ -717,6 +770,13 @@ static void *metal_buffer_create_biased(void *vctx, const void *data, size_t siz
 
     if (type == BN_GGUF_TENSOR_Q4_0) {
         int bias_len = (int)(bias_size / sizeof(float));
+        if (ctx->q4_native_enabled) {
+            const void *parts[1] = { data };
+            size_t part_sizes[1] = { size };
+            return metal_q4_native_buffer(ctx, parts, part_sizes, 1,
+                                          rows, cols,
+                                          (const float *)bias, bias_len);
+        }
         return metal_repack_q4_0_for_gpu(ctx, data, size, rows, cols,
                                          (const float *)bias, bias_len, 1);
     }
@@ -747,6 +807,12 @@ static void *metal_buffer_create_stacked2(void *vctx,
 
     size_t total = size0 + size1;
     if (type == BN_GGUF_TENSOR_Q4_0) {
+        if (ctx->q4_native_enabled) {
+            const void *parts[2] = { data0, data1 };
+            size_t part_sizes[2] = { size0, size1 };
+            return metal_q4_native_buffer(ctx, parts, part_sizes, 2,
+                                          rows, cols, NULL, 0);
+        }
         uint8_t *combined = (uint8_t *)malloc(total);
         if (!combined) return NULL;
         memcpy(combined, data0, size0);
@@ -805,6 +871,12 @@ static void *metal_buffer_create_stacked3(void *vctx,
     if (!ctx || !data0 || !data1 || !data2 ||
         size0 == 0 || size1 == 0 || size2 == 0)
         return NULL;
+    if (type == BN_GGUF_TENSOR_Q4_0 && ctx->q4_native_enabled) {
+        const void *parts[3] = { data0, data1, data2 };
+        size_t part_sizes[3] = { size0, size1, size2 };
+        return metal_q4_native_buffer(ctx, parts, part_sizes, 3,
+                                      rows, cols, NULL, 0);
+    }
     if (type == BN_GGUF_TENSOR_Q4_0 && metal_q4_prepared_upload_enabled())
         return NULL;
 
@@ -844,6 +916,13 @@ static void *metal_buffer_create_stacked3_biased(void *vctx,
     if (!ctx || !data0 || !data1 || !data2 || !bias ||
         size0 == 0 || size1 == 0 || size2 == 0 || bias_size == 0)
         return NULL;
+    if (type == BN_GGUF_TENSOR_Q4_0 && ctx->q4_native_enabled) {
+        const void *parts[3] = { data0, data1, data2 };
+        size_t part_sizes[3] = { size0, size1, size2 };
+        int bias_len = (int)(bias_size / sizeof(float));
+        return metal_q4_native_buffer(ctx, parts, part_sizes, 3, rows, cols,
+                                      (const float *)bias, bias_len);
+    }
     if (type == BN_GGUF_TENSOR_Q4_0 && metal_q4_prepared_upload_enabled())
         return NULL;
 
@@ -1367,11 +1446,13 @@ static int metal_matvec(void *vctx, float *out, void *W_buf, const float *x,
     size_t x_size = (size_t)cols * sizeof(float);
     size_t out_size = (size_t)rows * sizeof(float);
     if (ensure_scratch(ctx, x_size, out_size) != 0) return -1;
-    int use_q4_prepared_q8 = ctx->q4_q8_enabled && type == BN_GGUF_TENSOR_Q4_0 &&
+    int use_q4_prepared_q8 = ctx->q4_q8_enabled && !ctx->q4_native_enabled &&
+                    type == BN_GGUF_TENSOR_Q4_0 &&
                     wbuf->q4_prepared &&
                     ctx->q8_quant_pipeline &&
                     ctx->q4_prepared_q8_matvec_pipeline;
-    int use_q4_q8 = ctx->q4_q8_enabled && type == BN_GGUF_TENSOR_Q4_0 &&
+    int use_q4_q8 = ctx->q4_q8_enabled && !ctx->q4_native_enabled &&
+                    type == BN_GGUF_TENSOR_Q4_0 &&
                     !wbuf->q4_prepared &&
                     ctx->q8_quant_pipeline && ctx->q4_q8_matvec_pipeline;
     int use_q6_q8k = type == BN_GGUF_TENSOR_Q6_K &&
@@ -1484,6 +1565,7 @@ metal_mul_mm_pipeline_for(BnMetalCtx *ctx, int type,
         return ctx->q6k_mul_mm_pipeline;
     }
     if (type == BN_GGUF_TENSOR_Q8_0   && ctx->q8_0_mul_mm_pipeline)   return ctx->q8_0_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_Q4_0   && ctx->q4_native_enabled)      return ctx->q4_native_mul_mm_pipeline;
     if (type == BN_GGUF_TENSOR_Q4_0   && ctx->q4_0_mul_mm_pipeline)   return ctx->q4_0_mul_mm_pipeline;
     if (type == BN_GGUF_TENSOR_Q4_1   && ctx->q4_1_mul_mm_pipeline)   return ctx->q4_1_mul_mm_pipeline;
     if (type == BN_GGUF_TENSOR_Q3_K   && ctx->q3k_mul_mm_pipeline)    return ctx->q3k_mul_mm_pipeline;
@@ -3821,6 +3903,44 @@ static int metal_execute(void *vctx, const void *ops_raw, int n_ops,
     return 0;
 }
 
+/* Report the GPU memory budget so optional_layout_fits_memory() can decide
+ * whether to allocate the additive fused QKV/QK/gate-up layouts. On Apple
+ * unified memory there is no separate VRAM, so use the device's recommended
+ * working-set size as the budget and currentAllocatedSize (which already counts
+ * the no-copy weight buffers) as used. Without this the guard saw no
+ * memory_info, always allocated every fused copy, and a model could commit far
+ * past physical RAM and swap (e.g. 9B Q8_0 hit a 13 GB anonymous footprint and
+ * 0.08 tok/s on a 24 GB machine). */
+static int metal_memory_info(void *vctx, size_t *free_bytes,
+                             size_t *total_bytes)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || !ctx->device || !free_bytes || !total_bytes)
+        return -1;
+    size_t budget = (size_t)[ctx->device recommendedMaxWorkingSetSize];
+    if (budget == 0)
+        return -1;
+    /* Used = device-allocated buffers + no-copy mmap weight buffers. The
+     * device's currentAllocatedSize covers every buffer it allocates (repacked
+     * weights, fused QKV/gate-up stacks, KV cache, activation scratch) but NOT
+     * newBufferWithBytesNoCopy weights, which wrap mmap pages and are the bulk
+     * of a Q8_0 model. ctx->nocopy_bytes tracks those. Counting them at upload
+     * (not when the pages fault in) is what makes the layout guard skip fused
+     * copies before the process commits past the working set and swaps. */
+    size_t used = (size_t)[ctx->device currentAllocatedSize] + ctx->nocopy_bytes;
+    *total_bytes = budget;
+    *free_bytes  = (used < budget) ? budget - used : 0;
+    if (getenv("BN_METAL_MEM_DEBUG")) {
+        static int n = 0;
+        if (n++ % 20 == 0)
+            fprintf(stderr, "[bn:gpu:metal:mem] budget=%.2fG alloc=%.2fG "
+                    "nocopy=%.2fG free=%.2fG\n", budget/1073741824.0,
+                    (double)[ctx->device currentAllocatedSize]/1073741824.0,
+                    ctx->nocopy_bytes/1073741824.0, *free_bytes/1073741824.0);
+    }
+    return 0;
+}
+
 /* ── Public API ────────────────────────────────────────────────────── */
 
 BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
@@ -3862,13 +3982,40 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
         fprintf(stderr, "[bn:gpu:metal] compiled %d/%d matvec pipelines\n",
                 compiled, N_SUPPORTED_TYPES);
 
-        if (!getenv("BN_GPU_Q4_Q8") &&
+        /* Native Q4_0 (default ON; opt out with BN_METAL_DISABLE_Q4_NATIVE):
+         * read the GGUF 18-byte block directly so Q4_0 weights need no repacked
+         * GPU copy (q4_native_matvec/q4_native_mul_mm take fp32 x like the
+         * generic pipeline path). When on, the q4/q8-prequant and split/fused
+         * Q4_0 paths -- which all assume the repacked layout -- are disabled so
+         * every Q4_0 op routes to the native kernels (decode + prefill). This
+         * also lets model load skip the CPU SIMD Q4_0 repack arena. */
+        ctx->q4_native_enabled = getenv("BN_METAL_DISABLE_Q4_NATIVE") ? 0 : 1;
+        if (ctx->q4_native_enabled) {
+            id<MTLComputePipelineState> nat = compile_shader(
+                ctx, dir, "q4_native_matvec.metal", "q4_native_matvec");
+            if (nat) ctx->pipelines[BN_GGUF_TENSOR_Q4_0] = nat;
+            else { ctx->q4_native_enabled = 0;
+                   fprintf(stderr, "[bn:gpu:metal] q4_native compile failed; "
+                                   "falling back to repacked Q4_0\n"); }
+        }
+        if (ctx->q4_native_enabled) {
+            MTLFunctionConstantValues *empty_fc =
+                [[MTLFunctionConstantValues alloc] init];
+            ctx->q4_native_mul_mm_pipeline = compile_shader_with_fc(
+                ctx, dir, "q4_native_mul_mm.metal", "q4_native_mul_mm",
+                empty_fc);
+            /* No native GEMM -> fall back to per-token native matvec for
+             * prefill (still correct, just slower). */
+        }
+        if (!ctx->q4_native_enabled &&
+            !getenv("BN_GPU_Q4_Q8") &&
             !getenv("BN_METAL_DISABLE_Q4_Q8_DEFAULT")) {
             setenv("BN_GPU_Q4_Q8", "1", 1);
             if (!getenv("BN_GPU_Q4_Q8_FROM_LAYER"))
                 setenv("BN_GPU_Q4_Q8_FROM_LAYER", "0", 1);
         }
-        ctx->q4_q8_enabled = getenv("BN_GPU_Q4_Q8") ? 1 : 0;
+        ctx->q4_q8_enabled =
+            (!ctx->q4_native_enabled && getenv("BN_GPU_Q4_Q8")) ? 1 : 0;
         ctx->q8_barriers_enabled = getenv("BN_METAL_Q8_BARRIERS") ? 1 : 0;
         ctx->cpu_order_rmsnorm_enabled =
             getenv("BN_METAL_CPU_ORDER_RMSNORM") ? 1 : 0;
@@ -3938,6 +4085,7 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
         gpu->execute              = metal_execute;
         gpu->init_activations     = metal_init_activations;
         gpu->free_activations     = metal_free_activations;
+        gpu->memory_info          = metal_memory_info;
         gpu->write_activation     = metal_write_activation;
         gpu->read_activation      = metal_read_activation;
         gpu->ctx                  = ctx;
@@ -3945,6 +4093,12 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
                                     BN_GPU_CAP_Q4_MATVEC_SPLIT |
                                     BN_GPU_CAP_Q4K_MATVEC_SPLIT |
                                     BN_GPU_CAP_Q4_FUSED_GATEUP_SILU;
+        /* Native Q4_0 has no repacked split/fused-gateup kernels; drop those
+         * Q4_0 caps so gpu_emit emits plain per-weight matvec for Q4_0 (Q4_K
+         * split stays available). */
+        if (ctx->q4_native_enabled)
+            gpu->caps &= ~(uint32_t)(BN_GPU_CAP_Q4_MATVEC_SPLIT |
+                                     BN_GPU_CAP_Q4_FUSED_GATEUP_SILU);
         gpu->kind                 = BN_GPU_BACKEND_METAL;
 
         return gpu;
