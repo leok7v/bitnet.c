@@ -4106,6 +4106,11 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
             gpu->caps &= ~(uint32_t)(BN_GPU_CAP_Q4_MATVEC_SPLIT |
                                      BN_GPU_CAP_Q4_FUSED_GATEUP_SILU);
         gpu->kind                 = BN_GPU_BACKEND_METAL;
+        /* Without this the policy default (128 MB) forces any large weight --
+         * notably the vocab output projection -- onto the CPU each token, which
+         * dominates decode CPU time. Metal binds buffers up to maxBufferLength,
+         * so advertise the real cap; weights past it still fall back. */
+        gpu->max_storage_binding_size = (size_t)[ctx->device maxBufferLength];
 
         return gpu;
     }

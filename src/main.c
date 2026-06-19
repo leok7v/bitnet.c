@@ -1375,7 +1375,10 @@ int main(int argc, char **argv) {
         double gen_start = prompt_start;
         int pos = 0;
         int n_generated = 0;
-        double cpu0_ms = 0.0, gpu0_ms = 0.0;  /* decode-start CPU/GPU snapshots */
+        double cpu0_ms = 0.0;  /* decode-start CPU snapshot */
+#ifdef BN_ENABLE_METAL
+        double gpu0_ms = 0.0;  /* decode-start GPU-active snapshot */
+#endif
 
         if (args.n_tokens == 0 && !has_draft) {
             if (bn_prefill_no_logits(&model, session, prompt_tokens, n_prompt, 0,
