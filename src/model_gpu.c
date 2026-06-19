@@ -269,6 +269,18 @@ static int optional_layout_fits_memory(BnGPUBackend *gpu, size_t bytes,
                                        int layer, const char *name) {
     if (bytes == 0)
         return 0;
+    if (getenv("BN_GPU_NO_STACKED_LAYOUTS"))
+        return 0; /* general kill-switch for additive stacked/fused copies */
+    /* On Metal (unified memory) these stacked/fused weight buffers are additive
+     * Private copies of the no-copy mmap'd individual weights -- they roughly
+     * DOUBLE resident memory (measured ~+7 GiB on Qwen3.5-9B). They feed the
+     * split/fused matvec kernels, which are a CUDA-oriented optimization; on
+     * Metal the separate-matvec path is actually FASTER for both prefill and
+     * decode (measured across 0.8B-9B), so building them is pure loss. Skip on
+     * Metal (opt back in with BN_METAL_FORCE_STACKED_LAYOUTS). */
+    if (gpu && gpu->kind == BN_GPU_BACKEND_METAL &&
+        !getenv("BN_METAL_FORCE_STACKED_LAYOUTS"))
+        return 0;
     if (!gpu || !gpu->memory_info)
         return 1;
     size_t free_bytes = 0;
