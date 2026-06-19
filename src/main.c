@@ -39,6 +39,16 @@
 #endif
 #include <unistd.h>
 
+// Allocation failure on a 64-bit virtual-memory host is effectively
+// unreachable (the OS kills the process under memory pressure long before
+// malloc/strdup hand back NULL); aborting here makes the contract explicit
+// instead of dereferencing NULL on a path that cannot realistically fire.
+
+static void *oom(void *p) {
+    if (!p) { abort(); }
+    return p;
+}
+
 // Cumulative process CPU time (user+sys, all threads) in ms, for a
 // Wall/CPU/GPU decode breakdown alongside the GPU-active integral.
 
@@ -1223,7 +1233,7 @@ int main(int argc, char **argv) {
 
             // Append the user turn.
             msgs[n_msgs].role = BN_TPL_ROLE_USER;
-            msgs[n_msgs].content = strdup(line);
+            msgs[n_msgs].content = oom(strdup(line));
             n_msgs++;
 
             // Render the whole conversation + generation prompt, then tokenize
@@ -1295,7 +1305,7 @@ int main(int argc, char **argv) {
 
             // Record the assistant message so the next turn re-renders it.
             msgs[n_msgs].role = BN_TPL_ROLE_ASSISTANT;
-            msgs[n_msgs].content = turn.content ? turn.content : strdup("");
+            msgs[n_msgs].content = turn.content ? turn.content : oom(strdup(""));
             n_msgs++;
 
             printf("\n");

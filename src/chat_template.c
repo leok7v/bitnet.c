@@ -14,6 +14,15 @@ struct hostctx {
     size_t cap;
 };
 
+// Allocation failure on a 64-bit virtual-memory host is effectively
+// unreachable; abort rather than write into a NULL buffer after a lying
+// capacity update.
+
+static void *oom(void *p) {
+    if (!p) { abort(); }
+    return p;
+}
+
 static struct jinja_value jv(enum jinja_value_kind k) {
     struct jinja_value v = {0};
     v.kind = k;
@@ -60,7 +69,7 @@ static const char *build_tool_json(struct hostctx *c, const BnTplTool *t) {
     const char *params = t->params_json ? t->params_json : "{}";
     size_t need = strlen(name) + strlen(desc) * 2 + strlen(params) + 64;
     if (need > c->cap) {
-        c->json = (char *)realloc(c->json, need);
+        c->json = (char *)oom(realloc(c->json, need));
         c->cap = need;
     }
     char *w = c->json;
