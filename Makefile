@@ -194,7 +194,7 @@ BUILD_METAL_OBJS := $(addprefix $(BUILD)/,$(METAL_OBJS))
 BUILD_CUDA_OBJS  := $(addprefix $(BUILD)/,$(CUDA_OBJS))
 
 SRCS = src/platform.c src/gguf.c src/jinja.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
-       $(TRANSFORMER_SRCS) src/tokenizer.c src/chat_template.c src/sampler.c \
+       $(TRANSFORMER_SRCS) src/tokenizer.c src/chat_template.c src/sampler.c src/grammar.c \
        src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c src/prompt_cache.c src/generate.c $(WEBGPU_SRCS) src/main.c
 CFLAGS += $(WEBGPU_CFLAGS) $(METAL_CFLAGS) $(CUDA_CFLAGS)
 LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS) $(CUDA_LDFLAGS)
@@ -415,6 +415,9 @@ test_safety: test/test_safety.c src/platform.c src/gguf.c $(QUANT_SRCS) src/turb
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 test_arena: test/test_arena.c src/sh_arena.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
+
+test_grammar: test/test_grammar.c src/grammar.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 SSM_BACKEND = $(filter src/transformer/ssm_%, $(TRANSFORMER_BACKEND))

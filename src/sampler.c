@@ -38,7 +38,14 @@ int bn_sampler_init(BnSampler *s, int vocab_size, float temp, float topp, uint64
     s->recent_cap = 0;
     s->recent_len = 0;
     s->recent_pos = 0;
+    s->mask_fn = NULL;
+    s->mask_ctx = NULL;
     return s->candidates ? 0 : -1;
+}
+
+void bn_sampler_set_mask(BnSampler *s, BnLogitMaskFn fn, void *ctx) {
+    s->mask_fn = fn;
+    s->mask_ctx = ctx;
 }
 
 void bn_sampler_free(BnSampler *s) {
@@ -274,6 +281,10 @@ static int sample_topp(BnSampler *s, float *probs, int n, float topp) {
 }
 
 int bn_sampler_sample(BnSampler *s, float *logits) {
+    // Constrained decoding: forbid grammar-illegal tokens before anything else.
+    if (s->mask_fn)
+        s->mask_fn(s->mask_ctx, logits, s->vocab_size);
+
     // Apply repetition penalty before temperature/argmax
     if (s->repeat_penalty != 1.0f && s->recent_len > 0) {
         for (int i = 0; i < s->recent_len; i++) {

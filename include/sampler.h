@@ -8,6 +8,12 @@
 
 typedef struct { float prob; int index; } BnProbIndex;
 
+/* Optional logit mask, called at the top of bn_sampler_sample before any
+ * temperature/penalty/argmax. The callback sets logits[t] = -INFINITY for
+ * every token it forbids. Lets a REPL/agent plug in grammar-constrained
+ * decoding (see grammar.h) without the sampler knowing about grammars. */
+typedef void (*BnLogitMaskFn)(void *ctx, float *logits, int vocab_size);
+
 typedef struct {
     int      vocab_size;
     float    temperature;
@@ -21,11 +27,16 @@ typedef struct {
     int      recent_cap;
     int      recent_len;
     int      recent_pos;
+    // Optional constrained-decoding mask
+    BnLogitMaskFn mask_fn;
+    void         *mask_ctx;
 } BnSampler;
 
 int  bn_sampler_init(BnSampler *s, int vocab_size, float temp, float topp, uint64_t seed);
 void bn_sampler_free(BnSampler *s);
 void bn_sampler_set_repeat_penalty(BnSampler *s, float penalty, int window);
+/* Install (or clear, with fn == NULL) a logit mask for constrained decoding. */
+void bn_sampler_set_mask(BnSampler *s, BnLogitMaskFn fn, void *ctx);
 void bn_sampler_accept(BnSampler *s, int token);
 void bn_sampler_reset_recent(BnSampler *s);
 int  bn_sampler_sample(BnSampler *s, float *logits);
