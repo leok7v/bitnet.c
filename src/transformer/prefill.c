@@ -1478,11 +1478,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
     if (n_tokens <= 0) return NULL;
     if (sess) {
         sess->gpu_kv_direct_valid = 0;
-        /* Assume every SSM layer will write its recurrent state directly to
-           the GPU; any layer that falls back to the CPU path clears this, so
-           the end-of-prefill sync uploads only when at least one layer was
-           CPU-computed (logical AND over layers). */
-        sess->gpu_ssm_direct_valid = 1;
+        sess->gpu_ssm_direct_valid = 0;
         /* A from-scratch prefill restarts the sequence, so the recurrent SSM
            state must be zero. The GPU SSM buffer is per-context (shared, not
            otherwise cleared), so explicitly zero it; no-op on CPU/non-hybrid. */
@@ -2475,13 +2471,11 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                       kern_ssm, ssm_idx, l,
                                       n_tokens >= prefill_moe_chain_min_tokens(c, bn_model_gpu(m)),
                                       c->norm_eps, &ssm_did_ffn) == 0) {
+                sess->gpu_ssm_direct_valid = 1;
                 if (ssm_did_ffn)
                     goto prefill_layer_done;
                 goto prefill_ssm_done;
             }
-            /* This SSM layer fell back to the CPU; its GPU-resident state is
-               now stale, so force the end-of-prefill upload. */
-            sess->gpu_ssm_direct_valid = 0;
 
             for (int t = 0; t < n_tokens; t++)
                 prefill_rmsnorm(Xb + (size_t)t * dim, act + (size_t)t * dim,
