@@ -12,6 +12,8 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>   /* _mh_execute_header for the embedded metallib */
 
 #include "gpu_metal.h"
 #include "gpu_backend.h"
@@ -124,6 +126,10 @@ typedef struct {
     int                            gpu_kv_dim;
     /* Shader directory path */
     char shader_dir[256];
+    /* Precompiled shaders embedded in the binary's __TEXT,__metallib section.
+     * When non-nil, pipelines are looked up here; nil -> compile .metal files
+     * from shader_dir (BN_METAL_SHADER_DIR dev override / fallback). */
+    id<MTLLibrary> shader_lib;
 
     /* Profiling */
     int gpu_frame;
@@ -302,21 +308,9 @@ static const int supported_types[] = {
 
 /* ── Shader compilation ────────────────────────────────────────────── */
 
-static id<MTLComputePipelineState> compile_shader(BnMetalCtx *ctx,
-                                                   const char *dir,
-                                                   const char *filename,
-                                                   const char *fn_name)
+/* Compile options shared by the from-source fallback path. */
+static MTLCompileOptions *metal_compile_options(void)
 {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s", dir, filename);
-
-    NSString *nsPath = [NSString stringWithUTF8String:path];
-    NSError *err = nil;
-    NSString *source = [NSString stringWithContentsOfFile:nsPath
-                                                 encoding:NSUTF8StringEncoding
-                                                    error:&err];
-    if (!source) return nil;
-
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     if (@available(macOS 15.0, *)) {
         opts.mathMode = MTLMathModeFast;
@@ -327,30 +321,69 @@ static id<MTLComputePipelineState> compile_shader(BnMetalCtx *ctx,
 #pragma clang diagnostic pop
     }
     opts.languageVersion = MTLLanguageVersion3_0;
+    return opts;
+}
 
+/* Read one .metal file and compile it to a library (fallback when no embedded
+ * metallib is present, or under the BN_METAL_SHADER_DIR dev override). */
+static id<MTLLibrary> metal_lib_from_file(BnMetalCtx *ctx, const char *dir,
+                                          const char *filename)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, filename);
+    NSError *err = nil;
+    NSString *source =
+        [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path]
+                                  encoding:NSUTF8StringEncoding error:&err];
+    if (!source) return nil;
     id<MTLLibrary> lib = [ctx->device newLibraryWithSource:source
-                                                   options:opts
+                                                   options:metal_compile_options()
                                                      error:&err];
-    if (!lib) {
+    if (!lib)
         fprintf(stderr, "[bn:gpu:metal] shader compile error (%s): %s\n",
                 filename, [[err localizedDescription] UTF8String]);
-        return nil;
-    }
+    return lib;
+}
 
-    NSString *fnName = [NSString stringWithUTF8String:fn_name];
-    id<MTLFunction> fn = [lib newFunctionWithName:fnName];
+/* Is fn_name present in the embedded library? Several optional pipelines (e.g.
+ * the per-format *_mul_mm variants that were never authored as .metal files) are
+ * registered unconditionally; with the file-load path a missing .metal file made
+ * them skip silently. The embedded metallib has no "missing file" concept, so a
+ * function absent from functionNames is the exact equivalent — skip it quietly
+ * rather than logging a spurious "not found" for an intentionally-absent shader. */
+static int metal_lib_has_function(id<MTLLibrary> lib, const char *fn_name)
+{
+    NSString *want = [NSString stringWithUTF8String:fn_name];
+    for (NSString *have in lib.functionNames)
+        if ([have isEqualToString:want]) return 1;
+    return 0;
+}
+
+static id<MTLComputePipelineState> compile_shader(BnMetalCtx *ctx,
+                                                   const char *dir,
+                                                   const char *filename,
+                                                   const char *fn_name)
+{
+    NSError *err = nil;
+    id<MTLFunction> fn = nil;
+    if (ctx->shader_lib) {
+        if (!metal_lib_has_function(ctx->shader_lib, fn_name)) return nil;
+        fn = [ctx->shader_lib newFunctionWithName:[NSString stringWithUTF8String:fn_name]];
+    } else {
+        id<MTLLibrary> lib = metal_lib_from_file(ctx, dir, filename);
+        if (!lib) return nil;
+        fn = [lib newFunctionWithName:[NSString stringWithUTF8String:fn_name]];
+    }
     if (!fn) {
-        fprintf(stderr, "[bn:gpu:metal] function '%s' not found in %s\n",
-                fn_name, filename);
+        fprintf(stderr, "[bn:gpu:metal] function '%s' not found (%s)\n",
+                fn_name, ctx->shader_lib ? "embedded metallib" : filename);
         return nil;
     }
-
-    id<MTLComputePipelineState> pso = [ctx->device newComputePipelineStateWithFunction:fn
-                                                                                error:&err];
-    if (!pso) {
+    id<MTLComputePipelineState> pso =
+        [ctx->device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso)
         fprintf(stderr, "[bn:gpu:metal] pipeline error (%s): %s\n",
-                filename, [[err localizedDescription] UTF8String]);
-    }
+                fn_name, [[err localizedDescription] UTF8String]);
     return pso;
 }
 
@@ -359,31 +392,15 @@ compile_shader_with_fc(BnMetalCtx *ctx, const char *dir,
                        const char *filename, const char *fn_name,
                        MTLFunctionConstantValues *fc)
 {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s", dir, filename);
-    NSString *nsPath = [NSString stringWithUTF8String:path];
     NSError *err = nil;
-    NSString *source = [NSString stringWithContentsOfFile:nsPath
-                                                 encoding:NSUTF8StringEncoding
-                                                    error:&err];
-    if (!source) return nil;
-
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    if (@available(macOS 15.0, *)) {
-        opts.mathMode = MTLMathModeFast;
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        opts.fastMathEnabled = YES;
-#pragma clang diagnostic pop
+    id<MTLLibrary> lib = ctx->shader_lib;
+    if (!lib) {
+        lib = metal_lib_from_file(ctx, dir, filename);
+        if (!lib) return nil;
+    } else if (!metal_lib_has_function(lib, fn_name)) {
+        /* Intentionally-absent optional shader: skip quietly (see above). */
+        return nil;
     }
-    opts.languageVersion = MTLLanguageVersion3_0;
-
-    id<MTLLibrary> lib = [ctx->device newLibraryWithSource:source
-                                                   options:opts
-                                                     error:&err];
-    if (!lib) return nil;
-
     NSString *fnName = [NSString stringWithUTF8String:fn_name];
     id<MTLFunction> fn = [lib newFunctionWithName:fnName
                                    constantValues:fc
@@ -3977,6 +3994,33 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
         /* Store shader directory */
         const char *dir = shader_dir ? shader_dir : "shaders/metal/";
         snprintf(ctx->shader_dir, sizeof(ctx->shader_dir), "%s", dir);
+
+        /* Prefer the precompiled metallib embedded in this binary
+         * (__TEXT,__metallib via -sectcreate): no runtime MSL compile, and no
+         * dependency on shaders/metal/ being on disk relative to the CWD.
+         * BN_METAL_SHADER_DIR forces the from-source path (edit-and-rerun dev
+         * loop); a missing section also falls back to compiling files. */
+        const char *override_dir = getenv("BN_METAL_SHADER_DIR");
+        if (override_dir && *override_dir) {
+            snprintf(ctx->shader_dir, sizeof(ctx->shader_dir), "%s", override_dir);
+            dir = ctx->shader_dir;
+        } else {
+            unsigned long mlib_len = 0;
+            const uint8_t *mlib = getsectiondata(&_mh_execute_header, "__TEXT",
+                                                 "__metallib", &mlib_len);
+            if (mlib && mlib_len > 0) {
+                dispatch_data_t data = dispatch_data_create(
+                    mlib, (size_t)mlib_len, NULL,
+                    DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *lerr = nil;
+                ctx->shader_lib = [ctx->device newLibraryWithData:data error:&lerr];
+                if (!ctx->shader_lib)
+                    fprintf(stderr, "[bn:gpu:metal] embedded metallib load failed "
+                            "(%s); compiling from %s\n",
+                            lerr ? [[lerr localizedDescription] UTF8String] : "nil",
+                            dir);
+            }
+        }
 
         /* Compile matvec pipelines for all supported quant types */
         int compiled = 0;

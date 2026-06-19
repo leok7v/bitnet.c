@@ -29,7 +29,7 @@ kernel void q4k_matvec(device const uchar *weights [[buffer(0)]],
                        constant uint      *p       [[buffer(3)]],
                        uint3 wid [[threadgroup_position_in_grid]],
                        uint3 lid [[thread_position_in_threadgroup]]) {
-    uint rows = p[0], cols = p[1], n_tokens = p[2], extra = p[3];
+    uint rows = p[0], cols = p[1], extra = p[3]; // p[2] (n_tokens) unused here
     uint out_offset = p[5];
     uint tile_start = (extra > 0) ? (wid.x + wid.y * extra) * TILE_ROWS : wid.x * TILE_ROWS;
     uint token = (extra > 0) ? 0 : wid.y;

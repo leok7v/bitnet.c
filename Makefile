@@ -22,6 +22,18 @@ endif
 QUANT_COMMON = src/quant/fp16.c src/quant/dequant.c src/quant/registry.c src/quant/prepared.c src/quant/kernel_select.c src/quant/dispatch.c src/quant/matvec_batch.c src/quant/matmul.c src/quant/fused_gateup.c src/quant/batch_preq8k.c src/quant/matvec_multi.c
 
 UNAME_M := $(shell uname -m)
+
+# macOS on Apple Silicon: build Metal by default (opt out with BN_DISABLE_METAL=1).
+# Intel macOS / Linux stay CPU-only by default -- Metal is unreliable on x64
+# hosts and there is rarely a capable GPU; force it with BN_ENABLE_METAL=1.
+ifeq ($(UNAME_S),Darwin)
+ifneq ($(filter arm% aarch%,$(UNAME_M)),)
+ifndef BN_DISABLE_METAL
+BN_ENABLE_METAL ?= 1
+endif
+endif
+endif
+
 ifneq ($(filter arm% aarch%,$(UNAME_M)),)
   # ARM: NEON + NEON SDOT + scalar
   QUANT_BACKEND = src/quant/x_quant_neon.c \
@@ -138,6 +150,15 @@ ifdef BN_ENABLE_METAL
   METAL_FRAMEWORKS := -framework Metal -framework Foundation
   METAL_SRCS := src/gpu_metal.m
   METAL_OBJS := src/gpu_metal.o
+  # Precompile shaders into bitnet.metallib and embed it into each binary via
+  # the linker (read at runtime from the __TEXT,__metallib section -- no runtime
+  # MSL compile, no shaders/metal/ CWD dependency). Needs the Metal toolchain;
+  # without it METAL_LIB stays empty and binaries compile .metal from disk.
+  METAL_TOOL := $(shell xcrun -sdk macosx -f metal 2>/dev/null)
+  ifneq ($(METAL_TOOL),)
+    METAL_LIB := bitnet.metallib
+    METAL_EMBED_LDFLAGS := -Wl,-sectcreate,__TEXT,__metallib,$(METAL_LIB)
+  endif
 else
   METAL_CFLAGS :=
   METAL_FRAMEWORKS :=
@@ -182,8 +203,13 @@ config-check:
 	fi
 
 # Default target
-bitnet: config-check $(OBJS)
-	$(LINK) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
+ifneq ($(METAL_LIB),)
+$(METAL_LIB): $(wildcard shaders/metal/*.metal)
+	xcrun -sdk macosx metal -std=metal3.0 -O $^ -o $@
+endif
+
+bitnet: config-check $(METAL_LIB) $(OBJS)
+	$(LINK) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS) $(METAL_EMBED_LDFLAGS)
 
 # Debug build
 debug: CFLAGS += -DDEBUG -g -O0
@@ -674,9 +700,9 @@ COHERENCE_OBJS =
 endif
 
 ifdef BN_ENABLE_METAL
-test_coherence: $(COHERENCE_SRCS) $(COHERENCE_EXTRA_OBJS) src/gpu_metal.m
+test_coherence: $(COHERENCE_SRCS) $(COHERENCE_EXTRA_OBJS) src/gpu_metal.m $(METAL_LIB)
 	$(CC) $(CFLAGS) -c -o /tmp/bn_coherence_metal.o src/gpu_metal.m -fobjc-arc
-	$(CC) $(CFLAGS) -o $@ $(COHERENCE_SRCS) $(COHERENCE_EXTRA_OBJS) /tmp/bn_coherence_metal.o $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(COHERENCE_SRCS) $(COHERENCE_EXTRA_OBJS) /tmp/bn_coherence_metal.o $(LDFLAGS) $(METAL_EMBED_LDFLAGS)
 else
 test_coherence: $(COHERENCE_SRCS) $(COHERENCE_EXTRA_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -686,9 +712,9 @@ endif
 # BN_ENABLE_METAL=1; without it the test compiles to a SKIP stub.
 Q4NATIVE_SRCS = test/test_metal_q4_native.c $(filter-out test/test_coherence.c,$(COHERENCE_SRCS))
 ifdef BN_ENABLE_METAL
-test_metal_q4_native: $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS) src/gpu_metal.m
+test_metal_q4_native: $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS) src/gpu_metal.m $(METAL_LIB)
 	$(CC) $(CFLAGS) -c -o /tmp/bn_q4native_metal.o src/gpu_metal.m -fobjc-arc
-	$(CC) $(CFLAGS) -o $@ $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS) /tmp/bn_q4native_metal.o $(LDFLAGS) && ./$@
+	$(CC) $(CFLAGS) -o $@ $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS) /tmp/bn_q4native_metal.o $(LDFLAGS) $(METAL_EMBED_LDFLAGS) && ./$@
 else
 test_metal_q4_native: $(Q4NATIVE_SRCS) $(COHERENCE_EXTRA_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
@@ -698,13 +724,13 @@ endif
 # Run: ./test_rewind models/qwen3.5.gguf [--metal]
 REWIND_SRCS = test/test_rewind.c $(filter-out test/test_coherence.c,$(COHERENCE_SRCS))
 ifdef BN_ENABLE_METAL
-test_rewind: $(REWIND_SRCS) $(COHERENCE_EXTRA_OBJS) src/gpu_metal.m
+test_rewind: $(REWIND_SRCS) $(COHERENCE_EXTRA_OBJS) src/gpu_metal.m $(METAL_LIB)
 	$(CC) $(CFLAGS) -c -o /tmp/bn_rewind_metal.o src/gpu_metal.m -fobjc-arc
-	$(CC) $(CFLAGS) -o $@ $(REWIND_SRCS) $(COHERENCE_EXTRA_OBJS) /tmp/bn_rewind_metal.o $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(REWIND_SRCS) $(COHERENCE_EXTRA_OBJS) /tmp/bn_rewind_metal.o $(LDFLAGS) $(METAL_EMBED_LDFLAGS)
 else
 test_rewind: $(REWIND_SRCS) $(COHERENCE_EXTRA_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 endif
 
 clean:
-	rm -f bitnet bitnet_scalar bench_kernels bench_prefill bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence test_rewind test_e2e test_prefill test_kv_f16 default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda src/gpu_metal.o $(BUILD_CONFIG_STAMP)
+	rm -f bitnet bitnet_scalar bench_kernels bench_prefill bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence test_rewind test_e2e test_prefill test_kv_f16 bitnet.metallib default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda src/gpu_metal.o $(BUILD_CONFIG_STAMP)

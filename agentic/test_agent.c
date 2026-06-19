@@ -374,26 +374,6 @@ static int parse_tool_call(const char *block, size_t block_len,
     return 0;
 }
 
-typedef struct {
-    ByteBuf strpool;
-    char *owned_strings[MAX_MSGS * 4];
-    int n_owned;
-} StringPool;
-
-static char *pool_dup(StringPool *sp, const char *s) {
-    if (!s) return NULL;
-    char *d = strdup(s);
-    if (!d) { fprintf(stderr, "pool_dup oom\n"); exit(1); }
-    sp->owned_strings[sp->n_owned++] = d;
-    return d;
-}
-
-static void pool_free(StringPool *sp) {
-    for (int i = 0; i < sp->n_owned; i++) free(sp->owned_strings[i]);
-    sp->n_owned = 0;
-    bb_free(&sp->strpool);
-}
-
 static int find_complete_tool_call(const char *stream, size_t stream_len,
                                    size_t search_from,
                                    size_t *out_start, size_t *out_end) {
@@ -531,19 +511,9 @@ static int is_stop_token(const BnTokenizer *tok, int tid) {
             tid == tok->eos_id);
 }
 
-static int sample_and_advance(Agent *a, float *logits, int *pos) {
-    int tid = bn_sampler_sample(&a->sampler, logits);
-    if (prefill_range(a, &tid, 1, *pos, NULL) != 0) return -1;
-    (*pos)++;
-    return tid;
-}
-
 static int run_turn(Agent *a, const char *user_msg,
                     const BnTplTool *tools[], int n_tools,
                     int turn_index, ByteBuf *transcript) {
-    StringPool *sp = (StringPool *)a->msgs[0].content;
-    (void)sp;
-
     /* per-turn metric accumulators */
     g_pp_ms = g_tg_ms = 0.0;
     g_pp_tok = g_tg_tok = 0;
@@ -808,15 +778,17 @@ int main(int argc, char **argv) {
     const char *model_path = argv[1];
     const char *transcript_path = "tr.json";
     const char *workdir = NULL;
-    int use_metal = 0;
+    int use_metal = 0;           /* --metal: force Metal on (any arch) */
+    int use_cpu = 0;             /* --cpu: force CPU (skip GPU) */
     int kv_f16 = 0;   /* --kv16: store the KV cache as fp16 (half the memory) */
-    int think_mode = 1;          /* --thinking on|off -> enable_thinking */
-    const char *effort = NULL;   /* --reasoning-effort low|medium|high */
+    int think_mode = 1;          /* --thinking on|off -> enable_thinking (default on) */
+    const char *effort = "low";  /* --reasoning-effort low|medium|high (default low) */
     int max_seq = 8192;          /* --maxseq N: KV/context token cap */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) transcript_path = argv[++i];
         else if (strcmp(argv[i], "--workdir") == 0 && i + 1 < argc) workdir = argv[++i];
         else if (strcmp(argv[i], "--metal") == 0) use_metal = 1;
+        else if (strcmp(argv[i], "--cpu") == 0) use_cpu = 1;
         else if (strcmp(argv[i], "--kv16") == 0) kv_f16 = 1;
         else if (strcmp(argv[i], "--thinking") == 0 && i + 1 < argc)
             think_mode = strcmp(argv[++i], "off") != 0;
@@ -826,8 +798,28 @@ int main(int argc, char **argv) {
             max_seq = atoi(argv[++i]);
             if (max_seq < 1) max_seq = 1;
             if (max_seq > MAX_TOKENS) max_seq = MAX_TOKENS;
+        } else {
+            fprintf(stderr, "test_agent: unknown or malformed option '%s'\n\n"
+                    "usage: %s <model.gguf> [--out FILE] [--workdir DIR] [--cpu]\n"
+                    "  [--metal] [--kv16] [--thinking on|off]\n"
+                    "  [--reasoning-effort low|medium|high] [--maxseq N]\n",
+                    argv[i], argv[0]);
+            return 2;
         }
     }
+
+    /* Metal is the default on Apple Silicon (the per-slice arch macro also makes
+     * a fat binary / Rosetta run CPU on x64). --cpu forces CPU; --metal forces
+     * Metal on regardless of arch. */
+    int want_metal = 0;
+#ifdef BN_ENABLE_METAL
+    if (!use_cpu) {
+#if defined(__aarch64__) || defined(__arm64__)
+        want_metal = 1;
+#endif
+        if (use_metal) want_metal = 1;
+    }
+#endif
     /* If --workdir is set the agent's file tools run inside it (chdir below);
        resolve a relative --out to an absolute path now so the transcript still
        lands in the launch directory, outside the searched sandbox. */
@@ -893,7 +885,7 @@ int main(int argc, char **argv) {
     bn_model_set_thread_pool(&model, bn_tp_create(n_workers), 1);
 
 #ifdef BN_ENABLE_METAL
-    if (use_metal) {
+    if (want_metal) {
         BnGPUBackend *gpu = bn_gpu_metal_create("shaders/metal/");
         /* Hand the mmap range to Metal so weight upload wraps the mapped file
            pages zero-copy (newBufferWithBytesNoCopy) instead of allocating a
@@ -1004,7 +996,7 @@ int main(int argc, char **argv) {
     a.n_msgs = 1;
     printf("config: thinking=%s reasoning-effort=%s maxseq=%d kv16=%d metal=%d\n",
            think_mode ? "on" : "off", effort ? effort : "(none)",
-           max_seq, kv_f16, use_metal);
+           max_seq, kv_f16, want_metal);
 
     a.pos_pre_turn = 0;
     if (snapshot_current(&a) != 0) {

@@ -83,14 +83,13 @@ typedef struct {
     int threads;        // 0 = auto-detect
     int webgpu;         // use WebGPU backend for matvec (requires BN_ENABLE_WEBGPU)
     int metal;          // use Metal backend (requires BN_ENABLE_METAL)
+    int cpu;            // --cpu: force CPU backend (overrides arch default)
     int cuda;           // use CUDA backend (requires BN_ENABLE_CUDA)
     int gpu_cpu_logits; // hidden diagnostic: run final logits on CPU
     int gpu_compare_logits; // hidden diagnostic: compare GPU logits to CPU
     int gpu_max_storage_binding_mb; // hidden diagnostic: allow large GPU logits
     int gpu_profile;    // hidden diagnostic: enable GPU timing logs
-    int metal_disable_barriers; // hidden diagnostic: skip Metal memory barriers
     int metal_enable_q6_q8k; // hidden diagnostic: use Q6_K x Q8_K Metal path
-    int metal_q4_prepared; // hidden diagnostic: use prepared Q4_0 Metal upload layout
     int gpu_debug_qkv_split; // hidden diagnostic: print QKV split decision
     int gpu_disable_qkv_split; // hidden diagnostic: disable stacked QKV split
     int gpu_disable_gateup_split; // hidden diagnostic: disable gate/up split
@@ -143,11 +142,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --draft <path>  Draft model for speculative decoding\n");
     fprintf(stderr, "  --draft-k <int> Draft tokens per iteration (default: 5)\n");
     fprintf(stderr, "  --webgpu        Enable WebGPU backend (requires BN_ENABLE_WEBGPU=1)\n");
-    fprintf(stderr, "  --metal         Enable Metal backend (requires BN_ENABLE_METAL=1)\n");
+    fprintf(stderr, "  --metal         Enable Metal backend (requires BN_ENABLE_METAL=1; default on Apple Silicon)\n");
+    fprintf(stderr, "  --cpu           Force the CPU backend (overrides the Apple Silicon Metal default)\n");
     fprintf(stderr, "  --cuda          Enable experimental CUDA backend (requires BN_ENABLE_CUDA=1)\n");
     fprintf(stderr, "  --gpu-profile <int>  Print GPU timing diagnostics\n");
-    fprintf(stderr, "  --metal-disable-barriers  Skip Metal inter-dispatch barriers\n");
-    fprintf(stderr, "  --metal-q4-prepared  Use prepared Q4_0 Metal upload layout\n");
     fprintf(stderr, "  --gpu-debug-qkv-split  Print QKV split diagnostic\n");
     fprintf(stderr, "  --gpu-disable-qkv-split  Disable stacked QKV split diagnostic path\n");
     fprintf(stderr, "  --gpu-disable-gateup-split  Disable gate/up split diagnostic path\n");
@@ -304,6 +302,8 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.webgpu = 1;
         } else if (strcmp(argv[i], "--metal") == 0) {
             args.metal = 1;
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            args.cpu = 1;
         } else if (strcmp(argv[i], "--cuda") == 0) {
             args.cuda = 1;
         } else if (strcmp(argv[i], "--gpu-cpu-logits") == 0) {
@@ -314,12 +314,8 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.gpu_max_storage_binding_mb = parse_int(argv[++i], "--gpu-max-storage-binding-mb");
         } else if (strcmp(argv[i], "--gpu-profile") == 0 && i + 1 < argc) {
             args.gpu_profile = parse_int(argv[++i], "--gpu-profile");
-        } else if (strcmp(argv[i], "--metal-disable-barriers") == 0) {
-            args.metal_disable_barriers = 1;
         } else if (strcmp(argv[i], "--metal-enable-q6-q8k") == 0) {
             args.metal_enable_q6_q8k = 1;
-        } else if (strcmp(argv[i], "--metal-q4-prepared") == 0) {
-            args.metal_q4_prepared = 1;
         } else if (strcmp(argv[i], "--metal-disable-q6-q8k") == 0) {
             /* Q6_K x Q8_K is now opt-in; keep the old diagnostic flag harmless. */
         } else if (strcmp(argv[i], "--gpu-debug-qkv-split") == 0) {
@@ -650,17 +646,27 @@ static int chat_capture_token(const char *piece, int token_id, void *user_data) 
 int main(int argc, char **argv) {
     sh_log_init(NULL);
     CLIArgs args = parse_args(argc, argv);
+    /* Backend default: on a Metal build running on an Apple Silicon slice, Metal
+       is the default backend. --cpu forces CPU anywhere (including a fat binary's
+       x64 slice, where the per-slice arch macro below is simply false, so CPU is
+       already the default). --metal/--webgpu/--cuda still force a backend. */
+    if (args.cpu) {
+        args.metal = 0;
+        args.webgpu = 0;
+        args.cuda = 0;
+    }
+#if defined(BN_ENABLE_METAL) && (defined(__aarch64__) || defined(__arm64__))
+    else if (!args.metal && !args.webgpu && !args.cuda) {
+        args.metal = 1;
+    }
+#endif
     if (args.gpu_profile > 0) {
         char profile_env[16];
         snprintf(profile_env, sizeof(profile_env), "%d", args.gpu_profile);
         setenv("BN_GPU_PROFILE", profile_env, 1);
     }
-    if (args.metal_disable_barriers)
-        setenv("BN_METAL_DISABLE_BARRIERS", "1", 1);
     if (args.metal_enable_q6_q8k)
         setenv("BN_METAL_ENABLE_Q6_Q8K", "1", 1);
-    if (args.metal_q4_prepared)
-        setenv("BN_METAL_Q4_PREPARED", "1", 1);
     if (args.top_logits > 0) {
         char top_env[16];
         snprintf(top_env, sizeof(top_env), "%d", args.top_logits);
