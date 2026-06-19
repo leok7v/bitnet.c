@@ -1479,6 +1479,11 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
     if (sess) {
         sess->gpu_kv_direct_valid = 0;
         sess->gpu_ssm_direct_valid = 0;
+        /* A from-scratch prefill restarts the sequence, so the recurrent SSM
+           state must be zero. The GPU SSM buffer is per-context (shared, not
+           otherwise cleared), so explicitly zero it; no-op on CPU/non-hybrid. */
+        if (pos0 == 0)
+            (void)bn_transformer_gpu_zero_ssm_state(m, sess);
     }
     if (n_tokens == 1) {
         float *logits = bn_transformer_forward(m, sess, tokens[0], pos0);

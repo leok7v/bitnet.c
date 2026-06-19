@@ -1054,6 +1054,43 @@ int bn_transformer_gpu_upload_ssm_state(BnModel *m, BnSession *sess) {
                                  conv_values * sizeof(float), 0);
 }
 
+/* Zero the backend-resident SSM recurrent + conv buffers. The GPU SSM state is
+ * per-context (shared across sessions and prefill calls), so a from-scratch
+ * prefill (pos0==0) must clear it -- otherwise the scan, which seeds from this
+ * buffer, starts from a prior sequence's stale state instead of zero. */
+int bn_transformer_gpu_zero_ssm_state(BnModel *m, BnSession *sess) {
+    if (!m || !sess) return -1;
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    if (!gpu || !gpu->write_activation) return -1;
+    BnConfig *c = &m->config;
+    if (c->full_attn_interval <= 0 || c->ssm_inner_size <= 0)
+        return 0;
+    int n_attn = c->n_layers / c->full_attn_interval;
+    int n_ssm = c->n_layers - n_attn;
+    int num_v_heads = c->ssm_time_step_rank;
+    int head_k_dim = c->ssm_state_size;
+    if (n_ssm <= 0 || num_v_heads <= 0 || head_k_dim <= 0)
+        return -1;
+    int head_v_dim = c->ssm_inner_size / num_v_heads;
+    int qkv_dim = c->ssm_group_count * head_k_dim * 2 + c->ssm_inner_size;
+    int kern = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
+    if (head_v_dim <= 0 || qkv_dim <= 0 || kern <= 1)
+        return -1;
+    size_t state_values = (size_t)n_ssm * (size_t)num_v_heads *
+                          (size_t)head_k_dim * (size_t)head_v_dim;
+    size_t conv_values = (size_t)n_ssm * (size_t)(kern - 1) * (size_t)qkv_dim;
+    size_t n = state_values > conv_values ? state_values : conv_values;
+    float *zeros = (float *)calloc(n, sizeof(float));
+    if (!zeros) return -1;
+    int rc = gpu->write_activation(gpu->ctx, BN_GPU_VALUE_SSM_STATE, zeros,
+                                   state_values * sizeof(float), 0);
+    if (rc == 0)
+        rc = gpu->write_activation(gpu->ctx, BN_GPU_VALUE_SSM_CONV_STATE, zeros,
+                                   conv_values * sizeof(float), 0);
+    free(zeros);
+    return rc;
+}
+
 int bn_transformer_gpu_download_ssm_state(BnModel *m, BnSession *sess) {
     if (!m || !sess) return -1;
     BnGPUBackend *gpu = bn_model_gpu(m);
