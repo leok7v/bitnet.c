@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #ifdef BN_FORCE_SCALAR
 #undef __ARM_NEON
@@ -1518,6 +1519,11 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
     int cuda_hybrid_prefill =
         c->full_attn_interval > 0 && c->ssm_inner_size > 0 &&
         prefill_gpu && prefill_gpu->kind == BN_GPU_BACKEND_CUDA;
+    /* Per-SSM-layer path counts for the mixed-prefill tripwire at
+       prefill_layers_done. Declared here so every goto to that label (incl.
+       the dense-chain and cuda-hybrid early exits) reads initialized 0/0. */
+    int n_ssm_gpu = 0;
+    int n_ssm_cpu = 0;
     int cuda_moe_prefill =
         prefill_gpu && prefill_gpu->kind == BN_GPU_BACKEND_CUDA &&
         c->n_experts > 0 && c->full_attn_interval <= 0;
@@ -2472,10 +2478,12 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                       n_tokens >= prefill_moe_chain_min_tokens(c, bn_model_gpu(m)),
                                       c->norm_eps, &ssm_did_ffn) == 0) {
                 sess->gpu_ssm_direct_valid = 1;
+                n_ssm_gpu++;
                 if (ssm_did_ffn)
                     goto prefill_layer_done;
                 goto prefill_ssm_done;
             }
+            n_ssm_cpu++;
 
             for (int t = 0; t < n_tokens; t++)
                 prefill_rmsnorm(Xb + (size_t)t * dim, act + (size_t)t * dim,
@@ -2735,6 +2743,16 @@ prefill_layer_done:
     }
 
 prefill_layers_done:
+    /* A mixed prefill -- some SSM layers GPU-direct, some on the CPU -- would
+       corrupt the end-of-prefill SSM sync: the upload pushes the whole CPU
+       mirror, but GPU-direct layers never mirror their recurrent state to the
+       CPU, so they would be clobbered (and skipping leaves the CPU layers
+       stale). The Metal/WebGPU single-layer SSM gate is uniform today (all
+       layers take the same path), so this is unreachable; the assert is a
+       tripwire if a future model makes it reachable. The fix when that day
+       comes is a per-layer SELECTIVE upload of only the CPU-computed layers.
+       (The CUDA run-chain processes SSM layers without these counters.) */
+    assert(cuda_hybrid_prefill || !(n_ssm_gpu > 0 && n_ssm_cpu > 0));
     if (all_logits) {
         int vocab_size = c->vocab_size;
         t_prof = prefill_profile_now(&prof);
