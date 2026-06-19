@@ -1,12 +1,9 @@
-# Build artifacts
+# Build artifacts (objects, metallib, config stamp all live out-of-source)
 bitnet
-bitnet.metallib
 bitnet_scalar
 dump_model
-.build-config
-src/*.o
-src/quant/*.o
-src/transformer/*.o
+build/
+agentic/build/
 *.dSYM/
 
 # Test binaries
@@ -51,9 +48,6 @@ bench/*.js
 bitnet_prof*
 default.profraw
 default.profdata
-src/*.gcda
-src/quant/*.gcda
-src/transformer/*.gcda
 
 # WASM build output
 wasm/bitnet.js

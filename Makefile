@@ -3,6 +3,11 @@ NVCC    ?= /usr/local/cuda-13.2/bin/nvcc
 CUDA_ARCH ?= sm_120
 LDFLAGS = -lm
 
+# Out-of-source build dir. Object files and the metallib land here, never in
+# the source tree. Override (e.g. agentic/Makefile passes BUILD=agentic/build)
+# to get an independent object set that cannot collide with this one.
+BUILD   ?= build
+
 # Platform-specific arch flags:
 # -mcpu=apple-m1 on Darwin enables FP16 vector arithmetic + dotprod.
 # -march=native on Apple clang misses __ARM_FEATURE_FP16_VECTOR_ARITHMETIC.
@@ -156,7 +161,7 @@ ifdef BN_ENABLE_METAL
   # without it METAL_LIB stays empty and binaries compile .metal from disk.
   METAL_TOOL := $(shell xcrun -sdk macosx -f metal 2>/dev/null)
   ifneq ($(METAL_TOOL),)
-    METAL_LIB := bitnet.metallib
+    METAL_LIB := $(BUILD)/bitnet.metallib
     METAL_EMBED_LDFLAGS := -Wl,-sectcreate,__TEXT,__metallib,$(METAL_LIB)
   endif
 else
@@ -183,33 +188,47 @@ else
   LINK := $(CC)
 endif
 
+# Out-of-source locations for the optional backend objects, used by the bench
+# and per-backend test link lines.
+BUILD_METAL_OBJS := $(addprefix $(BUILD)/,$(METAL_OBJS))
+BUILD_CUDA_OBJS  := $(addprefix $(BUILD)/,$(CUDA_OBJS))
+
 SRCS = src/platform.c src/gguf.c src/jinja.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
        $(TRANSFORMER_SRCS) src/tokenizer.c src/chat_template.c src/sampler.c \
        src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c src/prompt_cache.c src/generate.c $(WEBGPU_SRCS) src/main.c
 CFLAGS += $(WEBGPU_CFLAGS) $(METAL_CFLAGS) $(CUDA_CFLAGS)
 LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS) $(CUDA_LDFLAGS)
-OBJS = $(SRCS:.c=.o) $(METAL_OBJS) $(CUDA_OBJS)
+OBJS = $(addprefix $(BUILD)/,$(SRCS:.c=.o)) $(BUILD_METAL_OBJS) $(BUILD_CUDA_OBJS)
 HEADERS = $(wildcard include/*.h src/*.h src/transformer/*.h)
 BUILD_CONFIG := webgpu=$(if $(BN_ENABLE_WEBGPU),1,0) metal=$(if $(BN_ENABLE_METAL),1,0) cuda=$(if $(BN_ENABLE_CUDA),1,0) cc=$(CC) nvcc=$(NVCC) cuda_arch=$(CUDA_ARCH) cflags=$(CFLAGS)
-BUILD_CONFIG_STAMP := .build-config
+# Stamp lives inside $(BUILD) so each build dir (root ./build, agentic's own)
+# tracks its own config independently -- no cross-build rebuild churn.
+BUILD_CONFIG_STAMP := $(BUILD)/.build-config
 
 .PHONY: config-check
 config-check:
-	@old=$$(cat $(BUILD_CONFIG_STAMP) 2>/dev/null || true); \
+	@mkdir -p $(BUILD); \
+	old=$$(cat $(BUILD_CONFIG_STAMP) 2>/dev/null || true); \
 	if [ "$$old" != "$(BUILD_CONFIG)" ]; then \
 		echo "Build config changed; rebuilding objects"; \
-		rm -f src/*.o src/quant/*.o src/transformer/*.o src/gpu_metal.o bitnet; \
+		rm -rf $(BUILD); mkdir -p $(BUILD); \
 		printf '%s\n' "$(BUILD_CONFIG)" > $(BUILD_CONFIG_STAMP); \
 	fi
 
 # Default target
 ifneq ($(METAL_LIB),)
 $(METAL_LIB): $(wildcard shaders/metal/*.metal)
+	@mkdir -p $(@D)
 	xcrun -sdk macosx metal -std=metal3.0 -O $^ -o $@
 endif
 
 bitnet: config-check $(METAL_LIB) $(OBJS)
 	$(LINK) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS) $(METAL_EMBED_LDFLAGS)
+
+# Build engine objects + metallib into $(BUILD) without linking. agentic/Makefile
+# invokes this with BUILD=agentic/build to get its own fresh object set.
+.PHONY: objs
+objs: config-check $(METAL_LIB) $(OBJS)
 
 # Debug build
 debug: CFLAGS += -DDEBUG -g -O0
@@ -220,34 +239,33 @@ asan: CFLAGS += -DDEBUG -g -O0 -fsanitize=address,undefined -fno-omit-frame-poin
 asan: LDFLAGS += -fsanitize=address,undefined
 asan: bitnet
 
-# Pattern rules for object files
-src/%.o: src/%.c $(HEADERS)
+# Pattern rules for object files. One rule per extension; the % spans nested
+# directories (src/quant/foo, src/transformer/foo), and mkdir mirrors the tree
+# under $(BUILD).
+$(BUILD)/src/%.o: src/%.c $(HEADERS)
+	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/quant/%.o: src/quant/%.c $(HEADERS)
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-src/transformer/%.o: src/transformer/%.c $(HEADERS)
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-src/%.o: src/%.cu $(HEADERS)
+$(BUILD)/src/%.o: src/%.cu $(HEADERS)
+	@mkdir -p $(@D)
 	$(NVCC) -O3 -std=c++11 -Iinclude $(CUDA_CFLAGS) $(CUDA_NVCCFLAGS) -c -o $@ $<
 
 # Objective-C pattern rule for Metal backend
-src/%.o: src/%.m $(HEADERS)
+$(BUILD)/src/%.o: src/%.m $(HEADERS)
+	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 # --- Tests ---
 # --- Benchmark ---
 BENCH_SRCS = bench/bench_kernels.c $(filter-out src/main.c, $(SRCS))
-BENCH_OBJS = $(METAL_OBJS) $(CUDA_OBJS)
+BENCH_OBJS = $(BUILD_METAL_OBJS) $(BUILD_CUDA_OBJS)
 
 bench_kernels: $(BENCH_SRCS) $(BENCH_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 BENCH_PREFILL_SRCS = bench/bench_prefill.c $(filter-out src/main.c, $(SRCS))
 
-bench_prefill: $(BENCH_PREFILL_SRCS) $(METAL_OBJS)
+bench_prefill: $(BENCH_PREFILL_SRCS) $(BUILD_METAL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Scalar benchmark (no -march=native, no SIMD)
@@ -442,12 +460,12 @@ endif
 ifdef BN_ENABLE_CUDA
 test_qwen36_cuda: test/test_qwen36.c src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
              src/transformer.c src/gpu_moe_cache.c src/gpu_moe_bridge.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/threadpool.c \
-             src/sh_arena.c src/sh_log.c src/session.c src/bn_alloc.c src/gpu_cuda.o
+             src/sh_arena.c src/sh_log.c src/session.c src/bn_alloc.c $(BUILD_CUDA_OBJS)
 	$(CC) $(CFLAGS) -DBN_QWEN36_TEST_CUDA -o $@ $^ $(LDFLAGS) && ./$@
 
 test_gemma4_cuda: test/test_gemma4.c src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
              src/transformer.c src/gpu_moe_cache.c src/gpu_moe_bridge.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/threadpool.c \
-             src/sh_arena.c src/sh_log.c src/session.c src/bn_alloc.c src/gpu_cuda.o
+             src/sh_arena.c src/sh_log.c src/session.c src/bn_alloc.c $(BUILD_CUDA_OBJS)
 	$(CC) $(CFLAGS) -DBN_GEMMA4_TEST_CUDA -o $@ $^ $(LDFLAGS) && ./$@
 else
 test_qwen36_cuda:
@@ -490,7 +508,7 @@ test_gpu_backend: test/test_gpu_backend.c $(QUANT_SRCS) src/turboquant.c $(MODEL
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 ifdef BN_ENABLE_CUDA
-test_cuda_backend: test/test_cuda_backend.c src/gpu_cuda.o src/quant/fp16.c
+test_cuda_backend: test/test_cuda_backend.c $(BUILD_CUDA_OBJS) src/quant/fp16.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 else
 test_cuda_backend:
@@ -525,9 +543,9 @@ ifeq ($(IS_GCC),1)
 	@echo "=== PGO (GCC) Step 2: Training run ==="
 	./bitnet $(PGO_MODEL) -p "The meaning of life is" -n 128
 	@echo "=== PGO (GCC) Step 3: Optimized rebuild ==="
-	rm -f bitnet src/*.o src/quant/*.o src/transformer/*.o
+	rm -rf $(BUILD) bitnet
 	$(MAKE) bitnet CFLAGS="$(CFLAGS) -fprofile-use -fprofile-correction" LDFLAGS="$(LDFLAGS) -fprofile-use"
-	@rm -f src/*.gcda src/quant/*.gcda src/transformer/*.gcda
+	@rm -f $(BUILD)/src/*.gcda $(BUILD)/src/quant/*.gcda $(BUILD)/src/transformer/*.gcda
 	@echo "=== PGO build complete ==="
 else
 	@echo "=== PGO (Clang) Step 1: Instrumented build ==="
@@ -538,7 +556,7 @@ else
 	@echo "=== PGO (Clang) Step 3: Merge profile ==="
 	xcrun llvm-profdata merge -output=default.profdata default.profraw
 	@echo "=== PGO (Clang) Step 4: Optimized rebuild ==="
-	rm -f bitnet src/*.o src/quant/*.o src/transformer/*.o
+	rm -rf $(BUILD) bitnet
 	$(MAKE) bitnet CFLAGS="$(CFLAGS) -fprofile-instr-use=default.profdata"
 	@rm -f default.profraw default.profdata
 	@echo "=== PGO build complete ==="
@@ -691,7 +709,7 @@ COHERENCE_SRCS += src/gpu_wgpu.c
 endif
 COHERENCE_EXTRA_OBJS :=
 ifdef BN_ENABLE_CUDA
-COHERENCE_EXTRA_OBJS += src/gpu_cuda.o
+COHERENCE_EXTRA_OBJS += $(BUILD_CUDA_OBJS)
 endif
 ifdef BN_ENABLE_METAL
 COHERENCE_OBJS = $(COHERENCE_SRCS:.c=.o) src/gpu_metal.o
@@ -733,4 +751,5 @@ test_rewind: $(REWIND_SRCS) $(COHERENCE_EXTRA_OBJS)
 endif
 
 clean:
-	rm -f bitnet bitnet_scalar bench_kernels bench_prefill bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence test_rewind test_e2e test_prefill test_kv_f16 bitnet.metallib default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda src/gpu_metal.o $(BUILD_CONFIG_STAMP)
+	rm -rf $(BUILD)
+	rm -f bitnet bitnet_scalar bench_kernels bench_prefill bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence test_rewind test_e2e test_prefill test_kv_f16 default.profraw default.profdata

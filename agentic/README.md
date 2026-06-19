@@ -17,33 +17,19 @@ environment.
 
 - macOS or Linux
 - A Qwen3.5 hybrid-SSM GGUF model (tokenizer.chat_template required)
-- Engine objects already built in the repo root (see step 1)
 
 ## Build
 
-**Step 1 - build the engine in the repo root:**
-
-```
-make bitnet
-```
-
-For Apple GPU (Metal):
-
-```
-make BN_ENABLE_METAL=1 bitnet
-```
-
-**Step 2 - build the harness:**
+One step. The harness delegates engine compilation to the root Makefile but
+directs the objects into `agentic/build/`, so it always links a fresh engine
+and never shares (or disturbs) the root's `build/` object set:
 
 ```
 cd agentic && make
 ```
 
-For Metal:
-
-```
-cd agentic && make BN_ENABLE_METAL=1
-```
+On macOS/arm64 Metal is the default (opt out with `BN_DISABLE_METAL=1`). On
+Intel macOS or Linux, force Metal with `BN_ENABLE_METAL=1`.
 
 ## Fetch a model
 
