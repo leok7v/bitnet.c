@@ -108,6 +108,19 @@ static int mem_pressure_level(void) {
     return level;
 }
 
+/* Integral GPU-active time (ms) from the Metal backend's command-buffer
+ * GPUStartTime/GPUEndTime sum; per-turn delta gives a real GPU-busy share. */
+
+static double cur_gpu_active_ms(const BnModel *model) {
+    double ms = 0.0;
+#ifdef BN_ENABLE_METAL
+    ms = bn_gpu_metal_active_ms(bn_model_gpu(model));
+#else
+    (void)model;
+#endif
+    return ms;
+}
+
 typedef struct {
     int    ctx_in;     /* context tokens carried into the turn */
     int    ctx_out;    /* context tokens after generation */
@@ -122,6 +135,7 @@ typedef struct {
     size_t footprint;  /* phys_footprint bytes at end of turn */
     double wall_ms;    /* wall time spent in the turn */
     double cpu_ms;     /* process CPU time (user+sys) spent in the turn */
+    double gpu_ms;     /* GPU-active time (command-buffer windows) in the turn */
     int    pressure;   /* system memory-pressure level at end of turn */
 } TurnMetrics;
 
@@ -135,7 +149,7 @@ static void print_metrics_table(const char *model_name) {
     printf("%-4s %7s %8s %7s %9s %7s %9s %5s %7s %8s %7s %5s %6s %5s\n",
            "turn", "ctx_in", "ctx_out", "pp_tok", "pp_tok/s",
            "tg_tok", "tg_tok/s", "rnds", "tools", "rss_MB",
-           "fp_MB", "cpu%", "gpuW%", "press");
+           "fp_MB", "cpu%", "gpu%", "press");
     double tot_pp_ms = 0, tot_tg_ms = 0;
     long tot_pp = 0, tot_tg = 0;
     size_t peak = 0, peak_fp = 0;
@@ -144,7 +158,7 @@ static void print_metrics_table(const char *model_name) {
         double pps = m->pp_ms > 0 ? (double)m->pp_tok * 1000.0 / m->pp_ms : 0;
         double tps = m->tg_ms > 0 ? (double)m->tg_tok * 1000.0 / m->tg_ms : 0;
         double cpu_pct = m->wall_ms > 0 ? m->cpu_ms * 100.0 / m->wall_ms : 0;
-        double gpu_pct = cpu_pct < 100.0 ? 100.0 - cpu_pct : 0.0;
+        double gpu_pct = m->wall_ms > 0 ? m->gpu_ms * 100.0 / m->wall_ms : 0;
         char tcs[16];
         snprintf(tcs, sizeof tcs, "%d/%d", m->tool_ok, m->tool_err);
         printf("%-4d %7d %8d %7ld %9.1f %7ld %9.1f %5d %7s %8.0f "
@@ -170,9 +184,9 @@ static void print_metrics_table(const char *model_name) {
            "ALL", "-", final_ctx, tot_pp, opps, tot_tg, otps, "-", "-",
            (double)peak / 1048576.0, (double)peak_fp / 1048576.0, "-", "-", "-");
     printf("(pp=prefill, tg=token-gen; rss/fp=resident/phys-footprint MB per "
-           "turn end; cpu%%=process CPU/wall, gpuW%%=off-CPU wall (GPU+sync "
-           "wait); press=mem-pressure 1/2/4; peak rss=%.0f fp=%.0f MB, "
-           "final ctx=%d tok)\n",
+           "turn end; cpu%%=process CPU/wall (sums all cores), gpu%%=GPU-active "
+           "wall fraction (Metal cmd-buffer GPU time); press=mem-pressure 1/2/4; "
+           "peak rss=%.0f fp=%.0f MB, final ctx=%d tok)\n",
            (double)peak / 1048576.0, (double)peak_fp / 1048576.0, final_ctx);
 }
 
@@ -528,6 +542,7 @@ static int run_turn(Agent *a, const char *user_msg,
     g_pp_tok = g_tg_tok = 0;
     double t_turn0 = now_ms();
     double cpu_turn0 = cur_cpu_ms();
+    double gpu_turn0 = cur_gpu_active_ms(a->model);
     int m_ctx_in = a->pos_pre_turn;
     int m_tool_ok = 0, m_tool_err = 0;
 
@@ -756,6 +771,7 @@ static int run_turn(Agent *a, const char *user_msg,
         tm->footprint = cur_footprint_bytes();
         tm->wall_ms = now_ms() - t_turn0;
         tm->cpu_ms = cur_cpu_ms() - cpu_turn0;
+        tm->gpu_ms = cur_gpu_active_ms(a->model) - gpu_turn0;
         tm->pressure = mem_pressure_level();
     }
 
