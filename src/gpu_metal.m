@@ -133,6 +133,9 @@ typedef struct {
     int q8_matvec_dispatches;
     int q8_split_dispatches;
     int q8_gateup_dispatches;
+    /* Integral GPU-active time (sum of command-buffer GPUEndTime-GPUStartTime),
+     * accumulated across the run for a Wall/CPU/GPU breakdown. */
+    double gpu_active_ms;
 
     /* Slab allocator for MoE weight suballocation */
     id<MTLBuffer> slab_buf;
@@ -3767,6 +3770,7 @@ static int metal_execute(void *vctx, const void *ops_raw, int n_ops,
                 if (gpu_end > gpu_start)
                     gpu_ms = (gpu_end - gpu_start) * 1000.0;
                 shader_gpu_ms[shader] += gpu_ms;
+                ctx->gpu_active_ms += gpu_ms;
                 shader_wall_ms[shader] += op_wall1 - op_wall0;
                 shader_profile_counts[shader]++;
                 if (shader == BN_GPU_SHADER_MATVEC ||
@@ -3800,6 +3804,8 @@ static int metal_execute(void *vctx, const void *ops_raw, int n_ops,
         if (cmd) {
             [cmd commit];
             [cmd waitUntilCompleted];
+            double gs = cmd.GPUStartTime, ge = cmd.GPUEndTime;
+            if (ge > gs) ctx->gpu_active_ms += (ge - gs) * 1000.0;
         }
 
         t_gpu = bn_platform_time_ms();
@@ -4103,6 +4109,14 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
 
         return gpu;
     }
+}
+
+double bn_gpu_metal_active_ms(const BnGPUBackend *gpu)
+{
+    double ms = 0.0;
+    if (gpu && gpu->kind == BN_GPU_BACKEND_METAL && gpu->ctx)
+        ms = ((const BnMetalCtx *)gpu->ctx)->gpu_active_ms;
+    return ms;
 }
 
 void bn_gpu_metal_destroy(BnGPUBackend *gpu)

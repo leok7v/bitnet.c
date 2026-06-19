@@ -31,12 +31,25 @@
 #include <string.h>
 #include <limits.h>
 #include <ctype.h>
+#include <sys/resource.h>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <pthread/qos.h>
 #endif
 #include <unistd.h>
+
+// Cumulative process CPU time (user+sys, all threads) in ms, for a
+// Wall/CPU/GPU decode breakdown alongside the GPU-active integral.
+
+static double proc_cpu_ms(void) {
+    struct rusage ru;
+    double ms = 0.0;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        ms = (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 +
+             (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
+    return ms;
+}
 
 typedef struct {
     const char *model_path;
@@ -1362,6 +1375,7 @@ int main(int argc, char **argv) {
         double gen_start = prompt_start;
         int pos = 0;
         int n_generated = 0;
+        double cpu0_ms = 0.0, gpu0_ms = 0.0;  /* decode-start CPU/GPU snapshots */
 
         if (args.n_tokens == 0 && !has_draft) {
             if (bn_prefill_no_logits(&model, session, prompt_tokens, n_prompt, 0,
@@ -1387,6 +1401,10 @@ int main(int argc, char **argv) {
                     bn_sampler_accept(&sampler, prompt_tokens[i]);
                 }
                 gen_start = bn_platform_time_ms();
+                cpu0_ms = proc_cpu_ms();
+#ifdef BN_ENABLE_METAL
+                gpu0_ms = bn_gpu_metal_active_ms(bn_model_gpu(&model));
+#endif
 #ifdef DEBUG
                 // Dump top-10 logits after prefill
                 {
@@ -1442,6 +1460,26 @@ int main(int argc, char **argv) {
             snprintf(total, sizeof(total), "%.1f", total_time);
             SH_LOG_INFO("Generation complete", "tokens", ng, "tok/s", speed,
                         "prompt_ms", prompt_ms, "total_ms", total);
+        }
+        /* Decode-only Wall vs CPU-time vs GPU-active integral. cpu_pct can
+         * exceed 100 (CPU work is summed across threads); gpu_pct is GPU-active
+         * wall fraction. The gap = CPU work serialized around the GPU. */
+        if (n_generated > 0) {
+            double cpu_dec = proc_cpu_ms() - cpu0_ms;
+            double gpu_dec = 0.0;
+#ifdef BN_ENABLE_METAL
+            gpu_dec = bn_gpu_metal_active_ms(bn_model_gpu(&model)) - gpu0_ms;
+#endif
+            char w[32], c[32], g[32], cp[16], gp[16];
+            snprintf(w, sizeof w, "%.1f", gen_time);
+            snprintf(c, sizeof c, "%.1f", cpu_dec);
+            snprintf(g, sizeof g, "%.1f", gpu_dec);
+            snprintf(cp, sizeof cp, "%.0f",
+                     gen_time > 0 ? cpu_dec * 100.0 / gen_time : 0.0);
+            snprintf(gp, sizeof gp, "%.0f",
+                     gen_time > 0 ? gpu_dec * 100.0 / gen_time : 0.0);
+            SH_LOG_INFO("Decode timing", "wall_ms", w, "cpu_ms", c,
+                        "gpu_active_ms", g, "cpu_pct", cp, "gpu_pct", gp);
         }
 
         // Print MoE stats if applicable

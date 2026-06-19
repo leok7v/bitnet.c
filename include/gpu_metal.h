@@ -17,6 +17,10 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir);
 // Safe to call with NULL.
 void bn_gpu_metal_destroy(BnGPUBackend *gpu);
 
+// Integral GPU-active time (ms) summed over all command buffers since creation:
+// sum of (GPUEndTime - GPUStartTime). 0 for a non-Metal/NULL backend.
+double bn_gpu_metal_active_ms(const BnGPUBackend *gpu);
+
 // Initialize Metal slab allocator for MoE weight suballocation.
 // Eliminates per-expert buffer allocation overhead.
 // size_mb: slab size in MB (0 = disabled). Returns 0 on success.
