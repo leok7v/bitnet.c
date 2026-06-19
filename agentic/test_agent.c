@@ -490,27 +490,34 @@ static int render_msgs(Agent *a, int enable_thinking, int add_gen_prompt,
                                    out_tokens, max_tokens);
 }
 
-static int prefill_range(Agent *a, const int *tokens, int n, int pos0) {
+/* Batch-prefill [tokens..tokens+n) at pos0. The batch already computes the
+ * logits for the next token, returned via *out_logits -- the caller MUST use
+ * these instead of re-feeding the last token, which would advance the recurrent
+ * (SSM) state a second time and corrupt it (hybrid models scan forward; a token
+ * applied twice is not idempotent like an attention-KV overwrite). */
+static int prefill_range(Agent *a, const int *tokens, int n, int pos0,
+                         float **out_logits) {
     if (n <= 0) return 0;
     double t0 = now_ms();
     float *lp = bn_prefill(a->model, a->sess, tokens, n, pos0, 0);
     g_pp_ms += now_ms() - t0;
     g_pp_tok += n;
+    if (out_logits) *out_logits = lp;
     return lp ? 0 : -1;
 }
 
-static int restore_and_extend(Agent *a, const int *full_tokens, int n_full) {
+static int restore_and_extend(Agent *a, const int *full_tokens, int n_full,
+                              float **out_logits) {
     if (bn_session_set_recurrent_state(a->sess, a->model,
                                        a->snap, a->snap_bytes) != 0) {
         fprintf(stderr, "restore failed\n");
         return -1;
     }
     bn_session_kv_truncate(a->sess, a->pos_pre_turn);
-    if (n_full > a->pos_pre_turn) {
-        if (prefill_range(a, full_tokens + a->pos_pre_turn,
-                          n_full - a->pos_pre_turn, a->pos_pre_turn) != 0)
-            return -1;
-    }
+    if (n_full > a->pos_pre_turn)
+        return prefill_range(a, full_tokens + a->pos_pre_turn,
+                             n_full - a->pos_pre_turn, a->pos_pre_turn,
+                             out_logits);
     return 0;
 }
 
@@ -526,7 +533,7 @@ static int is_stop_token(const BnTokenizer *tok, int tid) {
 
 static int sample_and_advance(Agent *a, float *logits, int *pos) {
     int tid = bn_sampler_sample(&a->sampler, logits);
-    if (prefill_range(a, &tid, 1, *pos) != 0) return -1;
+    if (prefill_range(a, &tid, 1, *pos, NULL) != 0) return -1;
     (*pos)++;
     return tid;
 }
@@ -559,7 +566,8 @@ static int run_turn(Agent *a, const char *user_msg,
                                tools, n_tools, prompt_tokens, MAX_TOKENS);
     if (n_prompt < 0) { fprintf(stderr, "render prompt failed\n"); return -1; }
 
-    if (restore_and_extend(a, prompt_tokens, n_prompt) != 0) return -1;
+    float *logits = NULL;
+    if (restore_and_extend(a, prompt_tokens, n_prompt, &logits) != 0) return -1;
     int pos = n_prompt;
 
     ByteBuf stream = {0};
@@ -570,13 +578,7 @@ static int run_turn(Agent *a, const char *user_msg,
     int gen_count = 0;
     int round_count = 0;
 
-    float *logits = bn_prefill(a->model, a->sess, NULL, 0, pos, 0);
-    {
-        float *lp = bn_prefill(a->model, a->sess,
-                               prompt_tokens + (n_prompt - 1), 1,
-                               n_prompt - 1, 0);
-        logits = lp;
-    }
+    if (!logits) { fprintf(stderr, "prompt prefill produced no logits\n"); return -1; }
 
     while (gen_count < MAX_GEN_PER_TURN && !turn_done) {
         int tid = bn_sampler_sample(&a->sampler, logits);
@@ -635,7 +637,12 @@ static int run_turn(Agent *a, const char *user_msg,
             }
             a->msgs[asst_idx].role = BN_TPL_ROLE_ASSISTANT;
             a->msgs[asst_idx].content = content;
-            a->msgs[asst_idx].reasoning = reasoning;
+            /* Do NOT commit reasoning to history: the chat template strips
+               <think> from every assistant turn except the active last one, so a
+               stored reasoning makes the re-rendered prefix (and the snapshot
+               position it's based on) diverge from the next turn's render. */
+            free(reasoning);
+            a->msgs[asst_idx].reasoning = NULL;
             a->msgs[asst_idx].tool_calls = a->msg_tool_calls[asst_idx];
             a->msgs[asst_idx].n_tool_calls = n_observed_tcs;
             a->n_msgs++;
@@ -658,12 +665,9 @@ static int run_turn(Agent *a, const char *user_msg,
                 fprintf(stderr, "render continuation failed\n"); return -1;
             }
             if (n_cont > pos) {
-                if (prefill_range(a, cont_tokens + pos, n_cont - pos, pos) != 0)
+                if (prefill_range(a, cont_tokens + pos, n_cont - pos, pos,
+                                  &logits) != 0)
                     return -1;
-                float *lp = bn_prefill(a->model, a->sess,
-                                       cont_tokens + (n_cont - 1), 1,
-                                       n_cont - 1, 0);
-                logits = lp;
                 pos = n_cont;
             }
             bb_reset(&stream);
@@ -689,18 +693,18 @@ static int run_turn(Agent *a, const char *user_msg,
     if (stream.buf && stream.len > 0) {
         char *reasoning = NULL, *content = NULL;
         extract_reasoning_content(stream.buf, &reasoning, &content);
-        int has_content = content && *content;
-        int has_reasoning = reasoning && *reasoning;
-        if (has_content || has_reasoning) {
+        /* Thinking is transient; commit only the answer text to history so the
+           re-rendered prefix stays stable across turns (see tool-round note). */
+        free(reasoning);
+        if (content && *content) {
             int asst_idx = a->n_msgs;
             a->msgs[asst_idx].role = BN_TPL_ROLE_ASSISTANT;
             a->msgs[asst_idx].content = content;
-            a->msgs[asst_idx].reasoning = reasoning;
+            a->msgs[asst_idx].reasoning = NULL;
             a->msgs[asst_idx].tool_calls = NULL;
             a->msgs[asst_idx].n_tool_calls = 0;
             a->n_msgs++;
         } else {
-            free(reasoning);
             free(content);
         }
     }
@@ -783,7 +787,7 @@ static int run_turn(Agent *a, const char *user_msg,
     if (n_clean < 0) {
         fprintf(stderr, "render clean history failed\n"); return -1;
     }
-    if (restore_and_extend(a, clean_tokens, n_clean) != 0) return -1;
+    if (restore_and_extend(a, clean_tokens, n_clean, NULL) != 0) return -1;
     if (snapshot_current(a) != 0) {
         fprintf(stderr, "snapshot failed\n"); return -1;
     }
