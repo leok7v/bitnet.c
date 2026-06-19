@@ -43,6 +43,7 @@ struct list {
 struct dict {
     struct jinja_var *e;
     int n;
+    int cap;
 };
 
 struct macro {
@@ -391,6 +392,7 @@ static struct jinja_value dict_make(struct state *st, int n) {
     d->e = (struct jinja_var *)arena_alloc(st,
                    (size_t)n * sizeof(struct jinja_var));
     d->n = 0;
+    d->cap = n;
     struct jinja_value v = jv_none();
     v.kind = JV_NODE;
     v.tag = DICT_TAG;
@@ -398,7 +400,7 @@ static struct jinja_value dict_make(struct state *st, int n) {
     return v;
 }
 
-static void dict_put(struct jinja_value dv, const char *k,
+static void dict_put(struct state *st, struct jinja_value dv, const char *k,
                      struct jinja_value val) {
     struct dict *d = (struct dict *)dv.node;
     int i = 0;
@@ -409,6 +411,14 @@ static void dict_put(struct jinja_value dv, const char *k,
             hit = 1;
         }
         i++;
+    }
+    if (!hit && d->n == d->cap) {
+        int ncap = d->cap ? d->cap * 2 : 4;
+        struct jinja_var *ne = (struct jinja_var *)arena_alloc(st,
+                       (size_t)ncap * sizeof(struct jinja_var));
+        for (int j = 0; j < d->n; j++) { ne[j] = d->e[j]; }
+        d->e = ne;
+        d->cap = ncap;
     }
     if (!hit) {
         d->e[d->n].name = k;
@@ -1302,7 +1312,7 @@ static struct jinja_value call_named(struct state *st, const char *nm,
         r = dict_make(st, ca.nkw > 0 ? ca.nkw : 1);
         int i = 0;
         while (i < ca.nkw) {
-            dict_put(r, ca.kw[i].name, ca.kw[i].val);
+            dict_put(st, r, ca.kw[i].name, ca.kw[i].val);
             i++;
         }
     } else if (m) {
@@ -1383,7 +1393,7 @@ static struct jinja_value eval_primary(struct state *st) {
             const char *ks = arena_dup(st, to_str(st, k),
                                        strlen(to_str(st, k)));
             if (is_op(st, ":")) { lex(st); }
-            dict_put(d, ks, eval_expr(st));
+            dict_put(st, d, ks, eval_expr(st));
             if (is_op(st, ",")) { lex(st); }
         }
         st->brace--;
@@ -1721,7 +1731,9 @@ static void do_set(struct state *st) {
         consume_close(st);
     }
     if (!st->mute && member) {
-        dict_put(*var_find(st, name, (int)strlen(name)), key, val);
+        struct jinja_value *ns = var_find(st, name, (int)strlen(name));
+        if (ns) { dict_put(st, *ns, key, val); }
+        else { fail(st, "set member on undeclared namespace"); }
     } else if (!st->mute) {
         var_set(st, name, (int)strlen(name), val);
     }
@@ -1749,7 +1761,11 @@ static void do_filter(struct state *st) {
 }
 
 static void do_macro(struct state *st) {
-    struct macro *m = &st->macros[st->n_macros];
+    /* Past the cap, parse into a throwaway slot so the lexer still advances
+       over the definition and body; the macro is just not registered. */
+    struct macro scratch;
+    int have_room = st->n_macros < MAX_MACROS;
+    struct macro *m = have_room ? &st->macros[st->n_macros] : &scratch;
     m->name = arena_dup(st, st->ts, (size_t)st->tn);
     m->nlen = st->tn;
     m->nparam = 0;
@@ -1771,7 +1787,7 @@ static void do_macro(struct state *st) {
     if (is_op(st, ")")) { lex(st); }
     consume_close(st);
     m->body = st->p;
-    if (st->n_macros < MAX_MACROS - 1) { st->n_macros++; }
+    if (have_room) { st->n_macros++; }
     /* Skip the body by raw scan to the matching endmacro: rendering it
      * here (even muted) would run its if/for terminators with no outer
      * consumer, drifting the mute counter. The body is rendered only
@@ -1811,14 +1827,14 @@ static void bind_loop(struct state *st, const char *v1, int v1n,
                       long n, long k) {
     struct jinja_value cur = seq_index(st, base, k);
     struct jinja_value lp = dict_make(st, 8);
-    dict_put(lp, "index", jv_int(k + 1));
-    dict_put(lp, "index0", jv_int(k));
-    dict_put(lp, "first", jv_bool(k == 0));
-    dict_put(lp, "last", jv_bool(k == n - 1));
-    dict_put(lp, "length", jv_int(n));
-    dict_put(lp, "previtem",
+    dict_put(st, lp, "index", jv_int(k + 1));
+    dict_put(st, lp, "index0", jv_int(k));
+    dict_put(st, lp, "first", jv_bool(k == 0));
+    dict_put(st, lp, "last", jv_bool(k == n - 1));
+    dict_put(st, lp, "length", jv_int(n));
+    dict_put(st, lp, "previtem",
              k > 0 ? seq_index(st, base, k - 1) : jv_undef());
-    dict_put(lp, "nextitem",
+    dict_put(st, lp, "nextitem",
              k < n - 1 ? seq_index(st, base, k + 1) : jv_undef());
     if (v2) {
         int pair = cur.kind == JV_LIST &&

@@ -124,9 +124,18 @@ static int bn_session_ssm_sizes(const BnModel *model,
     if (checked_mul_size((size_t)n_ssm, state_per_layer, &state_total) != 0)
         return -1;
     int conv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
+    /* Match the GPU emit/upload convention (gpu_emit.c): an unset kernel
+       defaults to 4, and a kernel of 1 has no conv history and is rejected,
+       so CPU snapshot sizing and GPU upload agree on the legal geometry. */
+    int kern = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
+    if (kern <= 1) {
+        *out_state_floats = 0;
+        *out_conv_floats = 0;
+        return -1;
+    }
     size_t conv_total;
     if (checked_mul3_size((size_t)n_ssm,
-                          (size_t)(c->ssm_conv_kernel - 1),
+                          (size_t)(kern - 1),
                           (size_t)conv_dim, &conv_total) != 0)
         return -1;
     *out_state_floats = state_total;
@@ -152,13 +161,14 @@ int bn_session_get_recurrent_state(const BnSession *s, const BnModel *model,
     size_t state_floats = 0, conv_floats = 0;
     if (bn_session_ssm_sizes(model, &state_floats, &conv_floats) != 0)
         return -1;
-    size_t expected = (state_floats + conv_floats) * sizeof(float);
-    if (out_bytes != expected) return -1;
+    size_t expected = bn_session_recurrent_state_bytes(model);
+    if (expected == 0 || out_bytes != expected) return -1;
     if (!s->state.ssm_state || !s->state.ssm_conv_state) return -1;
 
     if (bn_model_gpu((BnModel *)model)) {
-        bn_transformer_gpu_download_ssm_state((BnModel *)model,
-                                              (BnSession *)s);
+        if (bn_transformer_gpu_download_ssm_state((BnModel *)model,
+                                                  (BnSession *)s) != 0)
+            return -1;
     }
 
     uint8_t *dst = (uint8_t *)out;
@@ -174,8 +184,8 @@ int bn_session_set_recurrent_state(BnSession *s, const BnModel *model,
     size_t state_floats = 0, conv_floats = 0;
     if (bn_session_ssm_sizes(model, &state_floats, &conv_floats) != 0)
         return -1;
-    size_t expected = (state_floats + conv_floats) * sizeof(float);
-    if (in_bytes != expected) return -1;
+    size_t expected = bn_session_recurrent_state_bytes(model);
+    if (expected == 0 || in_bytes != expected) return -1;
     if (!s->state.ssm_state || !s->state.ssm_conv_state) return -1;
     const uint8_t *src = (const uint8_t *)in;
     memcpy(s->state.ssm_state, src, state_floats * sizeof(float));
