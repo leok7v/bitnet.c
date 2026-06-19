@@ -21,6 +21,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>     /* chdir, getcwd */
+#include <sys/stat.h>   /* mkdir */
+#include <errno.h>
+#include <time.h>       /* clock_gettime */
+#ifdef __APPLE__
+#include <mach/mach.h>  /* task_info -> current resident size */
+#else
+#include <sys/resource.h>
+#endif
 
 #define MAX_TOKENS               8192
 #define MAX_GEN_PER_TURN         1024
@@ -29,6 +38,90 @@
 #define MAX_TURNS                8
 #define MAX_MSGS                256
 #define MAX_ROUNDS_PER_TURN      2
+
+/* ---- lightweight per-turn instrumentation ----------------------------------
+ * pp = prompt processing (bulk prefill of the user turn + tool-result
+ * continuations); tg = token generation (per-token decode). We time the two
+ * primitives separately and accumulate per turn, then print a readable table.
+ * RSS is the current resident footprint sampled at the end of each turn, so the
+ * table shows how RSS tracks context growth. The end-of-turn "clean re-render"
+ * snapshot prefill is deliberately NOT counted (accumulators reset per turn). */
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static size_t cur_rss_bytes(void) {
+#ifdef __APPLE__
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &cnt) == KERN_SUCCESS)
+        return (size_t)info.resident_size;
+    return 0;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        return (size_t)ru.ru_maxrss * 1024; /* Linux reports KiB */
+    return 0;
+#endif
+}
+
+typedef struct {
+    int    ctx_in;     /* context tokens carried into the turn */
+    int    ctx_out;    /* context tokens after generation */
+    long   pp_tok;     /* tokens bulk-prefilled this turn */
+    double pp_ms;
+    long   tg_tok;     /* tokens generated (decoded) this turn */
+    double tg_ms;
+    int    rounds;     /* tool round-trips */
+    int    tool_ok;
+    int    tool_err;
+    size_t rss;        /* resident bytes at end of turn */
+} TurnMetrics;
+
+static double g_pp_ms, g_tg_ms;   /* per-turn accumulators (reset each turn) */
+static long   g_pp_tok, g_tg_tok;
+static TurnMetrics g_metrics[MAX_TURNS];
+static int    g_n_metrics;
+
+static void print_metrics_table(const char *model_name) {
+    printf("\n========== metrics: %s ==========\n", model_name);
+    printf("%-4s %7s %8s %7s %9s %7s %9s %5s %7s %8s\n",
+           "turn", "ctx_in", "ctx_out", "pp_tok", "pp_tok/s",
+           "tg_tok", "tg_tok/s", "rnds", "tools", "rss_MB");
+    double tot_pp_ms = 0, tot_tg_ms = 0;
+    long tot_pp = 0, tot_tg = 0;
+    size_t peak = 0;
+    for (int i = 0; i < g_n_metrics; i++) {
+        TurnMetrics *m = &g_metrics[i];
+        double pps = m->pp_ms > 0 ? (double)m->pp_tok * 1000.0 / m->pp_ms : 0;
+        double tps = m->tg_ms > 0 ? (double)m->tg_tok * 1000.0 / m->tg_ms : 0;
+        char tcs[16];
+        snprintf(tcs, sizeof tcs, "%d/%d", m->tool_ok, m->tool_err);
+        printf("%-4d %7d %8d %7ld %9.1f %7ld %9.1f %5d %7s %8.0f\n",
+               i + 1, m->ctx_in, m->ctx_out, m->pp_tok, pps,
+               m->tg_tok, tps, m->rounds, tcs, (double)m->rss / 1048576.0);
+        /* compact CSV for cross-model aggregation (grep '^#M,') */
+        printf("#M,%s,%d,%d,%d,%ld,%.1f,%ld,%.1f,%d,%d,%d,%.0f\n",
+               model_name, i + 1, m->ctx_in, m->ctx_out, m->pp_tok, pps,
+               m->tg_tok, tps, m->rounds, m->tool_ok, m->tool_err,
+               (double)m->rss / 1048576.0);
+        tot_pp_ms += m->pp_ms; tot_tg_ms += m->tg_ms;
+        tot_pp += m->pp_tok; tot_tg += m->tg_tok;
+        if (m->rss > peak) peak = m->rss;
+    }
+    double opps = tot_pp_ms > 0 ? (double)tot_pp * 1000.0 / tot_pp_ms : 0;
+    double otps = tot_tg_ms > 0 ? (double)tot_tg * 1000.0 / tot_tg_ms : 0;
+    int final_ctx = g_n_metrics > 0 ? g_metrics[g_n_metrics - 1].ctx_out : 0;
+    printf("%-4s %7s %8d %7ld %9.1f %7ld %9.1f %5s %7s %8.0f\n",
+           "ALL", "-", final_ctx, tot_pp, opps, tot_tg, otps, "-", "-",
+           (double)peak / 1048576.0);
+    printf("(pp=prompt prefill, tg=token-gen; rss=resident MB at each turn end; "
+           "peak=%.0f MB, final ctx=%d tok)\n",
+           (double)peak / 1048576.0, final_ctx);
+}
 
 typedef struct {
     char *buf;
@@ -107,67 +200,109 @@ static void parsed_tc_free(ParsedToolCall *tc) {
     memset(tc, 0, sizeof(*tc));
 }
 
+/* Strip one layer of matching surrounding quotes, in place. */
+static void unquote(char *s) {
+    size_t n = strlen(s);
+    if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) {
+        memmove(s, s + 1, n - 2);
+        s[n - 2] = '\0';
+    }
+}
+
+/* Parse one <tool_call> body. Qwen3.5 sizes emit several malformed variants;
+ * this tolerates all observed shapes:
+ *   - function name:  <function=NAME>  and the <fuction=NAME> typo (2B)
+ *   - parameters:     <parameter=KEY>VALUE</parameter>   (Hermes / spec)
+ *                     <KEY>VALUE</parameter>             (bare open, 4B)
+ *                     <KEY>VALUE</KEY>                   (fully bare, 0.8B)
+ *                     <KEY=VALUE> or <KEY="VALUE">       (attribute form, 2B)
+ * Strategy: locate the function opener, then walk opening tags. A non-closing,
+ * non-structural tag introduces a parameter; if it contains '=' the value is
+ * inline (attribute form), otherwise the value is the body up to the matching
+ * close (</KEY> or </parameter>), or the next '<' if neither close is present.
+ * Preferring the explicit close lets values legitimately contain '<'. */
 static int parse_tool_call(const char *block, size_t block_len,
                            ParsedToolCall *out) {
     memset(out, 0, sizeof(*out));
     const char *p = block;
     const char *end = block + block_len;
-    const char *fn_open = "<function=";
-    const char *fn = memmem(p, end - p, fn_open, strlen(fn_open));
+
+    /* Function opener: accept the common "fuction" misspelling too. */
+    const char *fn = memmem(p, end - p, "<function=", 10);
+    size_t fn_open_len = 10;
+    if (!fn) { fn = memmem(p, end - p, "<fuction=", 9); fn_open_len = 9; }
     if (!fn) return -1;
-    fn += strlen(fn_open);
+    fn += fn_open_len;
     const char *fn_close = memchr(fn, '>', end - fn);
     if (!fn_close) return -1;
-    out->function_name = strndup(fn, fn_close - fn);
+    size_t name_len = (size_t)(fn_close - fn);
+    while (name_len > 0 && (fn[name_len - 1] == '/' || fn[name_len - 1] == ' '))
+        name_len--; /* tolerate <function=name/> and trailing space */
+    out->function_name = strndup(fn, name_len);
     if (!out->function_name) return -1;
 
     p = fn_close + 1;
-    const char *param_close = "</parameter>";
-    const char *param_prefix = "parameter=";
-    // Each value is terminated by </parameter>; anchor on that. The opening tag
-    // is either the well-formed <parameter=KEY> or, from smaller models, a bare
-    // <KEY> (Qwen3.5 4B emits e.g. <path>...</parameter>). Take the first tag
-    // before the close as the opener and strip an optional "parameter=" prefix,
-    // so both shapes parse. Anchoring on the close (not "<parameter=") is what
-    // makes the bare-key form work; the rnd prototype tolerated it too.
     while (out->n_params < MAX_PARAMS_PER_TOOL_CALL) {
-        const char *pc = memmem(p, end - p, param_close, strlen(param_close));
-        if (!pc) break;
-        const char *lt = memchr(p, '<', pc - p);
-        if (!lt) { p = pc + strlen(param_close); continue; }
-        const char *gt = memchr(lt, '>', pc - lt);
-        if (!gt) { p = pc + strlen(param_close); continue; }
-        char *key = strndup(lt + 1, gt - (lt + 1));
-        const char *vstart = gt + 1;
-        if (vstart < pc && *vstart == '\n') vstart++;
-        const char *vend = pc;
-        if (vend > vstart && vend[-1] == '\n') vend--;
-        char *val = strndup(vstart, vend - vstart);
-        // Unify <parameter=KEY> with the bare <KEY> form by dropping the prefix.
-        if (key && strncmp(key, param_prefix, strlen(param_prefix)) == 0)
-            memmove(key, key + strlen(param_prefix),
-                    strlen(key + strlen(param_prefix)) + 1);
-        // Tolerate the small-model malformation <parameter=name="value"> (kwarg
-        // jammed into the name slot, empty body) instead of the well-formed
-        // <parameter=name>value</parameter>. A real parameter name never holds
-        // '=', so any '=' in the key marks this case: split and take the inline
-        // value, stripping one layer of surrounding quotes.
-        char *eq = key ? strchr(key, '=') : NULL;
-        if (eq) {
-            *eq = '\0';
-            char *iv = eq + 1;
-            size_t ivn = strlen(iv);
-            if (ivn >= 2 && (iv[0] == '"' || iv[0] == '\'') && iv[ivn - 1] == iv[0]) {
-                iv[ivn - 1] = '\0';
-                iv++;
-            }
-            free(val);
-            val = strdup(iv);
+        const char *lt = memchr(p, '<', end - p);
+        if (!lt) break;
+        const char *gt = memchr(lt, '>', end - lt);
+        if (!gt) break;
+        size_t taglen = (size_t)(gt - (lt + 1));
+        const char *tag = lt + 1;
+        /* Skip closing tags and the function/tool_call structural tags. */
+        if (taglen == 0 || tag[0] == '/' ||
+            (taglen >= 8 && strncmp(tag, "function", 8) == 0) ||
+            (taglen >= 7 && strncmp(tag, "fuction", 7) == 0) ||
+            (taglen >= 9 && strncmp(tag, "tool_call", 9) == 0)) {
+            p = gt + 1;
+            continue;
         }
-        out->param_names[out->n_params] = key;
-        out->param_values[out->n_params] = val;
-        out->n_params++;
-        p = pc + strlen(param_close);
+        char *key = strndup(tag, taglen);
+        if (!key) break;
+        if (strncmp(key, "parameter=", 10) == 0)
+            memmove(key, key + 10, strlen(key + 10) + 1);
+
+        char *eq = strchr(key, '=');
+        if (eq) {
+            /* Attribute form <KEY=VALUE>: value is inline, no body/close. */
+            *eq = '\0';
+            char *val = strdup(eq + 1);
+            if (val) unquote(val);
+            p = gt + 1;
+            if (key[0] && val) {
+                out->param_names[out->n_params] = key;
+                out->param_values[out->n_params] = val;
+                out->n_params++;
+            } else { free(key); free(val); }
+            continue;
+        }
+
+        /* Bare/Hermes form: value is the body up to the matching close. Prefer
+         * </KEY> or </parameter> (so values may contain '<'); else next '<'. */
+        const char *vstart = gt + 1;
+        if (vstart < end && *vstart == '\n') vstart++;
+        char close_tag[80];
+        int cn = snprintf(close_tag, sizeof close_tag, "</%s>", key);
+        const char *pc = NULL;
+        if (cn > 0 && (size_t)cn < sizeof close_tag)
+            pc = memmem(vstart, end - vstart, close_tag, (size_t)cn);
+        if (!pc) pc = memmem(vstart, end - vstart, "</parameter>", 12);
+        const char *vend = pc ? pc : memchr(vstart, '<', end - vstart);
+        if (!vend) vend = end;
+        const char *ve = vend;
+        while (ve > vstart && (ve[-1] == '\n' || ve[-1] == ' ')) ve--;
+        char *val = strndup(vstart, (size_t)(ve - vstart));
+        if (key[0] && val) {
+            out->param_names[out->n_params] = key;
+            out->param_values[out->n_params] = val;
+            out->n_params++;
+        } else { free(key); free(val); }
+        /* Advance past the body and an immediately following close tag. */
+        p = vend;
+        if (p < end && p[0] == '<') {
+            const char *cgt = memchr(p, '>', end - p);
+            if (cgt && p + 1 < end && p[1] == '/') p = cgt + 1;
+        }
     }
     return 0;
 }
@@ -289,7 +424,10 @@ static int render_msgs(Agent *a, int enable_thinking, int add_gen_prompt,
 
 static int prefill_range(Agent *a, const int *tokens, int n, int pos0) {
     if (n <= 0) return 0;
+    double t0 = now_ms();
     float *lp = bn_prefill(a->model, a->sess, tokens, n, pos0, 0);
+    g_pp_ms += now_ms() - t0;
+    g_pp_tok += n;
     return lp ? 0 : -1;
 }
 
@@ -330,6 +468,12 @@ static int run_turn(Agent *a, const char *user_msg,
                     int turn_index, ByteBuf *transcript) {
     StringPool *sp = (StringPool *)a->msgs[0].content;
     (void)sp;
+
+    /* per-turn metric accumulators */
+    g_pp_ms = g_tg_ms = 0.0;
+    g_pp_tok = g_tg_tok = 0;
+    int m_ctx_in = a->pos_pre_turn;
+    int m_tool_ok = 0, m_tool_err = 0;
 
     int user_idx = a->n_msgs;
     a->msgs[user_idx].role = BN_TPL_ROLE_USER;
@@ -392,6 +536,8 @@ static int run_turn(Agent *a, const char *user_msg,
                 }
                 tc->result = tools_execute(tc->function_name, args, tc->n_params);
                 if (!tc->result) tc->result = strdup("error: tool execution failed");
+                if (strncmp(tc->result, "error", 5) == 0) m_tool_err++;
+                else m_tool_ok++;
                 printf("[tool] %s -> %s\n", tc->function_name, tc->result);
                 fflush(stdout);
             }
@@ -460,7 +606,10 @@ static int run_turn(Agent *a, const char *user_msg,
         const char *piece = bn_tokenizer_decode(a->tok, tid);
         if (piece) bb_append(&stream, piece);
 
+        double t0 = now_ms();
         float *lp = bn_prefill(a->model, a->sess, &tid, 1, pos, 0);
+        g_tg_ms += now_ms() - t0;
+        g_tg_tok += 1;
         if (!lp) return -1;
         logits = lp;
         pos++;
@@ -534,6 +683,22 @@ static int run_turn(Agent *a, const char *user_msg,
 
     bb_free(&stream);
 
+    /* Record this turn's metrics before the snapshot re-render below (that
+     * prefill is harness bookkeeping, not prompt processing). */
+    if (g_n_metrics < MAX_TURNS) {
+        TurnMetrics *tm = &g_metrics[g_n_metrics++];
+        tm->ctx_in = m_ctx_in;
+        tm->ctx_out = pos;
+        tm->pp_tok = g_pp_tok;
+        tm->pp_ms = g_pp_ms;
+        tm->tg_tok = g_tg_tok;
+        tm->tg_ms = g_tg_ms;
+        tm->rounds = round_count;
+        tm->tool_ok = m_tool_ok;
+        tm->tool_err = m_tool_err;
+        tm->rss = cur_rss_bytes();
+    }
+
     /* Re-render the full conversation (no clean_history concept in bn_chat_template_encode)
        and snapshot so the next turn starts from a consistent KV position. */
     int clean_tokens[MAX_TOKENS];
@@ -553,16 +718,30 @@ static int run_turn(Agent *a, const char *user_msg,
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: %s <model.gguf> [--out transcript.json] [--metal]\n",
+                "usage: %s <model.gguf> [--out transcript.json] "
+                "[--workdir DIR] [--metal]\n",
                 argv[0]);
         return 2;
     }
     const char *model_path = argv[1];
     const char *transcript_path = "tr.json";
+    const char *workdir = NULL;
     int use_metal = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) transcript_path = argv[++i];
+        else if (strcmp(argv[i], "--workdir") == 0 && i + 1 < argc) workdir = argv[++i];
         else if (strcmp(argv[i], "--metal") == 0) use_metal = 1;
+    }
+    /* If --workdir is set the agent's file tools run inside it (chdir below);
+       resolve a relative --out to an absolute path now so the transcript still
+       lands in the launch directory, outside the searched sandbox. */
+    char transcript_abs[4096];
+    if (workdir && transcript_path[0] != '/') {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof cwd) &&
+            snprintf(transcript_abs, sizeof transcript_abs, "%s/%s",
+                     cwd, transcript_path) < (int)sizeof transcript_abs)
+            transcript_path = transcript_abs;
     }
 
     BnGGUFFile *gf = bn_gguf_open_file(model_path);
@@ -645,6 +824,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--metal requires BN_ENABLE_METAL=1 build; using CPU\n");
     }
 #endif
+
+    /* Run the agent's file tools inside --workdir so its grep/glob/exec never
+       see the harness's own transcript or the caller's redirected stdout log
+       (which otherwise sit in the searched cwd and can feed a grep match loop).
+       Done after Metal init so the relative shader dir resolved first. */
+    if (workdir) {
+        if (mkdir(workdir, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "could not create workdir %s: %s\n",
+                    workdir, strerror(errno));
+            return 1;
+        }
+        if (chdir(workdir) != 0) {
+            fprintf(stderr, "could not chdir to %s: %s\n",
+                    workdir, strerror(errno));
+            return 1;
+        }
+    }
 
     Agent a = {0};
     a.model = &model;
@@ -736,6 +932,8 @@ int main(int argc, char **argv) {
             break;
         }
     }
+
+    print_metrics_table(model_name_buf);
 
     bb_append(&transcript, "\n  ]\n}\n");
 
