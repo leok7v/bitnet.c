@@ -68,6 +68,46 @@ static size_t cur_rss_bytes(void) {
 #endif
 }
 
+/* phys_footprint is the memory the process is actually charged for (anonymous +
+ * wired GPU buffers), excluding clean mmap'd file pages -- a truer figure than
+ * resident_size for an mmap-weights inference engine. */
+
+static size_t cur_footprint_bytes(void) {
+    size_t bytes = 0;
+#ifdef __APPLE__
+    task_vm_info_data_t vm;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  (task_info_t)&vm, &cnt) == KERN_SUCCESS)
+        bytes = (size_t)vm.phys_footprint;
+#endif
+    return bytes;
+}
+
+static double cur_cpu_ms(void) {
+    struct rusage ru;
+    double ms = 0.0;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        ms = (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 +
+             (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
+    return ms;
+}
+
+/* macOS system memory-pressure level: 1 normal, 2 warn, 4 critical (-1 if the
+ * sysctl is unavailable). Process-local GPU utilization is not exposed by the
+ * OS, so the table derives a GPU/wait share from off-CPU wall time instead. */
+
+static int mem_pressure_level(void) {
+    int level = -1;
+#ifdef __APPLE__
+    size_t sz = sizeof(level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level",
+                     &level, &sz, NULL, 0) != 0)
+        level = -1;
+#endif
+    return level;
+}
+
 typedef struct {
     int    ctx_in;     /* context tokens carried into the turn */
     int    ctx_out;    /* context tokens after generation */
@@ -79,6 +119,10 @@ typedef struct {
     int    tool_ok;
     int    tool_err;
     size_t rss;        /* resident bytes at end of turn */
+    size_t footprint;  /* phys_footprint bytes at end of turn */
+    double wall_ms;    /* wall time spent in the turn */
+    double cpu_ms;     /* process CPU time (user+sys) spent in the turn */
+    int    pressure;   /* system memory-pressure level at end of turn */
 } TurnMetrics;
 
 static double g_pp_ms, g_tg_ms;   /* per-turn accumulators (reset each turn) */
@@ -88,39 +132,48 @@ static int    g_n_metrics;
 
 static void print_metrics_table(const char *model_name) {
     printf("\n========== metrics: %s ==========\n", model_name);
-    printf("%-4s %7s %8s %7s %9s %7s %9s %5s %7s %8s\n",
+    printf("%-4s %7s %8s %7s %9s %7s %9s %5s %7s %8s %7s %5s %6s %5s\n",
            "turn", "ctx_in", "ctx_out", "pp_tok", "pp_tok/s",
-           "tg_tok", "tg_tok/s", "rnds", "tools", "rss_MB");
+           "tg_tok", "tg_tok/s", "rnds", "tools", "rss_MB",
+           "fp_MB", "cpu%", "gpuW%", "press");
     double tot_pp_ms = 0, tot_tg_ms = 0;
     long tot_pp = 0, tot_tg = 0;
-    size_t peak = 0;
+    size_t peak = 0, peak_fp = 0;
     for (int i = 0; i < g_n_metrics; i++) {
         TurnMetrics *m = &g_metrics[i];
         double pps = m->pp_ms > 0 ? (double)m->pp_tok * 1000.0 / m->pp_ms : 0;
         double tps = m->tg_ms > 0 ? (double)m->tg_tok * 1000.0 / m->tg_ms : 0;
+        double cpu_pct = m->wall_ms > 0 ? m->cpu_ms * 100.0 / m->wall_ms : 0;
+        double gpu_pct = cpu_pct < 100.0 ? 100.0 - cpu_pct : 0.0;
         char tcs[16];
         snprintf(tcs, sizeof tcs, "%d/%d", m->tool_ok, m->tool_err);
-        printf("%-4d %7d %8d %7ld %9.1f %7ld %9.1f %5d %7s %8.0f\n",
+        printf("%-4d %7d %8d %7ld %9.1f %7ld %9.1f %5d %7s %8.0f "
+               "%7.0f %5.0f %6.0f %5d\n",
                i + 1, m->ctx_in, m->ctx_out, m->pp_tok, pps,
-               m->tg_tok, tps, m->rounds, tcs, (double)m->rss / 1048576.0);
+               m->tg_tok, tps, m->rounds, tcs, (double)m->rss / 1048576.0,
+               (double)m->footprint / 1048576.0, cpu_pct, gpu_pct, m->pressure);
         /* compact CSV for cross-model aggregation (grep '^#M,') */
-        printf("#M,%s,%d,%d,%d,%ld,%.1f,%ld,%.1f,%d,%d,%d,%.0f\n",
+        printf("#M,%s,%d,%d,%d,%ld,%.1f,%ld,%.1f,%d,%d,%d,%.0f,%.0f,%.0f,%.0f,%d\n",
                model_name, i + 1, m->ctx_in, m->ctx_out, m->pp_tok, pps,
                m->tg_tok, tps, m->rounds, m->tool_ok, m->tool_err,
-               (double)m->rss / 1048576.0);
+               (double)m->rss / 1048576.0, (double)m->footprint / 1048576.0,
+               cpu_pct, gpu_pct, m->pressure);
         tot_pp_ms += m->pp_ms; tot_tg_ms += m->tg_ms;
         tot_pp += m->pp_tok; tot_tg += m->tg_tok;
         if (m->rss > peak) peak = m->rss;
+        if (m->footprint > peak_fp) peak_fp = m->footprint;
     }
     double opps = tot_pp_ms > 0 ? (double)tot_pp * 1000.0 / tot_pp_ms : 0;
     double otps = tot_tg_ms > 0 ? (double)tot_tg * 1000.0 / tot_tg_ms : 0;
     int final_ctx = g_n_metrics > 0 ? g_metrics[g_n_metrics - 1].ctx_out : 0;
-    printf("%-4s %7s %8d %7ld %9.1f %7ld %9.1f %5s %7s %8.0f\n",
+    printf("%-4s %7s %8d %7ld %9.1f %7ld %9.1f %5s %7s %8.0f %7.0f %5s %6s %5s\n",
            "ALL", "-", final_ctx, tot_pp, opps, tot_tg, otps, "-", "-",
-           (double)peak / 1048576.0);
-    printf("(pp=prompt prefill, tg=token-gen; rss=resident MB at each turn end; "
-           "peak=%.0f MB, final ctx=%d tok)\n",
-           (double)peak / 1048576.0, final_ctx);
+           (double)peak / 1048576.0, (double)peak_fp / 1048576.0, "-", "-", "-");
+    printf("(pp=prefill, tg=token-gen; rss/fp=resident/phys-footprint MB per "
+           "turn end; cpu%%=process CPU/wall, gpuW%%=off-CPU wall (GPU+sync "
+           "wait); press=mem-pressure 1/2/4; peak rss=%.0f fp=%.0f MB, "
+           "final ctx=%d tok)\n",
+           (double)peak / 1048576.0, (double)peak_fp / 1048576.0, final_ctx);
 }
 
 typedef struct {
@@ -473,6 +526,8 @@ static int run_turn(Agent *a, const char *user_msg,
     /* per-turn metric accumulators */
     g_pp_ms = g_tg_ms = 0.0;
     g_pp_tok = g_tg_tok = 0;
+    double t_turn0 = now_ms();
+    double cpu_turn0 = cur_cpu_ms();
     int m_ctx_in = a->pos_pre_turn;
     int m_tool_ok = 0, m_tool_err = 0;
 
@@ -698,6 +753,10 @@ static int run_turn(Agent *a, const char *user_msg,
         tm->tool_ok = m_tool_ok;
         tm->tool_err = m_tool_err;
         tm->rss = cur_rss_bytes();
+        tm->footprint = cur_footprint_bytes();
+        tm->wall_ms = now_ms() - t_turn0;
+        tm->cpu_ms = cur_cpu_ms() - cpu_turn0;
+        tm->pressure = mem_pressure_level();
     }
 
     /* Re-render the full conversation (no clean_history concept in bn_chat_template_encode)
