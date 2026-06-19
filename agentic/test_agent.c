@@ -719,7 +719,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
                 "usage: %s <model.gguf> [--out transcript.json] "
-                "[--workdir DIR] [--metal]\n",
+                "[--workdir DIR] [--metal] [--kv16]\n",
                 argv[0]);
         return 2;
     }
@@ -727,10 +727,12 @@ int main(int argc, char **argv) {
     const char *transcript_path = "tr.json";
     const char *workdir = NULL;
     int use_metal = 0;
+    int kv_f16 = 0;   /* --kv16: store the KV cache as fp16 (half the memory) */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) transcript_path = argv[++i];
         else if (strcmp(argv[i], "--workdir") == 0 && i + 1 < argc) workdir = argv[++i];
         else if (strcmp(argv[i], "--metal") == 0) use_metal = 1;
+        else if (strcmp(argv[i], "--kv16") == 0) kv_f16 = 1;
     }
     /* If --workdir is set the agent's file tools run inside it (chdir below);
        resolve a relative --out to an absolute path now so the transcript still
@@ -747,7 +749,7 @@ int main(int argc, char **argv) {
     BnGGUFFile *gf = bn_gguf_open_file(model_path);
     if (!gf) { fprintf(stderr, "gguf open failed\n"); return 1; }
     BnModel model;
-    if (bn_model_load(&model, gf, MAX_TOKENS, 0, 0) != 0) {
+    if (bn_model_load(&model, gf, MAX_TOKENS, kv_f16, 0) != 0) {
         fprintf(stderr, "model load failed\n"); return 1;
     }
     BnTokenizer tok;
