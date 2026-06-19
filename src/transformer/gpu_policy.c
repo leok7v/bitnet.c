@@ -194,13 +194,13 @@ int bn_transformer_gpu_validate_forward(
     }
 
     int cuda_large_native = gpu->kind == BN_GPU_BACKEND_CUDA;
-    /* Metal runs large (dim>=4096) hybrid/dense decode correctly with an fp32
-     * KV cache -- verified on Qwen3.5-9B: per-layer hidden states match CPU to
-     * float noise and output is coherent. Only the fp16 KV-cache GPU path is
-     * still broken for these (garbles), and large MoE on Metal is unverified,
-     * so keep those gated to the CPU fallback. */
+    /* Metal runs large (dim>=4096) hybrid/dense decode correctly -- verified on
+     * Qwen3.5-9B: per-layer hidden states match CPU to float noise and output
+     * is coherent, with both fp32 and fp16 KV caches (the GPU KV buffer is fp32;
+     * kv16's fp16 cache is converted on upload). Large MoE on Metal is still
+     * unverified, so keep that gated to the CPU fallback. */
     int metal_large_native =
-        gpu->kind == BN_GPU_BACKEND_METAL && !c->kv_f16 &&
+        gpu->kind == BN_GPU_BACKEND_METAL &&
         c->n_experts <= 0 &&
         !bn_model_arch_requires_large_gpu_graph_fallback(c);
     if (!getenv("BN_GPU_FORCE_GRAPH") && c->dim >= 4096 &&

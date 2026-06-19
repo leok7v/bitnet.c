@@ -918,7 +918,35 @@ static int gpu_upload_kv_segment(BnGPUBackend *gpu, BnRunState *s,
     size_t row_elems = (size_t)kv_dim;
     size_t layer_base = (size_t)layer * (size_t)seq_len * row_elems;
     size_t row_base = layer_base + (size_t)start_pos * row_elems;
-    size_t bytes = (size_t)n_rows * row_elems * elem_size;
+    size_t n_elems = (size_t)n_rows * row_elems;
+
+    /* The GPU KV-cache activation buffer is fp32 (the decode-side writes via
+     * buf_copy and the attention read shaders are all fp32). When the CPU KV
+     * cache is fp16 (kv_f16) we must CONVERT fp16->fp32 on upload, not copy the
+     * packed fp16 bytes -- otherwise the prompt's KV is half-strided in an
+     * fp32 buffer and the GPU reads garbage. kv16's memory win is the CPU
+     * cache; the GPU cache stays fp32. */
+    if (elem_size == sizeof(uint16_t)) {
+        size_t fp32_off = row_base * sizeof(float);
+        float *ktmp = (float *)malloc(n_elems * sizeof(float));
+        float *vtmp = (float *)malloc(n_elems * sizeof(float));
+        if (!ktmp || !vtmp) { free(ktmp); free(vtmp); return -1; }
+        const uint16_t *ksrc = (const uint16_t *)s->key_cache + row_base;
+        const uint16_t *vsrc = (const uint16_t *)s->value_cache + row_base;
+        for (size_t i = 0; i < n_elems; i++) {
+            ktmp[i] = bn_fp16_to_fp32(ksrc[i]);
+            vtmp[i] = bn_fp16_to_fp32(vsrc[i]);
+        }
+        int rc = gpu->write_activation(gpu->ctx, BN_GPU_VALUE_KEY_CACHE,
+                                       ktmp, n_elems * sizeof(float), fp32_off);
+        if (rc == 0)
+            rc = gpu->write_activation(gpu->ctx, BN_GPU_VALUE_VALUE_CACHE,
+                                       vtmp, n_elems * sizeof(float), fp32_off);
+        free(ktmp); free(vtmp);
+        return rc;
+    }
+
+    size_t bytes = n_elems * elem_size;
     size_t offset = row_base * elem_size;
     const char *key_src = (const char *)s->key_cache + offset;
     const char *val_src = (const char *)s->value_cache + offset;
