@@ -31,7 +31,7 @@
 #include <sys/resource.h>
 #endif
 
-#define MAX_TOKENS               8192
+#define MAX_TOKENS               65536
 #define MAX_GEN_PER_TURN         1024
 #define MAX_TOOL_CALLS_PER_TURN  4
 #define MAX_PARAMS_PER_TOOL_CALL 8
@@ -407,6 +407,7 @@ typedef struct {
     const char *chat_tmpl;
     const char *bos_token;
     const char *eos_token;
+    int think;               /* enable_thinking, from --thinking on|off */
 } Agent;
 
 static int render_msgs(Agent *a, int enable_thinking, int add_gen_prompt,
@@ -484,7 +485,7 @@ static int run_turn(Agent *a, const char *user_msg,
     a->n_msgs++;
 
     int prompt_tokens[MAX_TOKENS];
-    int n_prompt = render_msgs(a, 1, 1,
+    int n_prompt = render_msgs(a, a->think, 1,
                                tools, n_tools, prompt_tokens, MAX_TOKENS);
     if (n_prompt < 0) { fprintf(stderr, "render prompt failed\n"); return -1; }
 
@@ -580,7 +581,7 @@ static int run_turn(Agent *a, const char *user_msg,
             }
 
             int cont_tokens[MAX_TOKENS];
-            int enable_thinking_now = (round_count < MAX_ROUNDS_PER_TURN) ? 1 : 0;
+            int enable_thinking_now = a->think && (round_count < MAX_ROUNDS_PER_TURN);
             int n_cont = render_msgs(a, enable_thinking_now, 1,
                                      tools, n_tools, cont_tokens, MAX_TOKENS);
             if (n_cont < 0) {
@@ -702,7 +703,7 @@ static int run_turn(Agent *a, const char *user_msg,
     /* Re-render the full conversation (no clean_history concept in bn_chat_template_encode)
        and snapshot so the next turn starts from a consistent KV position. */
     int clean_tokens[MAX_TOKENS];
-    int n_clean = render_msgs(a, 1, 0,
+    int n_clean = render_msgs(a, a->think, 0,
                               tools, n_tools, clean_tokens, MAX_TOKENS);
     if (n_clean < 0) {
         fprintf(stderr, "render clean history failed\n"); return -1;
@@ -719,7 +720,9 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
                 "usage: %s <model.gguf> [--out transcript.json] "
-                "[--workdir DIR] [--metal] [--kv16]\n",
+                "[--workdir DIR] [--metal] [--kv16] "
+                "[--thinking on|off] [--reasoning-effort low|medium|high] "
+                "[--maxseq N]\n",
                 argv[0]);
         return 2;
     }
@@ -728,11 +731,23 @@ int main(int argc, char **argv) {
     const char *workdir = NULL;
     int use_metal = 0;
     int kv_f16 = 0;   /* --kv16: store the KV cache as fp16 (half the memory) */
+    int think_mode = 1;          /* --thinking on|off -> enable_thinking */
+    const char *effort = NULL;   /* --reasoning-effort low|medium|high */
+    int max_seq = 8192;          /* --maxseq N: KV/context token cap */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) transcript_path = argv[++i];
         else if (strcmp(argv[i], "--workdir") == 0 && i + 1 < argc) workdir = argv[++i];
         else if (strcmp(argv[i], "--metal") == 0) use_metal = 1;
         else if (strcmp(argv[i], "--kv16") == 0) kv_f16 = 1;
+        else if (strcmp(argv[i], "--thinking") == 0 && i + 1 < argc)
+            think_mode = strcmp(argv[++i], "off") != 0;
+        else if (strcmp(argv[i], "--reasoning-effort") == 0 && i + 1 < argc)
+            effort = argv[++i];
+        else if (strcmp(argv[i], "--maxseq") == 0 && i + 1 < argc) {
+            max_seq = atoi(argv[++i]);
+            if (max_seq < 1) max_seq = 1;
+            if (max_seq > MAX_TOKENS) max_seq = MAX_TOKENS;
+        }
     }
     /* If --workdir is set the agent's file tools run inside it (chdir below);
        resolve a relative --out to an absolute path now so the transcript still
@@ -749,7 +764,7 @@ int main(int argc, char **argv) {
     BnGGUFFile *gf = bn_gguf_open_file(model_path);
     if (!gf) { fprintf(stderr, "gguf open failed\n"); return 1; }
     BnModel model;
-    if (bn_model_load(&model, gf, MAX_TOKENS, kv_f16, 0) != 0) {
+    if (bn_model_load(&model, gf, max_seq, kv_f16, 0) != 0) {
         fprintf(stderr, "model load failed\n"); return 1;
     }
     BnTokenizer tok;
@@ -855,6 +870,7 @@ int main(int argc, char **argv) {
     a.chat_tmpl = chat_tmpl;
     a.bos_token = bos_token;
     a.eos_token = eos_token;
+    a.think = think_mode;
 
     // Unsloth's recommended Qwen3.5 sampling (non-thinking text tasks):
     //   temperature=1.0, top_p=1.0, top_k=20, min_p=0.0,
@@ -884,13 +900,32 @@ int main(int argc, char **argv) {
     };
     int n_tools = 8;
     a.msgs[0].role = BN_TPL_ROLE_SYSTEM;
-    a.msgs[0].content = strdup(
+    const char *sys_base =
         "You are a coding agent working in the current project directory. "
         "You have file and shell tools: get_datetime, read_file, "
         "file_glob_search, grep_search, exec_shell_command, write_file, "
         "edit_file, apply_diff. Call a tool to inspect or modify files, then "
-        "reply with a short final answer after the tool round-trip.");
+        "reply with a short final answer after the tool round-trip.";
+    /* Qwen3.5's chat template has no reasoning_effort hook, so steer effort via
+       a system directive instead of a template variable. */
+    if (effort) {
+        const char *steer = strcmp(effort, "low") == 0 ?
+            "Keep reasoning minimal and act quickly." :
+            strcmp(effort, "high") == 0 ?
+            "Reason carefully and thoroughly before acting." :
+            "Use a moderate amount of reasoning.";
+        size_t cap = strlen(sys_base) + strlen(effort) + strlen(steer) + 32;
+        char *sys = malloc(cap);
+        snprintf(sys, cap, "%s\n\nReasoning effort: %s. %s",
+                 sys_base, effort, steer);
+        a.msgs[0].content = sys;
+    } else {
+        a.msgs[0].content = strdup(sys_base);
+    }
     a.n_msgs = 1;
+    printf("config: thinking=%s reasoning-effort=%s maxseq=%d kv16=%d metal=%d\n",
+           think_mode ? "on" : "off", effort ? effort : "(none)",
+           max_seq, kv_f16, use_metal);
 
     a.pos_pre_turn = 0;
     if (snapshot_current(&a) != 0) {
