@@ -1478,7 +1478,11 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
     if (n_tokens <= 0) return NULL;
     if (sess) {
         sess->gpu_kv_direct_valid = 0;
-        sess->gpu_ssm_direct_valid = 0;
+        /* Assume every SSM layer will write its recurrent state directly to
+           the GPU; any layer that falls back to the CPU path clears this, so
+           the end-of-prefill sync uploads only when at least one layer was
+           CPU-computed (logical AND over layers). */
+        sess->gpu_ssm_direct_valid = 1;
         /* A from-scratch prefill restarts the sequence, so the recurrent SSM
            state must be zero. The GPU SSM buffer is per-context (shared, not
            otherwise cleared), so explicitly zero it; no-op on CPU/non-hybrid. */
@@ -2459,54 +2463,6 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                 }
             }
 
-            if (metal_hybrid_prefill && prefill_gpu &&
-                prefill_gpu->prefill_begin_batch &&
-                prefill_gpu->prefill_flush &&
-                prefill_gpu->prefill_ssm_layer &&
-                !lw->moe.router_weight) {
-                int run_end = l + 1;
-                while (run_end < c->n_layers) {
-                    BnLayerWeights *rlw = &w->layers[run_end];
-                    BnLayerShapePlan rplan;
-                    bn_transformer_plan_layer_shape(
-                        &rplan, c, rlw, run_end,
-                        bn_model_tq_state(m) != NULL);
-                    if (rplan.is_attn || rlw->moe.router_weight)
-                        break;
-                    run_end++;
-                }
-                if (run_end - l > 1 &&
-                    prefill_gpu->prefill_begin_batch(
-                        prefill_gpu->ctx, act, n_tokens, dim) == 0) {
-                    int batch_ok = 1;
-                    for (int rl = l; rl < run_end; rl++) {
-                        BnLayerWeights *rlw = &w->layers[rl];
-                        BnLayerShapePlan rplan;
-                        bn_transformer_plan_layer_shape(
-                            &rplan, c, rlw, rl,
-                            bn_model_tq_state(m) != NULL);
-                        int r_did_ffn = 0;
-                        if (prefill_ssm_layer_gpu(
-                                m, act, rlw, act, n_tokens, dim,
-                                qkv_dim_ssm, value_dim, num_k_heads,
-                                head_k_dim, num_v_heads, head_v_dim,
-                                kern_ssm, rplan.ssm_idx, rl, 1,
-                                c->norm_eps, &r_did_ffn) != 0 ||
-                            !r_did_ffn) {
-                            batch_ok = 0;
-                            break;
-                        }
-                    }
-                    prefill_gpu->prefill_flush(prefill_gpu->ctx, act,
-                                               n_tokens, dim);
-                    if (batch_ok) {
-                        sess->gpu_ssm_direct_valid = 1;
-                        l = run_end - 1;
-                        goto prefill_layer_done;
-                    }
-                }
-            }
-
             size_t state_per_layer = (size_t)num_v_heads * head_k_dim * head_v_dim;
             float *ssm_state = s->ssm_state + (size_t)ssm_idx * state_per_layer;
             size_t conv_per_layer = (size_t)(kern_ssm - 1) * qkv_dim_ssm;
@@ -2519,11 +2475,13 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                       kern_ssm, ssm_idx, l,
                                       n_tokens >= prefill_moe_chain_min_tokens(c, bn_model_gpu(m)),
                                       c->norm_eps, &ssm_did_ffn) == 0) {
-                sess->gpu_ssm_direct_valid = 1;
                 if (ssm_did_ffn)
                     goto prefill_layer_done;
                 goto prefill_ssm_done;
             }
+            /* This SSM layer fell back to the CPU; its GPU-resident state is
+               now stale, so force the end-of-prefill upload. */
+            sess->gpu_ssm_direct_valid = 0;
 
             for (int t = 0; t < n_tokens; t++)
                 prefill_rmsnorm(Xb + (size_t)t * dim, act + (size_t)t * dim,

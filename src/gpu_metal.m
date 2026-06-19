@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <assert.h>
 #include <unistd.h>
 
 /* Max tensor type enum value we index into (I2_S = 36, plus margin) */
@@ -111,13 +112,6 @@ typedef struct {
     size_t        q8_bsums_buf_size;
     id<MTLBuffer> ssm_prefill_buf;
     size_t        ssm_prefill_buf_size;
-    id<MTLBuffer>                  batch_act_buf[2];
-    size_t                         batch_act_buf_size[2];
-    int                            batch_chain_index;
-    int                            batch_active;
-    id<MTLCommandBuffer>           batch_cmd;
-    id<MTLComputeCommandEncoder>   batch_enc;
-    id<MTLFence>                   batch_fence;
     id<MTLBuffer>                  gpu_key_cache;
     id<MTLBuffer>                  gpu_value_cache;
     size_t                         gpu_kv_cache_bytes;
@@ -2022,21 +2016,6 @@ static int metal_ensure_ssm_prefill_buf(BnMetalCtx *ctx, size_t bytes)
     return 0;
 }
 
-static int metal_ensure_batch_act_buf(BnMetalCtx *ctx, size_t bytes)
-{
-    size_t aligned = (bytes + 15) & ~(size_t)15;
-    for (int i = 0; i < 2; i++) {
-        if (ctx->batch_act_buf[i] && ctx->batch_act_buf_size[i] >= aligned)
-            continue;
-        ctx->batch_act_buf[i] =
-            [ctx->device newBufferWithLength:aligned
-                                     options:MTLResourceStorageModeShared];
-        if (!ctx->batch_act_buf[i]) return -1;
-        ctx->batch_act_buf_size[i] = aligned;
-    }
-    return 0;
-}
-
 static void metal_sync_buf(BnMetalCtx *ctx,
                            id<MTLComputeCommandEncoder> __strong *encp,
                            id<MTLCommandBuffer> cmd,
@@ -2045,35 +2024,6 @@ static void metal_sync_buf(BnMetalCtx *ctx,
     (void)ctx; (void)cmd; (void)res;
     id<MTLComputeCommandEncoder> enc = *encp;
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-}
-
-static int metal_prefill_begin_batch(void *vctx, const float *X,
-                                     int n_tokens, int dim)
-{
-    (void)vctx; (void)X; (void)n_tokens; (void)dim;
-    return -1;
-}
-
-static int metal_prefill_flush(void *vctx, float *out, int n_tokens, int dim)
-{
-    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
-    if (!ctx || !ctx->batch_active) return -1;
-
-    [ctx->batch_enc endEncoding];
-    [ctx->batch_cmd commit];
-    [ctx->batch_cmd waitUntilCompleted];
-
-    if (out && n_tokens > 0 && dim > 0) {
-        size_t bytes = (size_t)n_tokens * (size_t)dim * sizeof(float);
-        id<MTLBuffer> chain = ctx->batch_act_buf[ctx->batch_chain_index];
-        if (chain && ctx->batch_act_buf_size[ctx->batch_chain_index] >= bytes)
-            memcpy(out, [chain contents], bytes);
-    }
-
-    ctx->batch_cmd = nil;
-    ctx->batch_enc = nil;
-    ctx->batch_active = 0;
-    return 0;
 }
 
 static int metal_prefill_ssm_layer(
@@ -2097,6 +2047,11 @@ static int metal_prefill_ssm_layer(
     if (!ctx) return -1;
     if (!ctx->ssm_prefill_enabled) return -1;
 
+    /* The ssm_prefill_delta shaders hardcode a 128x128 head (k_row/col
+       strides, state base, q/k/v offsets all use the literal 128u), so a
+       non-128 head here would read wrong strides. Gate it out and fall back
+       to the CPU path; do NOT relax the 128 check without parameterizing the
+       shaders. */
     if (n_tokens <= 1 || dim <= 0 || qkv_dim <= 0 || inner_dim <= 0 ||
         num_k_heads <= 0 || num_v_heads <= 0 ||
         head_k_dim != 128 || head_v_dim != 128 ||
@@ -2179,21 +2134,12 @@ static int metal_prefill_ssm_layer(
     if (metal_ensure_ssm_prefill_buf(ctx, scratch_floats * sizeof(float)) != 0)
         return -1;
 
-    id<MTLBuffer> x_id  = nil;
-    id<MTLBuffer> out_id = nil;
-    if (ctx->batch_active) {
-        if (metal_ensure_batch_act_buf(ctx, dim_values * sizeof(float)) != 0)
-            return -1;
-        x_id  = ctx->batch_act_buf[ctx->batch_chain_index];
-        out_id = ctx->batch_act_buf[ctx->batch_chain_index ^ 1];
-    } else {
-        if (ensure_scratch(ctx, dim_values * sizeof(float),
-                           dim_values * sizeof(float)) != 0)
-            return -1;
-        x_id  = ctx->x_buf;
-        out_id = ctx->out_buf;
-        memcpy([x_id contents], X, dim_values * sizeof(float));
-    }
+    if (ensure_scratch(ctx, dim_values * sizeof(float),
+                       dim_values * sizeof(float)) != 0)
+        return -1;
+    id<MTLBuffer> x_id  = ctx->x_buf;
+    id<MTLBuffer> out_id = ctx->out_buf;
+    memcpy([x_id contents], X, dim_values * sizeof(float));
 
     const uint32_t key_dim = (uint32_t)(num_k_heads * head_k_dim);
     const float q_scale = 1.0f / sqrtf((float)head_k_dim);
@@ -2205,10 +2151,8 @@ static int metal_prefill_ssm_layer(
                    (size_t)qkv_dim);
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd =
-            ctx->batch_active ? ctx->batch_cmd : [ctx->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc =
-            ctx->batch_active ? ctx->batch_enc : [cmd computeCommandEncoder];
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
 #define SSM_CHECKPOINT(NAME, SLOT) do { (void)(NAME); (void)(SLOT); } while (0)
 
@@ -2276,6 +2220,10 @@ static int metal_prefill_ssm_layer(
             !use_precise &&
             ctx->ssm_prefill_delta_fused_ab_pipeline != nil;
         int fuse_l2norm = 0;
+        /* The precise delta shader implements neither the alpha/beta nor the
+           l2norm fusion paths; selecting it alongside either would silently
+           skip that transform and corrupt the recurrence. */
+        assert(!use_precise || (!fuse_alpha_beta && !fuse_l2norm));
 
         if (!fuse_l2norm) {
             uint32_t params[8] = { (uint32_t)head_k_dim, 0, key_dim,
@@ -2496,18 +2444,13 @@ static int metal_prefill_ssm_layer(
             }
         }
 
-        if (ctx->batch_active) {
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            ctx->batch_chain_index ^= 1;
-        } else {
-            [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
-        }
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
     }
 #undef SSM_CHECKPOINT
 
-    if (out && !ctx->batch_active)
+    if (out)
         memcpy(out, [ctx->out_buf contents], dim_values * sizeof(float));
 
     if (did_ffn) *did_ffn = fuse_ffn ? 1 : 0;
@@ -3662,6 +3605,11 @@ static int metal_execute(void *vctx, const void *ops_raw, int n_ops,
             case BN_GPU_SHADER_Q5K_MATVEC_SPLIT: {
                 BnMetalBuf *wbuf = (BnMetalBuf *)op->W_buf;
                 if (!wbuf) continue;
+                // Q5K split binds 4 buffers but the lowered op exposes only 3
+                // slots (in/out/aux). When p[3] is set, the third output's
+                // activation slot rides in op->rows (NOT a row count for this
+                // op); otherwise it reuses buf_aux. Do not read op->rows as a
+                // dimension here.
                 int out2_slot = (op->p[3] > 0u) ? op->rows : op->buf_aux;
                 [enc setBuffer:wbuf->buf offset:wbuf->offset atIndex:0];
                 [enc setBuffer:ctx->act_bufs[op->buf_in] offset:0 atIndex:1];
@@ -4125,8 +4073,6 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
         gpu->kv_cache_init        = metal_kv_cache_init;
         gpu->kv_cache_write       = metal_kv_cache_write;
         gpu->prefill_kv_prep      = metal_prefill_kv_prep;
-        gpu->prefill_begin_batch  = metal_prefill_begin_batch;
-        gpu->prefill_flush        = metal_prefill_flush;
         gpu->prefill_ssm_layer    = metal_prefill_ssm_layer;
         gpu->prefill_attention    = metal_prefill_attention;
         gpu->prefill_attention_wo = metal_prefill_attention_wo;

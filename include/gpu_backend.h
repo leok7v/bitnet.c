@@ -399,11 +399,6 @@ struct BnGPUBackend {
                            int rope_dims, int qk_norm_per_head,
                            float norm_eps);
 
-    int (*prefill_begin_batch)(void *ctx, const float *X,
-                               int n_tokens, int dim);
-
-    int (*prefill_flush)(void *ctx, float *out, int n_tokens, int dim);
-
     // Hybrid/SSM prompt block fast path:
     // out[n_tokens, dim] = X + ssm_out(SSM(norm(X))). Backend owns and updates
     // its resident SSM recurrent state. Optional CUDA-oriented hook.
