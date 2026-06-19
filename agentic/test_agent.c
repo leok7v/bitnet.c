@@ -5,6 +5,7 @@
 #include "generate.h"
 #include "tokenizer.h"
 #include "sampler.h"
+#include "grammar.h"
 #include "gguf.h"
 #include "threadpool.h"
 
@@ -38,6 +39,8 @@
 #define MAX_TURNS                8
 #define MAX_MSGS                256
 #define MAX_ROUNDS_PER_TURN      2
+#define MAX_IDENTICAL_ROUNDS     3   /* loop-breaker: stop after N repeats */
+#define MAX_TOTAL_ROUNDS         8   /* loop-breaker: hard cap on tool rounds */
 
 /* ---- lightweight per-turn instrumentation ----------------------------------
  * pp = prompt processing (bulk prefill of the user turn + tool-result
@@ -143,6 +146,10 @@ static double g_pp_ms, g_tg_ms;   /* per-turn accumulators (reset each turn) */
 static long   g_pp_tok, g_tg_tok;
 static TurnMetrics g_metrics[MAX_TURNS];
 static int    g_n_metrics;
+
+/* --vv / --verbose: echo the full rendered prompt, every generated token, and
+ * tool args/results to stdout so the whole model interaction is visible. */
+static int    g_verbose;
 
 static void print_metrics_table(const char *model_name) {
     printf("\n========== metrics: %s ==========\n", model_name);
@@ -435,6 +442,54 @@ static char *content_before_first_tool_call(const char *content) {
     return strndup(content, n);
 }
 
+/* Constrained decoding (--grammar): mask logits so the model can only emit
+ * well-formed tool-call markup. The grammar forces the literal structural tags
+ * (<tool_call>, <function=, <parameter=, the close tags) while leaving the
+ * function name and each parameter name/value FREE. It is armed only inside a
+ * <tool_call> block, so reasoning and final answers are unconstrained. The mask
+ * no-ops when the grammar is dead so it never forbids the whole vocabulary. */
+typedef struct {
+    BnGrammar *g;
+    const BnGrammarVocab *v;
+} GrammarMaskCtx;
+
+static void grammar_mask_cb(void *ctx, float *logits, int vocab_size) {
+    GrammarMaskCtx *c = (GrammarMaskCtx *)ctx;
+    (void)vocab_size;
+    if (!bn_grammar_dead(c->g)) bn_grammar_mask_logits(c->g, c->v, logits);
+}
+
+/* Tool-call skeleton: <tool_call> WS <function=NAME> ( WS <parameter=PNAME>
+ * VALUE </parameter> )* WS </function> WS </tool_call>. WS is (any byte except
+ * '<')*, which absorbs the inter-tag newlines and also matches the zero-space
+ * inline form. Parameters are zero-or-more so a no-arg call (get_datetime) emits
+ * </function> straight after <function=NAME>. Names run until '>', values until
+ * '<' (so a value may contain '>' but not '<' -- fine for paths/queries; a
+ * literal '<' inside a value, e.g. embedded markup, is the known limitation). */
+static int build_tool_call_grammar(BnGBuilder *b) {
+    bn_gb_reset(b);
+    bn_gb_lit(b, "<tool_call>");
+    bn_gb_until_char(b, '<');                   /* WS before <function= */
+    bn_gb_lit(b, "<function=");
+    bn_gb_until_char(b, '>');                   /* function name, free */
+    bn_gb_lit(b, ">");
+    int loop = b->n;
+    bn_gb_until_char(b, '<');                   /* WS before the next tag */
+    int sp = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);  /* param | end, alt patched */
+    bn_gb_lit(b, "<parameter=");
+    bn_gb_until_char(b, '>');                   /* param name, free */
+    bn_gb_lit(b, ">");
+    bn_gb_until_char(b, '<');                   /* value, free until close */
+    bn_gb_lit(b, "</parameter>");
+    bn_gb_emit(b, BN_G_JMP, 0, 0, loop, -1);    /* another param or the close */
+    int endb = b->n;
+    bn_gb_patch(b, sp, -1, endb);
+    bn_gb_lit(b, "</function>");
+    bn_gb_until_char(b, '<');                   /* WS before </tool_call> */
+    bn_gb_lit(b, "</tool_call>");
+    return bn_gb_match(b);
+}
+
 typedef struct {
     BnTplMessage msgs[MAX_MSGS];
     int n_msgs;
@@ -455,6 +510,15 @@ typedef struct {
     const char *bos_token;
     const char *eos_token;
     int think;               /* enable_thinking, from --thinking on|off */
+
+    /* --grammar: constrain tool-call markup via sampler logit masking. */
+    int            grammar_on;
+    BnGrammar      grammar;
+    BnGInst        grammar_prog[BN_G_MAX_PROG];
+    int            grammar_prog_len;
+    char         **gvocab_decoded;   /* stable decoded vocab strings (owned) */
+    BnGrammarVocab *gvocab;          /* sorted view over gvocab_decoded */
+    GrammarMaskCtx  gmctx;
 } Agent;
 
 static int render_msgs(Agent *a, int enable_thinking, int add_gen_prompt,
@@ -468,6 +532,48 @@ static int render_msgs(Agent *a, int enable_thinking, int add_gen_prompt,
                                    enable_thinking, add_gen_prompt,
                                    a->bos_token, a->eos_token,
                                    out_tokens, max_tokens);
+}
+
+/* Decode a token range back to text and echo it (special tokens are literal
+ * vocab strings, so the chat-template structure is preserved). */
+static void vb_dump_tokens(Agent *a, const char *label,
+                           const int *toks, int from, int to) {
+    if (!g_verbose) return;
+    printf("\n----- %s [%d..%d) -----\n", label, from, to);
+    for (int i = from; i < to; i++) {
+        const char *p = bn_tokenizer_decode(a->tok, toks[i]);
+        if (p) fputs(p, stdout);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+/* Arm/disarm the tool-call grammar from the committed token stream. Armed when
+ * the last <tool_call> in the stream is still open (replaying from that tag
+ * recovers the state even if one token straddled the open); advanced per
+ * committed piece; disarmed at </tool_call> or if the grammar dies, so free
+ * text resumes. Offsets, not pointers, survive the stream buffer reallocating. */
+static void grammar_step(Agent *a, ByteBuf *stream, const char *piece,
+                         int *armed, size_t *tc_open) {
+    const char *buf = stream->buf ? stream->buf : "";
+    if (!*armed) {
+        const char *open = NULL;
+        for (const char *p = buf; (p = strstr(p, "<tool_call>")) != NULL; p += 11)
+            open = p;
+        if (open && !strstr(open + 11, "</tool_call>")) {
+            bn_grammar_init(&a->grammar, a->grammar_prog, a->grammar_prog_len);
+            bn_grammar_advance(&a->grammar, open);
+            bn_sampler_set_mask(&a->sampler, grammar_mask_cb, &a->gmctx);
+            *armed = 1;
+            *tc_open = (size_t)(open - buf);
+        }
+    } else {
+        bn_grammar_advance(&a->grammar, piece);
+        if (strstr(buf + *tc_open + 11, "</tool_call>") || bn_grammar_dead(&a->grammar)) {
+            bn_sampler_set_mask(&a->sampler, NULL, NULL);
+            *armed = 0;
+        }
+    }
 }
 
 /* Batch-prefill [tokens..tokens+n) at pos0. The batch already computes the
@@ -517,6 +623,8 @@ static int run_turn(Agent *a, const char *user_msg,
     /* per-turn metric accumulators */
     g_pp_ms = g_tg_ms = 0.0;
     g_pp_tok = g_tg_tok = 0;
+    /* The sampler persists across turns; start every turn with no mask. */
+    if (a->grammar_on) bn_sampler_set_mask(&a->sampler, NULL, NULL);
     double t_turn0 = now_ms();
     double cpu_turn0 = cur_cpu_ms();
     double gpu_turn0 = cur_gpu_active_ms(a->model);
@@ -535,6 +643,8 @@ static int run_turn(Agent *a, const char *user_msg,
     int n_prompt = render_msgs(a, a->think, 1,
                                tools, n_tools, prompt_tokens, MAX_TOKENS);
     if (n_prompt < 0) { fprintf(stderr, "render prompt failed\n"); return -1; }
+    vb_dump_tokens(a, "PROMPT", prompt_tokens, 0, n_prompt);
+    if (g_verbose) { printf("----- GENERATION -----\n"); fflush(stdout); }
 
     float *logits = NULL;
     if (restore_and_extend(a, prompt_tokens, n_prompt, &logits) != 0) return -1;
@@ -547,6 +657,10 @@ static int run_turn(Agent *a, const char *user_msg,
     int turn_done = 0;
     int gen_count = 0;
     int round_count = 0;
+    int grammar_armed = 0;
+    size_t grammar_open = 0;
+    char *last_sig = NULL;
+    int repeat_rounds = 0;
 
     if (!logits) { fprintf(stderr, "prompt prefill produced no logits\n"); return -1; }
 
@@ -581,7 +695,15 @@ static int run_turn(Agent *a, const char *user_msg,
                 if (!tc->result) tc->result = strdup("error: tool execution failed");
                 if (strncmp(tc->result, "error", 5) == 0) m_tool_err++;
                 else m_tool_ok++;
-                printf("[tool] %s -> %s\n", tc->function_name, tc->result);
+                if (g_verbose) {
+                    printf("\n[tool] %s(", tc->function_name);
+                    for (int p = 0; p < tc->n_params; p++)
+                        printf("%s%s=%s", p ? ", " : "",
+                               tc->param_names[p], tc->param_values[p]);
+                    printf(") -> %s\n", tc->result);
+                } else {
+                    printf("[tool] %s -> %s\n", tc->function_name, tc->result);
+                }
                 fflush(stdout);
             }
             round_count++;
@@ -627,21 +749,59 @@ static int run_turn(Agent *a, const char *user_msg,
                 a->n_msgs++;
             }
 
-            int cont_tokens[MAX_TOKENS];
-            int enable_thinking_now = a->think && (round_count < MAX_ROUNDS_PER_TURN);
-            int n_cont = render_msgs(a, enable_thinking_now, 1,
-                                     tools, n_tools, cont_tokens, MAX_TOKENS);
-            if (n_cont < 0) {
-                fprintf(stderr, "render continuation failed\n"); return -1;
+            /* Loop-breaker: a small model can wedge on a tool it cannot satisfy
+               (e.g. apply_diff "corrupt patch") and re-emit the same call every
+               round until the growing context overflows and prefill crashes.
+               End the turn once the same call signature repeats too often. */
+            char sig[1024];
+            size_t so = 0;
+            for (int t = 0; t < n_observed_tcs && so + 1 < sizeof sig; t++) {
+                ParsedToolCall *tc = &observed_tcs[t];
+                int w = snprintf(sig + so, sizeof sig - so, "%s(", tc->function_name);
+                if (w > 0) so += (size_t)w < sizeof sig - so ? (size_t)w : sizeof sig - so - 1;
+                for (int p = 0; p < tc->n_params && so + 1 < sizeof sig; p++) {
+                    w = snprintf(sig + so, sizeof sig - so, "%s=%s;",
+                                 tc->param_names[p], tc->param_values[p]);
+                    if (w > 0) so += (size_t)w < sizeof sig - so ? (size_t)w : sizeof sig - so - 1;
+                }
             }
-            if (n_cont > pos) {
-                if (prefill_range(a, cont_tokens + pos, n_cont - pos, pos,
-                                  &logits) != 0)
-                    return -1;
-                pos = n_cont;
+            if (last_sig && strcmp(last_sig, sig) == 0) repeat_rounds++;
+            else repeat_rounds = 0;
+            free(last_sig);
+            last_sig = strdup(sig);
+            if (repeat_rounds + 1 >= MAX_IDENTICAL_ROUNDS) {
+                fprintf(stderr, "loop-breaker: '%s' repeated %d times; ending turn\n",
+                        sig, repeat_rounds + 1);
+                turn_done = 1;
+            }
+            /* The repeat check only catches identical CONSECUTIVE calls; an
+               alternating A-B-A-B loop evades it, so also cap total rounds. */
+            if (round_count >= MAX_TOTAL_ROUNDS) {
+                fprintf(stderr, "loop-breaker: %d tool rounds in one turn; ending turn\n",
+                        round_count);
+                turn_done = 1;
+            }
+
+            if (!turn_done) {
+                int cont_tokens[MAX_TOKENS];
+                int enable_thinking_now = a->think && (round_count < MAX_ROUNDS_PER_TURN);
+                int n_cont = render_msgs(a, enable_thinking_now, 1,
+                                         tools, n_tools, cont_tokens, MAX_TOKENS);
+                if (n_cont < 0) {
+                    fprintf(stderr, "render continuation failed\n"); return -1;
+                }
+                if (n_cont > pos) {
+                    vb_dump_tokens(a, "TOOL-RESULT PROMPT", cont_tokens, pos, n_cont);
+                    if (g_verbose) { printf("----- GENERATION -----\n"); fflush(stdout); }
+                    if (prefill_range(a, cont_tokens + pos, n_cont - pos, pos,
+                                      &logits) != 0)
+                        return -1;
+                    pos = n_cont;
+                }
             }
             bb_reset(&stream);
             scanned_to = 0;
+            if (a->grammar_on) { bn_sampler_set_mask(&a->sampler, NULL, NULL); grammar_armed = 0; }
             for (int t = 0; t < n_observed_tcs; t++)
                 parsed_tc_free(&observed_tcs[t]);
             n_observed_tcs = 0;
@@ -650,6 +810,9 @@ static int run_turn(Agent *a, const char *user_msg,
 
         const char *piece = bn_tokenizer_decode(a->tok, tid);
         if (piece) bb_append(&stream, piece);
+        if (g_verbose && piece) { fputs(piece, stdout); fflush(stdout); }
+        if (a->grammar_on && piece)
+            grammar_step(a, &stream, piece, &grammar_armed, &grammar_open);
 
         double t0 = now_ms();
         float *lp = bn_prefill(a->model, a->sess, &tid, 1, pos, 0);
@@ -727,6 +890,7 @@ static int run_turn(Agent *a, const char *user_msg,
     fflush(stdout);
 
     bb_free(&stream);
+    free(last_sig);
 
     /* Record this turn's metrics before the snapshot re-render below (that
      * prefill is harness bookkeeping, not prompt processing). */
@@ -769,31 +933,39 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
                 "usage: %s <model.gguf> [--out transcript.json] "
-                "[--workdir DIR] [--metal] [--kv16] "
-                "[--thinking on|off] [--reasoning-effort low|medium|high] "
-                "[--maxseq N]\n",
+                "[--workdir DIR] [--cpu] [--grammar] [--vv] [--kv16] "
+                "[--thinking on|off] [--reasoning-effort low|medium|high]\n                "
+                "[--maxseq N] [--callfmt 0..5]\n",
                 argv[0]);
         return 2;
     }
     const char *model_path = argv[1];
     const char *transcript_path = "tr.json";
     const char *workdir = NULL;
-    int use_metal = 0;           /* --metal: force Metal on (any arch) */
-    int use_cpu = 0;             /* --cpu: force CPU (skip GPU) */
+    int use_cpu = 0;             /* --cpu: force CPU (Metal is the default) */
+    int use_grammar = 0;         /* --grammar: constrain tool-call markup */
     int kv_f16 = 0;   /* --kv16: store the KV cache as fp16 (half the memory) */
     int think_mode = 1;          /* --thinking on|off -> enable_thinking (default on) */
     const char *effort = "low";  /* --reasoning-effort low|medium|high (default low) */
     int max_seq = 8192;          /* --maxseq N: KV/context token cap */
+    int callfmt = 0;             /* --callfmt 0..4: tool-call example variant */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) transcript_path = argv[++i];
         else if (strcmp(argv[i], "--workdir") == 0 && i + 1 < argc) workdir = argv[++i];
-        else if (strcmp(argv[i], "--metal") == 0) use_metal = 1;
         else if (strcmp(argv[i], "--cpu") == 0) use_cpu = 1;
+        else if (strcmp(argv[i], "--grammar") == 0) use_grammar = 1;
+        else if (strcmp(argv[i], "--vv") == 0 || strcmp(argv[i], "--verbose") == 0)
+            g_verbose = 1;
         else if (strcmp(argv[i], "--kv16") == 0) kv_f16 = 1;
         else if (strcmp(argv[i], "--thinking") == 0 && i + 1 < argc)
             think_mode = strcmp(argv[++i], "off") != 0;
         else if (strcmp(argv[i], "--reasoning-effort") == 0 && i + 1 < argc)
             effort = argv[++i];
+        else if (strcmp(argv[i], "--callfmt") == 0 && i + 1 < argc) {
+            callfmt = atoi(argv[++i]);
+            if (callfmt < 0) callfmt = 0;
+            if (callfmt > 5) callfmt = 5;
+        }
         else if (strcmp(argv[i], "--maxseq") == 0 && i + 1 < argc) {
             max_seq = atoi(argv[++i]);
             if (max_seq < 1) max_seq = 1;
@@ -801,24 +973,20 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "test_agent: unknown or malformed option '%s'\n\n"
                     "usage: %s <model.gguf> [--out FILE] [--workdir DIR] [--cpu]\n"
-                    "  [--metal] [--kv16] [--thinking on|off]\n"
-                    "  [--reasoning-effort low|medium|high] [--maxseq N]\n",
+                    "  [--grammar] [--vv] [--kv16] [--thinking on|off]\n"
+                    "  [--reasoning-effort low|medium|high] [--maxseq N] [--callfmt 0..5]\n",
                     argv[i], argv[0]);
             return 2;
         }
     }
 
     /* Metal is the default on Apple Silicon (the per-slice arch macro also makes
-     * a fat binary / Rosetta run CPU on x64). --cpu forces CPU; --metal forces
-     * Metal on regardless of arch. */
+     * a fat binary / Rosetta run CPU on x64); --cpu forces CPU. */
     int want_metal = 0;
 #ifdef BN_ENABLE_METAL
-    if (!use_cpu) {
 #if defined(__aarch64__) || defined(__arm64__)
-        want_metal = 1;
+    if (!use_cpu) want_metal = 1;
 #endif
-        if (use_metal) want_metal = 1;
-    }
 #endif
     /* If --workdir is set the agent's file tools run inside it (chdir below);
        resolve a relative --out to an absolute path now so the transcript still
@@ -907,10 +1075,6 @@ int main(int argc, char **argv) {
             printf("[agent] Metal backend attached\n");
         }
     }
-#else
-    if (use_metal) {
-        fprintf(stderr, "--metal requires BN_ENABLE_METAL=1 build; using CPU\n");
-    }
 #endif
 
     /* Run the agent's file tools inside --workdir so its grep/glob/exec never
@@ -963,6 +1127,25 @@ int main(int argc, char **argv) {
     bn_sampler_init(&a.sampler, model.config.vocab_size,
                     agent_temp, agent_topp, agent_seed);
 
+    /* Build the constrained-decoding tables once. The mask matches REAL bytes,
+       so the vocab view is over each token's DECODED string -- bn_tokenizer_decode
+       returns a shared thread-local buffer, so each is copied to stable storage
+       (bn_grammar_vocab_create borrows the pointers for the run's lifetime). */
+    a.grammar_on = use_grammar;
+    if (a.grammar_on) {
+        a.gvocab_decoded = malloc((size_t)tok.vocab_size * sizeof(char *));
+        for (int i = 0; i < tok.vocab_size; i++)
+            a.gvocab_decoded[i] = strdup(bn_tokenizer_decode(&tok, i));
+        a.gvocab = bn_grammar_vocab_create((const char *const *)a.gvocab_decoded,
+                                           tok.vocab_size);
+        BnGBuilder gb;
+        build_tool_call_grammar(&gb);
+        memcpy(a.grammar_prog, gb.inst, (size_t)gb.n * sizeof(BnGInst));
+        a.grammar_prog_len = gb.n;
+        a.gmctx.g = &a.grammar;
+        a.gmctx.v = a.gvocab;
+    }
+
     const BnTplTool *tools[8] = {
         tools_get_datetime_def(), tools_read_file_def(),
         tools_file_glob_search_def(), tools_grep_search_def(),
@@ -977,26 +1160,101 @@ int main(int argc, char **argv) {
         "file_glob_search, grep_search, exec_shell_command, write_file, "
         "edit_file, apply_diff. Call a tool to inspect or modify files, then "
         "reply with a short final answer after the tool round-trip.";
+    /* Tool-call example variants (--callfmt) to study whether demonstrating
+       parameter name-matching improves the small model's call syntax. V0 leans
+       only on the GGUF template's generic <parameter=example_parameter_1>
+       example; V1..V4 append a concrete demonstration. */
+    static const char *callfmt_suffix[6] = {
+        "",
+        /* V1: one concrete worked example */
+        "\n\nTo call a tool, follow this exact shape and change only the value "
+        "lines, using the chosen function's real parameter names:\n"
+        "<tool_call>\n<function=read_file>\n<parameter=path>\nnotes.txt\n"
+        "</parameter>\n</function>\n</tool_call>",
+        /* V2: explicit name-matching rule */
+        "\n\nTool-call rule: every <parameter=NAME> must use a NAME copied "
+        "verbatim from the chosen function's parameter list above -- read_file: "
+        "path; write_file: path, content; grep_search: path, pattern; "
+        "exec_shell_command: command; file_glob_search: path; edit_file: path, "
+        "changes; apply_diff: diff. The line after <parameter=NAME> is its "
+        "value; always close it with </parameter>.",
+        /* V3: rule + a two-parameter worked example */
+        "\n\nTool-call rule: every <parameter=NAME> must use a NAME copied "
+        "verbatim from the chosen function's parameter list above. Example "
+        "(write_file takes path and content):\n<tool_call>\n<function=write_file>"
+        "\n<parameter=path>\nreport.txt\n</parameter>\n<parameter=content>\n"
+        "A one-sentence summary.\n</parameter>\n</function>\n</tool_call>",
+        /* V4: exact call for every tool in the set */
+        "\n\nExactly how to call each tool (copy the parameter names verbatim):\n"
+        "<tool_call><function=get_datetime></function></tool_call>\n"
+        "<tool_call><function=read_file><parameter=path>notes.txt</parameter>"
+        "</function></tool_call>\n"
+        "<tool_call><function=file_glob_search><parameter=path>.</parameter>"
+        "</function></tool_call>\n"
+        "<tool_call><function=grep_search><parameter=path>.</parameter>"
+        "<parameter=pattern>TODO</parameter></function></tool_call>\n"
+        "<tool_call><function=exec_shell_command><parameter=command>ls -la"
+        "</parameter></function></tool_call>\n"
+        "<tool_call><function=write_file><parameter=path>report.txt</parameter>"
+        "<parameter=content>A one-sentence summary.</parameter></function></tool_call>\n"
+        "<tool_call><function=edit_file><parameter=path>report.txt</parameter>"
+        "<parameter=changes>[{\"mode\":\"append\",\"line_start\":-1,"
+        "\"line_end\":-1,\"content\":\"reviewed: yes\"}]</parameter>"
+        "</function></tool_call>\n"
+        "<tool_call><function=apply_diff><parameter=diff>--- a/report.txt\n"
+        "+++ b/report.txt\n@@ -1 +1 @@\n-reviewed: yes\n+reviewed: done\n"
+        "</parameter></function></tool_call>",
+        /* V5: V4 (exact per-tool calls) + a contrastive NEGATIVE for the most
+           common structural malformation -- the HTML-attribute collapse and
+           bare/mismatched tags the judge flagged. */
+        "\n\nExactly how to call each tool (copy the parameter names verbatim):\n"
+        "<tool_call><function=get_datetime></function></tool_call>\n"
+        "<tool_call><function=read_file><parameter=path>notes.txt</parameter>"
+        "</function></tool_call>\n"
+        "<tool_call><function=grep_search><parameter=path>.</parameter>"
+        "<parameter=pattern>TODO</parameter></function></tool_call>\n"
+        "<tool_call><function=exec_shell_command><parameter=command>ls -la"
+        "</parameter></function></tool_call>\n"
+        "<tool_call><function=write_file><parameter=path>report.txt</parameter>"
+        "<parameter=content>A one-sentence summary.</parameter></function></tool_call>\n"
+        "<tool_call><function=file_glob_search><parameter=path>.</parameter>"
+        "</function></tool_call>\n"
+        "<tool_call><function=edit_file><parameter=path>report.txt</parameter>"
+        "<parameter=changes>[{\"mode\":\"append\",\"line_start\":-1,"
+        "\"line_end\":-1,\"content\":\"reviewed: yes\"}]</parameter>"
+        "</function></tool_call>\n"
+        "<tool_call><function=apply_diff><parameter=diff>--- a/report.txt\n"
+        "+++ b/report.txt\n@@ -1 +1 @@\n-reviewed: yes\n+reviewed: done\n"
+        "</parameter></function></tool_call>\n"
+        "NEVER use attribute style: WRONG `<parameter=pattern>\"TODO\">` and "
+        "WRONG `<pattern=...>`. ALWAYS open `<parameter=NAME>`, put the value on "
+        "its own line, then close `</parameter>` on its own line. The tag name is "
+        "always literally 'parameter', never the parameter's name.",
+    };
+    if (callfmt > 5) callfmt = 5;
+    const char *cf = callfmt_suffix[callfmt];
     /* Qwen3.5's chat template has no reasoning_effort hook, so steer effort via
        a system directive instead of a template variable. */
-    if (effort) {
-        const char *steer = strcmp(effort, "low") == 0 ?
+    const char *steer = !effort ? "" :
+        strcmp(effort, "low") == 0 ?
             "Keep reasoning minimal and act quickly." :
-            strcmp(effort, "high") == 0 ?
+        strcmp(effort, "high") == 0 ?
             "Reason carefully and thoroughly before acting." :
             "Use a moderate amount of reasoning.";
-        size_t cap = strlen(sys_base) + strlen(effort) + strlen(steer) + 32;
-        char *sys = malloc(cap);
-        snprintf(sys, cap, "%s\n\nReasoning effort: %s. %s",
-                 sys_base, effort, steer);
-        a.msgs[0].content = sys;
-    } else {
-        a.msgs[0].content = strdup(sys_base);
-    }
+    size_t cap = strlen(sys_base) + (effort ? strlen(effort) : 0) +
+                 strlen(steer) + strlen(cf) + 48;
+    char *sys = malloc(cap);
+    if (effort)
+        snprintf(sys, cap, "%s\n\nReasoning effort: %s. %s%s",
+                 sys_base, effort, steer, cf);
+    else
+        snprintf(sys, cap, "%s%s", sys_base, cf);
+    a.msgs[0].content = sys;
     a.n_msgs = 1;
-    printf("config: thinking=%s reasoning-effort=%s maxseq=%d kv16=%d metal=%d\n",
+    printf("config: thinking=%s reasoning-effort=%s callfmt=%d maxseq=%d "
+           "kv16=%d metal=%d grammar=%d\n",
            think_mode ? "on" : "off", effort ? effort : "(none)",
-           max_seq, kv_f16, want_metal);
+           callfmt, max_seq, kv_f16, want_metal, use_grammar);
 
     a.pos_pre_turn = 0;
     if (snapshot_current(&a) != 0) {
@@ -1055,6 +1313,11 @@ int main(int argc, char **argv) {
     }
 
     bb_free(&transcript);
+    if (a.grammar_on) {
+        bn_grammar_vocab_destroy(a.gvocab);
+        for (int i = 0; i < tok.vocab_size; i++) free(a.gvocab_decoded[i]);
+        free(a.gvocab_decoded);
+    }
     free(a.snap);
     bn_session_free(a.sess, NULL);
     bn_tokenizer_free(&tok);
