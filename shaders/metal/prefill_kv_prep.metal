@@ -76,6 +76,10 @@ kernel void prefill_kv_prep(device float       *k        [[buffer(0)]],
     }
 
     if (use_rope != 0u && rope_dims > 0u) {
+        // mem_device is load-bearing: rope reads k[i1 = head_off+i+half_rope],
+        // which the k-norm above wrote from a different thread. The fence
+        // makes those cross-thread device writes visible. Do NOT weaken to
+        // mem_threadgroup.
         threadgroup_barrier(mem_flags::mem_device);
         uint half_rope = rope_dims / 2u;
         uint rope_row = t * rope_stride;

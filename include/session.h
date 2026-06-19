@@ -39,6 +39,10 @@ int bn_session_get_recurrent_state(const BnSession *s, const BnModel *model,
 int bn_session_set_recurrent_state(BnSession *s, const BnModel *model,
                                    const void *in, size_t in_bytes);
 
+// Roll the attention KV cache back to new_pos. Attention-only: it does NOT
+// rewind SSM/GDN recurrent state, so for a hybrid model the caller must pair
+// it with bn_session_set_recurrent_state to restore a snapshot taken at
+// new_pos (the snapshot/restore + truncate + delta-prefill pattern).
 void bn_session_kv_truncate(BnSession *s, int new_pos);
 
 #endif // BN_SESSION_H
