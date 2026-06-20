@@ -151,6 +151,11 @@ static int    g_n_metrics;
  * tool args/results to stdout so the whole model interaction is visible. */
 static int    g_verbose;
 
+/* --repair-force: corrupt the first tool call's first parameter name once, so a
+ * real turn drives error -> repair -> restore_and_extend end to end (confidence
+ * test for the in-turn SSM-safe substitution path). */
+static int    g_force_repair;
+
 static void print_metrics_table(const char *model_name) {
     printf("\n========== metrics: %s ==========\n", model_name);
     printf("%-4s %7s %8s %7s %9s %7s %9s %5s %7s %8s %7s %5s %6s %5s\n",
@@ -841,6 +846,18 @@ static int run_turn(Agent *a, const char *user_msg,
             int repaired_round = 0;
             for (int t = 0; t < n_observed_tcs; t++) {
                 ParsedToolCall *tc = &observed_tcs[t];
+                if (g_force_repair && tc->n_params > 0) {
+                    g_force_repair = 0;
+                    char *bad = malloc(strlen(tc->param_names[0]) + 2);
+                    if (bad) {
+                        sprintf(bad, "x%s", tc->param_names[0]);
+                        free(tc->param_names[0]);
+                        tc->param_names[0] = bad;
+                    }
+                    if (g_verbose)
+                        printf("[force] corrupted first param of %s -> %s\n",
+                               tc->function_name, tc->param_names[0]);
+                }
                 ToolArg args[MAX_PARAMS_PER_TOOL_CALL];
                 for (int p = 0; p < tc->n_params; p++) {
                     args[p].name = tc->param_names[p];
@@ -1125,6 +1142,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--cpu") == 0) use_cpu = 1;
         else if (strcmp(argv[i], "--grammar") == 0) use_grammar = 1;
         else if (strcmp(argv[i], "--repair-selftest") == 0) repair_selftest = 1;
+        else if (strcmp(argv[i], "--repair-force") == 0) g_force_repair = 1;
         else if (strcmp(argv[i], "--vv") == 0 || strcmp(argv[i], "--verbose") == 0)
             g_verbose = 1;
         else if (strcmp(argv[i], "--kv16") == 0) kv_f16 = 1;
