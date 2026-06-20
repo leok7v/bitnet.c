@@ -675,11 +675,10 @@ static char *run_apply_diff(const ToolArg *args, int n_args) {
             if ((c == '+' || c == ' ') && nnew < 2048) newb[nnew++] = body;
             i++;
         }
+        /* diff_find_block returns pos for a pure-addition hunk (nold == 0), so it
+           inserts at the cursor; m < 0 only happens for an unmatchable change. */
         int m = diff_find_block(fl, nfl, oldb, nold, pos);
-        if (m < 0) {
-            if (nold == 0) { m = nfl; }       /* pure addition -> append at end */
-            else { failed++; continue; }      /* unmatchable -> skip this hunk */
-        }
+        if (m < 0) { failed++; continue; }
         for (int k = pos; k < m && noi < out_cap; k++) out[noi++] = strdup(fl[k]);
         for (int k = 0; k < nnew && noi < out_cap; k++) {
             size_t bl = strlen(newb[k]);

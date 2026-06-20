@@ -644,11 +644,10 @@ static int repair_generate(Agent *a, float *logits, int *pos, int max_tokens,
         const char *piece = bn_tokenizer_decode(a->tok, tid);
         if (piece && *piece) {
             size_t pl = strlen(piece);
-            if (olen + pl < out_cap) {
-                memcpy(out + olen, piece, pl);
-                olen += pl;
-                out[olen] = '\0';
-            }
+            if (olen + pl >= out_cap) break;  /* buffer full: stop, no desync */
+            memcpy(out + olen, piece, pl);
+            olen += pl;
+            out[olen] = '\0';
         }
         if (!armed) {
             const char *open = NULL;
@@ -1367,7 +1366,12 @@ int main(int argc, char **argv) {
                                            a.repair_snap_bytes) == 0) {
             a.repair_prefix_pos = n_static;
         } else {
+            /* Warmup failed (also the case for a non-hybrid model with no
+               recurrent state); disable repair and free what it reserved. */
+            bn_sampler_free(&a.repair_sampler);
             bn_session_free(a.repair_sess, NULL);
+            free(a.repair_snap);
+            a.repair_snap = NULL;
             a.repair_sess = NULL;
         }
     }
