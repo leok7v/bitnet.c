@@ -174,6 +174,23 @@ int bn_gb_match(BnGBuilder *b) {
     return bn_gb_emit(b, BN_G_MATCH, 0, 0, -1, -1);
 }
 
+int bn_gb_ws_star(BnGBuilder *b) {
+    int loop = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);  /* body | exit (alt patch) */
+    int a1   = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);   /* ' '  | next */
+    bn_gb_emit(b, BN_G_CHAR, ' ',  0, loop, -1);
+    int a2   = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);   /* '\t' | next */
+    bn_gb_emit(b, BN_G_CHAR, '\t', 0, loop, -1);
+    int a3   = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);   /* '\n' | '\r' */
+    bn_gb_emit(b, BN_G_CHAR, '\n', 0, loop, -1);
+    bn_gb_emit(b, BN_G_CHAR, '\r', 0, loop, -1);
+    int after = b->n;
+    bn_gb_patch(b, loop, -1, after);
+    bn_gb_patch(b, a1,   -1, a1 + 2);
+    bn_gb_patch(b, a2,   -1, a2 + 2);
+    bn_gb_patch(b, a3,   -1, a3 + 2);
+    return loop;
+}
+
 void bn_gb_patch(BnGBuilder *b, int idx, int next, int alt) {
     if (idx < 0 || idx >= b->n) return;
     if (next >= 0) b->inst[idx].next = (int16_t)next;
@@ -188,12 +205,11 @@ void bn_gb_patch(BnGBuilder *b, int idx, int next, int alt) {
 int bn_grammar_build_tool_call(BnGBuilder *b) {
     bn_gb_reset(b);
     bn_gb_lit(b, "<tool_call>");
-    bn_gb_until_char(b, '<');                   /* WS before <function= */
+    bn_gb_ws_star(b);                           /* WS before <function= */
     bn_gb_lit(b, "<function=");
     bn_gb_until_char(b, '>');                   /* function name, free */
     bn_gb_lit(b, ">");
-    int loop = b->n;
-    bn_gb_until_char(b, '<');                   /* WS before the next tag */
+    int loop = bn_gb_ws_star(b);                /* WS before the next tag */
     int sp = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);  /* param | end, alt patched */
     bn_gb_lit(b, "<parameter=");
     bn_gb_until_char(b, '>');                   /* param name, free */
@@ -204,7 +220,7 @@ int bn_grammar_build_tool_call(BnGBuilder *b) {
     int endb = b->n;
     bn_gb_patch(b, sp, -1, endb);
     bn_gb_lit(b, "</function>");
-    bn_gb_until_char(b, '<');                   /* WS before </tool_call> */
+    bn_gb_ws_star(b);                           /* WS before </tool_call> */
     bn_gb_lit(b, "</tool_call>");
     return bn_gb_match(b);
 }

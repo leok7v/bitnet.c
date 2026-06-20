@@ -98,6 +98,10 @@ int  bn_gb_lit(BnGBuilder *b, const char *s);   /* literal byte run         */
  * (which the next emitted instruction must match). Lets a value run until the
  * '<' of its closing tag, deterministically. */
 int  bn_gb_until_char(BnGBuilder *b, uint8_t c);
+/* Zero or more ASCII whitespace bytes (space, tab, newline, CR). Unlike
+ * until_char, this does NOT swallow arbitrary non-delimiter text -- use it
+ * between structural tokens so only real whitespace may sit there. */
+int  bn_gb_ws_star(BnGBuilder *b);
 int  bn_gb_match(BnGBuilder *b);                /* accept                   */
 /* Patch a previously-emitted instruction's next/alt (for forward jumps and
  * loops). Pass -1 to leave a field unchanged. */
