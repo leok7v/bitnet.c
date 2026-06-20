@@ -262,6 +262,7 @@ typedef struct {
     char *param_values[MAX_PARAMS_PER_TOOL_CALL];
     int n_params;
     char *result;
+    char *raw_block;   /* the verbatim <tool_call> body, kept for LLM repair */
 } ParsedToolCall;
 
 static void parsed_tc_free(ParsedToolCall *tc) {
@@ -271,6 +272,7 @@ static void parsed_tc_free(ParsedToolCall *tc) {
         free(tc->param_values[i]);
     }
     free(tc->result);
+    free(tc->raw_block);
     memset(tc, 0, sizeof(*tc));
 }
 
@@ -488,6 +490,19 @@ typedef struct {
     char         **gvocab_decoded;   /* stable decoded vocab strings (owned) */
     BnGrammarVocab *gvocab;          /* sorted view over gvocab_decoded */
     GrammarMaskCtx  gmctx;
+
+    /* In-process LLM tool-call repair: a second session whose KV/SSM holds a
+       cached static "correct this call" prefix (prefilled once at warmup), plus
+       a greedy sampler. On a malformed call we restore the prefix and prefill
+       only the varying tail (the bad call + error), then grammar-generate the
+       fix -- so the agent's own session is never touched. */
+    BnSession     *repair_sess;
+    void          *repair_snap;
+    size_t         repair_snap_bytes;
+    int            repair_prefix_pos;
+    BnSampler      repair_sampler;
+    const char    *im_start_str;
+    const char    *im_end_str;
 } Agent;
 
 static int render_msgs(Agent *a, int enable_thinking, int add_gen_prompt,
@@ -586,6 +601,156 @@ static int is_stop_token(const BnTokenizer *tok, int tid) {
             tid == tok->eos_id);
 }
 
+/* Per-tool parameter hint for the repair prompt; the full list when the function
+ * name itself is wrong, so the repair model can still pick the right tool. */
+static const char *tool_param_hint(const char *fn) {
+    static const struct { const char *name, *hint; } H[] = {
+        {"get_datetime",       "(no parameters)"},
+        {"read_file",          "path"},
+        {"file_glob_search",   "path, include"},
+        {"grep_search",        "path, pattern"},
+        {"exec_shell_command", "command"},
+        {"write_file",         "path, content"},
+        {"edit_file",          "path, changes"},
+        {"apply_diff",         "diff"},
+    };
+    for (size_t i = 0; i < sizeof H / sizeof H[0]; i++)
+        if (fn && strcmp(fn, H[i].name) == 0) return H[i].hint;
+    return "path, content, pattern, command, include, changes, diff";
+}
+
+/* Repair only MALFORMED calls (bad structure, missing/misnamed params, wrong
+ * function) -- not calls that ran and failed for real (file not found etc). */
+static int repairable_error(const char *res) {
+    return res && (strstr(res, "missing '") || strstr(res, "unknown function") ||
+                   strstr(res, "could not parse"));
+}
+
+/* Grammar-constrained generation on the repair session into out; arms once a
+ * <tool_call> opens and stops at </tool_call>, EOS, or max_tokens. */
+static int repair_generate(Agent *a, float *logits, int *pos, int max_tokens,
+                           char *out, size_t out_cap) {
+    int armed = 0;
+    size_t open_off = 0, olen = 0;
+    out[0] = '\0';
+    for (int gi = 0; gi < max_tokens; gi++) {
+        int tid = bn_sampler_sample(&a->repair_sampler, logits);
+        if (is_stop_token(a->tok, tid)) break;
+        const char *piece = bn_tokenizer_decode(a->tok, tid);
+        if (piece && *piece) {
+            size_t pl = strlen(piece);
+            if (olen + pl < out_cap) {
+                memcpy(out + olen, piece, pl);
+                olen += pl;
+                out[olen] = '\0';
+            }
+        }
+        if (!armed) {
+            const char *open = NULL;
+            for (const char *p = out;
+                 (p = strstr(p, "<tool_call>")) != NULL; p += 11) open = p;
+            if (open && !strstr(open + 11, "</tool_call>")) {
+                bn_grammar_init(&a->grammar, a->grammar_prog, a->grammar_prog_len);
+                bn_grammar_advance(&a->grammar, open);
+                bn_sampler_set_mask(&a->repair_sampler, grammar_mask_cb, &a->gmctx);
+                armed = 1;
+                open_off = (size_t)(open - out);
+            }
+        } else {
+            bn_grammar_advance(&a->grammar, piece ? piece : "");
+            int closed = strstr(out + open_off + 11, "</tool_call>") != NULL;
+            if (closed || bn_grammar_dead(&a->grammar)) {
+                bn_sampler_set_mask(&a->repair_sampler, NULL, NULL);
+                armed = 0;
+                if (closed) break;
+            }
+        }
+        float *lp = bn_prefill(a->model, a->repair_sess, &tid, 1, *pos, 0);
+        if (!lp) break;
+        logits = lp;
+        (*pos)++;
+    }
+    bn_sampler_set_mask(&a->repair_sampler, NULL, NULL);
+    return (int)olen;
+}
+
+/* Second-model repair pass: restore the cached repair prefix, prefill only the
+ * varying tail (this bad call + its error), grammar-generate the corrected call,
+ * and re-execute it. On success mutate tc to the corrected call and its new
+ * result and return 1; otherwise leave tc untouched and return 0. Runs entirely
+ * on the repair session, so the agent's own KV/SSM is never disturbed. */
+static int try_repair_tool_call(Agent *a, ParsedToolCall *tc) {
+    if (!a->repair_sess || !a->gvocab || !tc->raw_block) return 0;
+    char varying[8192];
+    snprintf(varying, sizeof varying,
+        "user\nThe tool %s accepts ONLY these parameter names: %s.\n"
+        "This call failed with \"%s\":\n%s\n"
+        "Rewrite it as one correct <tool_call>: keep every value unchanged, but "
+        "rename each <parameter=NAME> to the matching name from that list (e.g. a "
+        "wrong name like filecontent or pcontent becomes content). Output ONLY the "
+        "corrected tool call.%s\n%sassistant\n",
+        tc->function_name ? tc->function_name : "the tool",
+        tool_param_hint(tc->function_name),
+        tc->result ? tc->result : "invalid", tc->raw_block,
+        a->im_end_str, a->im_start_str);
+    int t_var[2048];
+    int n_var = bn_tokenizer_encode_special(a->tok, varying, 0, t_var, 2048);
+    if (n_var <= 0) return 0;
+    if (bn_session_set_recurrent_state(a->repair_sess, a->model,
+                                       a->repair_snap, a->repair_snap_bytes) != 0)
+        return 0;
+    bn_session_kv_truncate(a->repair_sess, a->repair_prefix_pos);
+    int rpos = a->repair_prefix_pos;
+    float *logits = bn_prefill(a->model, a->repair_sess, t_var, n_var, rpos, 0);
+    if (!logits) return 0;
+    rpos += n_var;
+    char fixed[4096];
+    int flen = repair_generate(a, logits, &rpos, 256, fixed, sizeof fixed);
+    if (g_verbose)
+        printf("\n[repair?] %s\n  bad: %s\n  fixed: %.*s\n",
+               tc->result ? tc->result : "", tc->raw_block, flen, fixed);
+    ParsedToolCall ctc;
+    if (flen <= 0 || parse_tool_call(fixed, (size_t)flen, &ctc) != 0) return 0;
+    /* The repair is for names/structure only; the values were already captured
+       correctly in the malformed call. A small model may corrupt a value while
+       rewriting (e.g. "reviewed" -> "revised"), so when the param count matches
+       we keep the original values positionally rather than trust the rewrite. */
+    if (ctc.n_params == tc->n_params) {
+        for (int p = 0; p < ctc.n_params; p++) {
+            free(ctc.param_values[p]);
+            ctc.param_values[p] = strdup(tc->param_values[p]);
+        }
+    }
+    ToolArg args[MAX_PARAMS_PER_TOOL_CALL];
+    for (int p = 0; p < ctc.n_params; p++) {
+        args[p].name = ctc.param_names[p];
+        args[p].value = ctc.param_values[p];
+    }
+    char *cres = tools_execute(ctc.function_name, args, ctc.n_params);
+    int ok = cres && strncmp(cres, "error", 5) != 0;
+    if (ok) {
+        free(tc->function_name);
+        for (int p = 0; p < tc->n_params; p++) {
+            free(tc->param_names[p]);
+            free(tc->param_values[p]);
+        }
+        tc->function_name = ctc.function_name;
+        for (int p = 0; p < ctc.n_params; p++) {
+            tc->param_names[p] = ctc.param_names[p];
+            tc->param_values[p] = ctc.param_values[p];
+        }
+        tc->n_params = ctc.n_params;
+        free(tc->result);
+        tc->result = cres;
+        free(ctc.result);
+        free(ctc.raw_block);
+    } else {
+        free(cres);
+        parsed_tc_free(&ctc);
+    }
+    return ok;
+}
+
 static int run_turn(Agent *a, const char *user_msg,
                     const BnTplTool *tools[], int n_tools,
                     int turn_index, ByteBuf *transcript) {
@@ -645,6 +810,8 @@ static int run_turn(Agent *a, const char *user_msg,
                    n_observed_tcs < MAX_TOOL_CALLS_PER_TURN) {
                 if (parse_tool_call(stream.buf + tc_start, tc_end - tc_start,
                                     &observed_tcs[n_observed_tcs]) == 0) {
+                    observed_tcs[n_observed_tcs].raw_block =
+                        strndup(stream.buf + tc_start, tc_end - tc_start);
                     n_observed_tcs++;
                 }
                 scanned_to = tc_end + 12;
@@ -653,6 +820,7 @@ static int run_turn(Agent *a, const char *user_msg,
                 turn_done = 1;
                 break;
             }
+            int repaired_round = 0;
             for (int t = 0; t < n_observed_tcs; t++) {
                 ParsedToolCall *tc = &observed_tcs[t];
                 ToolArg args[MAX_PARAMS_PER_TOOL_CALL];
@@ -662,6 +830,11 @@ static int run_turn(Agent *a, const char *user_msg,
                 }
                 tc->result = tools_execute(tc->function_name, args, tc->n_params);
                 if (!tc->result) tc->result = strdup("error: tool execution failed");
+                if (repairable_error(tc->result) && try_repair_tool_call(a, tc)) {
+                    repaired_round = 1;
+                    if (g_verbose)
+                        printf("[repair] %s -> %s\n", tc->function_name, tc->result);
+                }
                 if (strncmp(tc->result, "error", 5) == 0) m_tool_err++;
                 else m_tool_ok++;
                 if (g_verbose) {
@@ -759,7 +932,16 @@ static int run_turn(Agent *a, const char *user_msg,
                 if (n_cont < 0) {
                     fprintf(stderr, "render continuation failed\n"); return -1;
                 }
-                if (n_cont > pos) {
+                if (repaired_round) {
+                    /* History now holds the corrected call, which diverges from
+                       the bad call baked into the live KV/SSM. Rebuild the turn
+                       from the turn-start snapshot so KV/SSM matches the corrected
+                       history (an SSM cannot be rewound token-by-token). */
+                    if (g_verbose) { printf("----- GENERATION -----\n"); fflush(stdout); }
+                    if (restore_and_extend(a, cont_tokens, n_cont, &logits) != 0)
+                        return -1;
+                    pos = n_cont;
+                } else if (n_cont > pos) {
                     vb_dump_tokens(a, "TOOL-RESULT PROMPT", cont_tokens, pos, n_cont);
                     if (g_verbose) { printf("----- GENERATION -----\n"); fflush(stdout); }
                     if (prefill_range(a, cont_tokens + pos, n_cont - pos, pos,
@@ -913,6 +1095,7 @@ int main(int argc, char **argv) {
     const char *workdir = NULL;
     int use_cpu = 0;             /* --cpu: force CPU (Metal is the default) */
     int use_grammar = 0;         /* --grammar: constrain tool-call markup */
+    int repair_selftest = 0;     /* --repair-selftest: deterministic repair check */
     int kv_f16 = 0;   /* --kv16: store the KV cache as fp16 (half the memory) */
     int think_mode = 1;          /* --thinking on|off -> enable_thinking (default on) */
     const char *effort = "low";  /* --reasoning-effort low|medium|high (default low) */
@@ -923,6 +1106,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--workdir") == 0 && i + 1 < argc) workdir = argv[++i];
         else if (strcmp(argv[i], "--cpu") == 0) use_cpu = 1;
         else if (strcmp(argv[i], "--grammar") == 0) use_grammar = 1;
+        else if (strcmp(argv[i], "--repair-selftest") == 0) repair_selftest = 1;
         else if (strcmp(argv[i], "--vv") == 0 || strcmp(argv[i], "--verbose") == 0)
             g_verbose = 1;
         else if (strcmp(argv[i], "--kv16") == 0) kv_f16 = 1;
@@ -1099,20 +1283,57 @@ int main(int argc, char **argv) {
     /* Build the constrained-decoding tables once. The mask matches REAL bytes,
        so the vocab view is over each token's DECODED string -- bn_tokenizer_decode
        returns a shared thread-local buffer, so each is copied to stable storage
-       (bn_grammar_vocab_create borrows the pointers for the run's lifetime). */
+       (bn_grammar_vocab_create borrows the pointers for the run's lifetime).
+       Built unconditionally: --grammar gates main-generation masking, but the
+       always-on tool-call repair needs the same tables. */
     a.grammar_on = use_grammar;
-    if (a.grammar_on) {
-        a.gvocab_decoded = malloc((size_t)tok.vocab_size * sizeof(char *));
-        for (int i = 0; i < tok.vocab_size; i++)
-            a.gvocab_decoded[i] = strdup(bn_tokenizer_decode(&tok, i));
-        a.gvocab = bn_grammar_vocab_create((const char *const *)a.gvocab_decoded,
-                                           tok.vocab_size);
+    a.gvocab_decoded = malloc((size_t)tok.vocab_size * sizeof(char *));
+    for (int i = 0; i < tok.vocab_size; i++)
+        a.gvocab_decoded[i] = strdup(bn_tokenizer_decode(&tok, i));
+    a.gvocab = bn_grammar_vocab_create((const char *const *)a.gvocab_decoded,
+                                       tok.vocab_size);
+    {
         BnGBuilder gb;
         bn_grammar_build_tool_call(&gb);
         memcpy(a.grammar_prog, gb.inst, (size_t)gb.n * sizeof(BnGInst));
         a.grammar_prog_len = gb.n;
-        a.gmctx.g = &a.grammar;
-        a.gmctx.v = a.gvocab;
+    }
+    a.gmctx.g = &a.grammar;
+    a.gmctx.v = a.gvocab;
+
+    /* Warm the repair session's cached static prefix once: a system turn that
+       teaches the format, ending at the user-turn opener so the per-repair tail
+       (the bad call) tokenizes as a stable continuation of these prefix tokens. */
+    a.im_start_str = (tok.im_start_id >= 0 && tok.im_start_id < tok.vocab_size)
+                     ? tok.vocab[tok.im_start_id] : "<|im_start|>";
+    a.im_end_str = (tok.im_end_id >= 0 && tok.im_end_id < tok.vocab_size)
+                   ? tok.vocab[tok.im_end_id] : "<|im_end|>";
+    a.repair_sess = bn_session_create(&model, NULL);
+    if (a.repair_sess && a.gvocab) {
+        a.repair_snap_bytes = bn_session_recurrent_state_bytes(&model);
+        a.repair_snap = malloc(a.repair_snap_bytes);
+        bn_sampler_init(&a.repair_sampler, model.config.vocab_size, 0.0f, 1.0f, 1);
+        char prefix[2048];
+        snprintf(prefix, sizeof prefix,
+            "%ssystem\nYou repair malformed tool calls for a coding agent. You "
+            "are given a broken <tool_call> and the error it caused. Output ONLY "
+            "the corrected call in EXACTLY this format, copying the function and "
+            "parameter names verbatim from the given signature:\n<tool_call>\n"
+            "<function=NAME>\n<parameter=PNAME>\nVALUE\n</parameter>\n</function>\n"
+            "</tool_call>\nFix only the structure and parameter names; keep the "
+            "intended values.%s\n%s",
+            a.im_start_str, a.im_end_str, a.im_start_str);
+        int t_static[1024];
+        int n_static = bn_tokenizer_encode_special(&tok, prefix, 0, t_static, 1024);
+        if (a.repair_snap && n_static > 0 &&
+            bn_prefill(&model, a.repair_sess, t_static, n_static, 0, 0) &&
+            bn_session_get_recurrent_state(a.repair_sess, &model, a.repair_snap,
+                                           a.repair_snap_bytes) == 0) {
+            a.repair_prefix_pos = n_static;
+        } else {
+            bn_session_free(a.repair_sess, NULL);
+            a.repair_sess = NULL;
+        }
     }
 
     const BnTplTool *tools[8] = {
@@ -1230,6 +1451,38 @@ int main(int argc, char **argv) {
         fprintf(stderr, "initial snapshot failed\n"); return 1;
     }
 
+    if (repair_selftest) {
+        /* Deterministic check of the repair round-trip: a real file plus a call
+           with a misnamed parameter ("filecontent", not in the alias table) that
+           write_file rejects with "missing 'content'". */
+        FILE *sf = fopen("selftest.txt", "w");
+        if (sf) { fputs("reviewed: yes\n", sf); fclose(sf); }
+        ParsedToolCall tc = {0};
+        tc.function_name = strdup("write_file");
+        tc.param_names[0] = strdup("path");
+        tc.param_values[0] = strdup("selftest.txt");
+        tc.param_names[1] = strdup("filecontent");
+        tc.param_values[1] = strdup("reviewed: done");
+        tc.n_params = 2;
+        tc.raw_block = strdup(
+            "<function=write_file>\n<parameter=path>selftest.txt</parameter>\n"
+            "<parameter=filecontent>reviewed: done</parameter>\n</function>");
+        ToolArg sa[2] = { {tc.param_names[0], tc.param_values[0]},
+                          {tc.param_names[1], tc.param_values[1]} };
+        tc.result = tools_execute("write_file", sa, 2);
+        printf("[selftest] initial: %s\n", tc.result ? tc.result : "(null)");
+        int ok = try_repair_tool_call(&a, &tc);
+        printf("[selftest] repaired=%d -> %s\n", ok, tc.result ? tc.result : "(null)");
+        printf("[selftest] fn=%s\n", tc.function_name);
+        for (int p = 0; p < tc.n_params; p++)
+            printf("  %s = %s\n", tc.param_names[p], tc.param_values[p]);
+        printf("[selftest] file now: ");
+        sf = fopen("selftest.txt", "r");
+        if (sf) { char b[128]; while (fgets(b, sizeof b, sf)) fputs(b, stdout); fclose(sf); }
+        parsed_tc_free(&tc);
+        return ok ? 0 : 3;
+    }
+
     ByteBuf transcript = {0};
     const char *model_name = strrchr(model_path, '/');
     model_name = model_name ? model_name + 1 : model_path;
@@ -1282,10 +1535,13 @@ int main(int argc, char **argv) {
     }
 
     bb_free(&transcript);
-    if (a.grammar_on) {
-        bn_grammar_vocab_destroy(a.gvocab);
-        for (int i = 0; i < tok.vocab_size; i++) free(a.gvocab_decoded[i]);
-        free(a.gvocab_decoded);
+    bn_grammar_vocab_destroy(a.gvocab);
+    for (int i = 0; i < tok.vocab_size; i++) free(a.gvocab_decoded[i]);
+    free(a.gvocab_decoded);
+    if (a.repair_sess) {
+        bn_sampler_free(&a.repair_sampler);
+        bn_session_free(a.repair_sess, NULL);
+        free(a.repair_snap);
     }
     free(a.snap);
     bn_session_free(a.sess, NULL);
