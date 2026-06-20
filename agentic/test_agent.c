@@ -459,37 +459,6 @@ static void grammar_mask_cb(void *ctx, float *logits, int vocab_size) {
     if (!bn_grammar_dead(c->g)) bn_grammar_mask_logits(c->g, c->v, logits);
 }
 
-/* Tool-call skeleton: <tool_call> WS <function=NAME> ( WS <parameter=PNAME>
- * VALUE </parameter> )* WS </function> WS </tool_call>. WS is (any byte except
- * '<')*, which absorbs the inter-tag newlines and also matches the zero-space
- * inline form. Parameters are zero-or-more so a no-arg call (get_datetime) emits
- * </function> straight after <function=NAME>. Names run until '>', values until
- * '<' (so a value may contain '>' but not '<' -- fine for paths/queries; a
- * literal '<' inside a value, e.g. embedded markup, is the known limitation). */
-static int build_tool_call_grammar(BnGBuilder *b) {
-    bn_gb_reset(b);
-    bn_gb_lit(b, "<tool_call>");
-    bn_gb_until_char(b, '<');                   /* WS before <function= */
-    bn_gb_lit(b, "<function=");
-    bn_gb_until_char(b, '>');                   /* function name, free */
-    bn_gb_lit(b, ">");
-    int loop = b->n;
-    bn_gb_until_char(b, '<');                   /* WS before the next tag */
-    int sp = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);  /* param | end, alt patched */
-    bn_gb_lit(b, "<parameter=");
-    bn_gb_until_char(b, '>');                   /* param name, free */
-    bn_gb_lit(b, ">");
-    bn_gb_until_char(b, '<');                   /* value, free until close */
-    bn_gb_lit(b, "</parameter>");
-    bn_gb_emit(b, BN_G_JMP, 0, 0, loop, -1);    /* another param or the close */
-    int endb = b->n;
-    bn_gb_patch(b, sp, -1, endb);
-    bn_gb_lit(b, "</function>");
-    bn_gb_until_char(b, '<');                   /* WS before </tool_call> */
-    bn_gb_lit(b, "</tool_call>");
-    return bn_gb_match(b);
-}
-
 typedef struct {
     BnTplMessage msgs[MAX_MSGS];
     int n_msgs;
@@ -1139,7 +1108,7 @@ int main(int argc, char **argv) {
         a.gvocab = bn_grammar_vocab_create((const char *const *)a.gvocab_decoded,
                                            tok.vocab_size);
         BnGBuilder gb;
-        build_tool_call_grammar(&gb);
+        bn_grammar_build_tool_call(&gb);
         memcpy(a.grammar_prog, gb.inst, (size_t)gb.n * sizeof(BnGInst));
         a.grammar_prog_len = gb.n;
         a.gmctx.g = &a.grammar;

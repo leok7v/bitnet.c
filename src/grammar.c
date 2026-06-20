@@ -180,6 +180,35 @@ void bn_gb_patch(BnGBuilder *b, int idx, int next, int alt) {
     if (alt  >= 0) b->inst[idx].alt  = (int16_t)alt;
 }
 
+/* <tool_call> WS <function=NAME> ( WS <parameter=PNAME> VALUE </parameter> )* WS
+ * </function> WS </tool_call>. WS = (any byte except '<')*, absorbing inter-tag
+ * newlines and matching the zero-space inline form. Parameters are zero-or-more
+ * so a no-arg call emits </function> straight after <function=NAME>. Names run
+ * until '>', values until '<' (a value may contain '>' but not '<'). */
+int bn_grammar_build_tool_call(BnGBuilder *b) {
+    bn_gb_reset(b);
+    bn_gb_lit(b, "<tool_call>");
+    bn_gb_until_char(b, '<');                   /* WS before <function= */
+    bn_gb_lit(b, "<function=");
+    bn_gb_until_char(b, '>');                   /* function name, free */
+    bn_gb_lit(b, ">");
+    int loop = b->n;
+    bn_gb_until_char(b, '<');                   /* WS before the next tag */
+    int sp = bn_gb_emit(b, BN_G_SPLIT, 0, 0, -1, 0);  /* param | end, alt patched */
+    bn_gb_lit(b, "<parameter=");
+    bn_gb_until_char(b, '>');                   /* param name, free */
+    bn_gb_lit(b, ">");
+    bn_gb_until_char(b, '<');                   /* value, free until close */
+    bn_gb_lit(b, "</parameter>");
+    bn_gb_emit(b, BN_G_JMP, 0, 0, loop, -1);    /* another param or the close */
+    int endb = b->n;
+    bn_gb_patch(b, sp, -1, endb);
+    bn_gb_lit(b, "</function>");
+    bn_gb_until_char(b, '<');                   /* WS before </tool_call> */
+    bn_gb_lit(b, "</tool_call>");
+    return bn_gb_match(b);
+}
+
 /* ---------------- fast vocab masking (sorted prefix walk) ---------------- */
 
 struct BnGrammarVocab {

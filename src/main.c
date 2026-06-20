@@ -8,6 +8,7 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "sampler.h"
+#include "grammar.h"
 #include "threadpool.h"
 #include "session.h"
 #include "prompt_cache.h"
@@ -64,6 +65,8 @@ static double proc_cpu_ms(void) {
 typedef struct {
     const char *model_path;
     const char *prompt;
+    const char *oneshot;            // --oneshot: one chat-templated user turn
+    int grammar;                    // --grammar: constrain --oneshot to tool-call markup
     const char *prompt_token_ids;
     int n_tokens;
     float temperature;
@@ -127,6 +130,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s <model.gguf> [options]\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -p <prompt>     Input prompt (default: \"Hello\")\n");
+    fprintf(stderr, "  --oneshot <msg> One chat-templated user turn, print the completion and exit\n");
+    fprintf(stderr, "  --grammar       Constrain --oneshot output to well-formed <tool_call> markup\n");
     fprintf(stderr, "  --prompt-token-ids <ids>  Comma-separated prompt token IDs for parity debugging\n");
     fprintf(stderr, "  -n <int>        Number of tokens to generate (default: 256)\n");
     fprintf(stderr, "  --temp <float>  Temperature (default: 0.0 = greedy)\n");
@@ -247,7 +252,11 @@ static CLIArgs parse_args(int argc, char **argv) {
     args.model_path = argv[1];
 
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--oneshot") == 0 && i + 1 < argc) {
+            args.oneshot = argv[++i];
+        } else if (strcmp(argv[i], "--grammar") == 0) {
+            args.grammar = 1;
+        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             args.prompt = argv[++i];
         } else if (strcmp(argv[i], "--prompt-token-ids") == 0 && i + 1 < argc) {
             args.prompt_token_ids = argv[++i];
@@ -611,6 +620,87 @@ static int print_token(const char *piece, int token_id, void *user_data) {
     if (user_data || isatty(STDOUT_FILENO))
         fflush(stdout);
     return 0;
+}
+
+// Constrained-decoding mask for --oneshot --grammar: forces well-formed
+// <tool_call> markup so a small model's repaired call comes out structurally
+// clean (it already reasons the right name; the grammar stops it parroting the
+// broken markup). No-ops when the grammar is dead so it never masks everything.
+typedef struct { BnGrammar *g; const BnGrammarVocab *v; } MainGrammarMaskCtx;
+
+static void main_grammar_mask_cb(void *ctx, float *logits, int vocab_size) {
+    MainGrammarMaskCtx *c = (MainGrammarMaskCtx *)ctx;
+    (void)vocab_size;
+    if (!bn_grammar_dead(c->g)) bn_grammar_mask_logits(c->g, c->v, logits);
+}
+
+// Manual greedy/sampled loop that arms the tool-call grammar once a <tool_call>
+// opens in the stream and stops at </tool_call>. Used instead of bn_generate
+// because the latter has a GPU argmax fast-path that bypasses the sampler mask.
+static int oneshot_grammar_generate(BnModel *model, BnSession *s,
+                                    BnTokenizer *tok, BnSampler *sampler,
+                                    float *logits, int *pos, int max_tokens,
+                                    int no_prefill) {
+    BnGBuilder gb;
+    bn_grammar_build_tool_call(&gb);
+    char **decoded = malloc((size_t)tok->vocab_size * sizeof(char *));
+    if (!decoded) return 0;
+    for (int i = 0; i < tok->vocab_size; i++)
+        decoded[i] = strdup(bn_tokenizer_decode(tok, i));
+    BnGrammarVocab *gv = bn_grammar_vocab_create((const char *const *)decoded,
+                                                 tok->vocab_size);
+    BnGrammar g;
+    MainGrammarMaskCtx ctx = { &g, gv };
+    char stream[8192];
+    size_t slen = 0, open_off = 0;
+    stream[0] = '\0';
+    int armed = 0, n_gen = 0;
+    for (int gi = 0; gi < max_tokens; gi++) {
+        int tid = bn_sampler_sample(sampler, logits);
+        if (tid == tok->im_end_id || tid == tok->endoftext_id ||
+            tid == tok->eos_id) break;
+        const char *piece = bn_tokenizer_decode(tok, tid);
+        if (piece && *piece) {
+            size_t pl = strlen(piece);
+            if (slen + pl < sizeof stream) {
+                memcpy(stream + slen, piece, pl);
+                slen += pl;
+                stream[slen] = '\0';
+            }
+            fputs(piece, stdout);
+            fflush(stdout);
+        }
+        n_gen++;
+        if (!armed) {
+            const char *open = NULL;
+            for (const char *p = stream;
+                 (p = strstr(p, "<tool_call>")) != NULL; p += 11) open = p;
+            if (open && !strstr(open + 11, "</tool_call>")) {
+                bn_grammar_init(&g, gb.inst, gb.n);
+                bn_grammar_advance(&g, open);
+                bn_sampler_set_mask(sampler, main_grammar_mask_cb, &ctx);
+                armed = 1;
+                open_off = (size_t)(open - stream);
+            }
+        } else {
+            bn_grammar_advance(&g, piece ? piece : "");
+            int closed = strstr(stream + open_off + 11, "</tool_call>") != NULL;
+            if (closed || bn_grammar_dead(&g)) {
+                bn_sampler_set_mask(sampler, NULL, NULL);
+                armed = 0;
+                if (closed) break;
+            }
+        }
+        float *lp = bn_prefill(model, s, &tid, 1, *pos, no_prefill);
+        if (!lp) break;
+        logits = lp;
+        (*pos)++;
+    }
+    bn_sampler_set_mask(sampler, NULL, NULL);
+    bn_grammar_vocab_destroy(gv);
+    for (int i = 0; i < tok->vocab_size; i++) free(decoded[i]);
+    free(decoded);
+    return n_gen;
 }
 
 // Chat turn capture (template-driven --chat): records generated tokens into the
@@ -1321,7 +1411,9 @@ int main(int argc, char **argv) {
         // --- Single-shot generation ---
         int max_prompt_tokens = args.prompt_token_ids
             ? parse_prompt_token_ids(args.prompt_token_ids, NULL, 0)
-            : (int)strlen(args.prompt) + 3;
+            : args.oneshot
+                ? (int)strlen(args.oneshot) + 512   /* room for template markup */
+                : (int)strlen(args.prompt) + 3;
         if (max_prompt_tokens <= 0) {
             fprintf(stderr, "Invalid value for --prompt-token-ids: %s\n",
                     args.prompt_token_ids ? args.prompt_token_ids : "");
@@ -1366,6 +1458,34 @@ int main(int argc, char **argv) {
                     return 1;
                 }
             }
+        } else if (args.oneshot) {
+            /* Render a single user turn through the GGUF chat template so a
+               small instruct model is prompted the way it was trained, rather
+               than the raw -p continuation. The generated completion prints to
+               stdout via the standard generation loop below. */
+            const char *chat_tmpl = bn_gguf_get_str(gf, "tokenizer.chat_template");
+            if (!chat_tmpl) {
+                SH_LOG_ERROR("--oneshot requires tokenizer.chat_template in the GGUF");
+                free(prompt_tokens);
+                bn_sampler_free(&sampler);
+                bn_tokenizer_free(&tokenizer);
+                bn_model_free(&model);
+                bn_gguf_free(gf);
+                return 1;
+            }
+            const char *bos_token =
+                (tokenizer.bos_id >= 0 && tokenizer.bos_id < tokenizer.vocab_size)
+                    ? tokenizer.vocab[tokenizer.bos_id] : NULL;
+            const char *eos_token =
+                (tokenizer.eos_id >= 0 && tokenizer.eos_id < tokenizer.vocab_size)
+                    ? tokenizer.vocab[tokenizer.eos_id] : NULL;
+            BnTplMessage m = {0};
+            m.role = BN_TPL_ROLE_USER;
+            m.content = args.oneshot;
+            n_prompt = bn_chat_template_encode(&tokenizer, chat_tmpl, &m, 1,
+                                               NULL, 0, args.think, 1,
+                                               bos_token, eos_token,
+                                               prompt_tokens, max_prompt_tokens);
         } else {
             int add_bos = args.prompt_bos && tokenizer.add_bos;
             n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, add_bos,
@@ -1443,8 +1563,12 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "  token %6d: %.4f\n", top[k], logits[top[k]]);
                 }
 #endif
-                // Generate tokens — speculative or standard
-                if (has_draft) {
+                // Generate tokens — grammar-constrained, speculative, or standard
+                if (args.grammar && args.oneshot) {
+                    n_generated = oneshot_grammar_generate(
+                        &model, session, &tokenizer, &sampler, logits, &pos,
+                        args.n_tokens, args.no_prefill);
+                } else if (has_draft) {
                     n_generated = bn_generate_speculative(
                         &model, session, &draft_model, draft_session, args.draft_k,
                         &tokenizer, &sampler, args.n_tokens, &pos,

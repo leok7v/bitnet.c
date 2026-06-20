@@ -103,4 +103,9 @@ int  bn_gb_match(BnGBuilder *b);                /* accept                   */
  * loops). Pass -1 to leave a field unchanged. */
 void bn_gb_patch(BnGBuilder *b, int idx, int next, int alt);
 
+/* The canonical tool-call skeleton grammar, shared by the agent harness and the
+ * one-shot repair path: forces the structural tags, leaves the function name and
+ * each parameter name/value free. Returns the index of the MATCH instruction. */
+int  bn_grammar_build_tool_call(BnGBuilder *b);
+
 #endif /* BN_GRAMMAR_H */
