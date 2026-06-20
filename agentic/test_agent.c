@@ -751,6 +751,24 @@ static int try_repair_tool_call(Agent *a, ParsedToolCall *tc) {
     return ok;
 }
 
+/* Drive one malformed call through exec -> repair and print the round-trip;
+ * returns 1 if the repair succeeded. */
+static int selftest_one(Agent *a, const char *label, ParsedToolCall *tc) {
+    ToolArg args[MAX_PARAMS_PER_TOOL_CALL];
+    for (int p = 0; p < tc->n_params; p++) {
+        args[p].name = tc->param_names[p];
+        args[p].value = tc->param_values[p];
+    }
+    tc->result = tools_execute(tc->function_name, args, tc->n_params);
+    printf("[selftest %s] initial: %s\n", label, tc->result ? tc->result : "(null)");
+    int ok = try_repair_tool_call(a, tc);
+    printf("[selftest %s] repaired=%d -> %s\n  fn=%s\n", label, ok,
+           tc->result ? tc->result : "(null)", tc->function_name);
+    for (int p = 0; p < tc->n_params; p++)
+        printf("    %s = %s\n", tc->param_names[p], tc->param_values[p]);
+    return ok;
+}
+
 static int run_turn(Agent *a, const char *user_msg,
                     const BnTplTool *tools[], int n_tools,
                     int turn_index, ByteBuf *transcript) {
@@ -1452,35 +1470,40 @@ int main(int argc, char **argv) {
     }
 
     if (repair_selftest) {
-        /* Deterministic check of the repair round-trip: a real file plus a call
-           with a misnamed parameter ("filecontent", not in the alias table) that
-           write_file rejects with "missing 'content'". */
+        /* Deterministic checks of the repair round-trip on misnamed parameters
+           (not in the alias table), with the values that must survive intact. */
         FILE *sf = fopen("selftest.txt", "w");
         if (sf) { fputs("reviewed: yes\n", sf); fclose(sf); }
-        ParsedToolCall tc = {0};
-        tc.function_name = strdup("write_file");
-        tc.param_names[0] = strdup("path");
-        tc.param_values[0] = strdup("selftest.txt");
-        tc.param_names[1] = strdup("filecontent");
-        tc.param_values[1] = strdup("reviewed: done");
-        tc.n_params = 2;
-        tc.raw_block = strdup(
-            "<function=write_file>\n<parameter=path>selftest.txt</parameter>\n"
-            "<parameter=filecontent>reviewed: done</parameter>\n</function>");
-        ToolArg sa[2] = { {tc.param_names[0], tc.param_values[0]},
-                          {tc.param_names[1], tc.param_values[1]} };
-        tc.result = tools_execute("write_file", sa, 2);
-        printf("[selftest] initial: %s\n", tc.result ? tc.result : "(null)");
-        int ok = try_repair_tool_call(&a, &tc);
-        printf("[selftest] repaired=%d -> %s\n", ok, tc.result ? tc.result : "(null)");
-        printf("[selftest] fn=%s\n", tc.function_name);
-        for (int p = 0; p < tc.n_params; p++)
-            printf("  %s = %s\n", tc.param_names[p], tc.param_values[p]);
-        printf("[selftest] file now: ");
-        sf = fopen("selftest.txt", "r");
-        if (sf) { char b[128]; while (fgets(b, sizeof b, sf)) fputs(b, stdout); fclose(sf); }
-        parsed_tc_free(&tc);
-        return ok ? 0 : 3;
+        int all_ok = 1;
+        {   /* single rename: filecontent -> content */
+            ParsedToolCall tc = {0};
+            tc.function_name = strdup("write_file");
+            tc.param_names[0] = strdup("path");
+            tc.param_values[0] = strdup("selftest.txt");
+            tc.param_names[1] = strdup("filecontent");
+            tc.param_values[1] = strdup("reviewed: done");
+            tc.n_params = 2;
+            tc.raw_block = strdup(
+                "<function=write_file>\n<parameter=path>selftest.txt</parameter>\n"
+                "<parameter=filecontent>reviewed: done</parameter>\n</function>");
+            all_ok &= selftest_one(&a, "write_file", &tc);
+            parsed_tc_free(&tc);
+        }
+        {   /* multi rename: dir -> path AND pat -> pattern */
+            ParsedToolCall tc = {0};
+            tc.function_name = strdup("grep_search");
+            tc.param_names[0] = strdup("dir");
+            tc.param_values[0] = strdup(".");
+            tc.param_names[1] = strdup("pat");
+            tc.param_values[1] = strdup("reviewed");
+            tc.n_params = 2;
+            tc.raw_block = strdup(
+                "<function=grep_search>\n<parameter=dir>.</parameter>\n"
+                "<parameter=pat>reviewed</parameter>\n</function>");
+            all_ok &= selftest_one(&a, "grep_search", &tc);
+            parsed_tc_free(&tc);
+        }
+        return all_ok ? 0 : 3;
     }
 
     ByteBuf transcript = {0};
