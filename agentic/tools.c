@@ -12,6 +12,24 @@ static const char *find_arg(const ToolArg *args, int n_args,
         if (args[i].name && strcmp(args[i].name, name) == 0)
             return args[i].value;
     }
+    /* Fall back to the wrong-but-obvious names small models emit, so a single
+       mis-named parameter still resolves (e.g. pcontent -> content) instead of
+       failing the whole call. Only consulted when the exact name is absent. */
+    static const struct { const char *canon, *alias; } aliases[] = {
+        {"content", "pcontent"}, {"content", "text"}, {"content", "body"},
+        {"content", "data"},     {"content", "file_content"},
+        {"path", "file"},        {"path", "filename"}, {"path", "filepath"},
+        {"path", "file_path"},   {"path", "filimame"},
+        {"pattern", "regex"},    {"pattern", "query"}, {"pattern", "search"},
+        {"command", "cmd"},      {"command", "cmdline"},
+        {"diff", "patch"},       {"changes", "edits"},
+    };
+    for (size_t k = 0; k < sizeof aliases / sizeof aliases[0]; k++) {
+        if (strcmp(aliases[k].canon, name) != 0) continue;
+        for (int i = 0; i < n_args; i++)
+            if (args[i].name && strcmp(args[i].name, aliases[k].alias) == 0)
+                return args[i].value;
+    }
     return NULL;
 }
 
@@ -545,25 +563,151 @@ static const BnTplTool APPLY_DIFF_TOOL = {
 
 const BnTplTool *tools_apply_diff_def(void) { return &APPLY_DIFF_TOOL; }
 
+/* Split a buffer into a NUL-terminated line array (newline stripped). */
+static char **split_lines(const char *s, int *n) {
+    int cap = 32, cnt = 0;
+    char **out = malloc((size_t)cap * sizeof(char *));
+    if (!out) { *n = 0; return NULL; }
+    for (const char *p = s; *p; ) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (cnt >= cap) {
+            cap *= 2;
+            char **nb = realloc(out, (size_t)cap * sizeof(char *));
+            if (!nb) { free_lines(out, cnt); *n = 0; return NULL; }
+            out = nb;
+        }
+        char *line = malloc(len + 1);
+        if (line) { memcpy(line, p, len); line[len] = '\0'; }
+        out[cnt++] = line;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    *n = cnt;
+    return out;
+}
+
+/* Target file from the diff's +++ header, stripping a/ b/ and any trailing
+   timestamp; falls back to the --- header. */
+static int diff_target_path(char **dl, int ndl, char *out, size_t outsz) {
+    const char *pref[2] = { "+++ ", "--- " };
+    for (int which = 0; which < 2; which++) {
+        for (int i = 0; i < ndl; i++) {
+            if (!dl[i] || strncmp(dl[i], pref[which], 4) != 0) continue;
+            const char *p = dl[i] + 4;
+            if (strncmp(p, "a/", 2) == 0 || strncmp(p, "b/", 2) == 0) p += 2;
+            size_t j = 0;
+            while (p[j] && p[j] != '\t' && p[j] != ' ' && j + 1 < outsz) {
+                out[j] = p[j];
+                j++;
+            }
+            out[j] = '\0';
+            if (j > 0 && strcmp(out, "/dev/null") != 0) return 1;
+        }
+    }
+    return 0;
+}
+
+/* A file line (may carry a trailing newline) and a diff body line (none) are
+   equal up to trailing whitespace -- the one fuzz level that lets a model's
+   slightly-off context still match. */
+static int diff_line_eq(const char *file_line, const char *body) {
+    size_t fl = file_line ? strlen(file_line) : 0;
+    while (fl > 0 && (file_line[fl-1] == '\n' || file_line[fl-1] == '\r' ||
+                      file_line[fl-1] == ' '  || file_line[fl-1] == '\t')) fl--;
+    size_t bl = body ? strlen(body) : 0;
+    while (bl > 0 && (body[bl-1] == '\r' || body[bl-1] == ' ' ||
+                      body[bl-1] == '\t')) bl--;
+    return fl == bl && (fl == 0 || strncmp(file_line, body, fl) == 0);
+}
+
+/* Locate the old-side block (context + removed lines) in the file, preferring a
+   match at/after pos but scanning from the top if the hunk line numbers lie. */
+static int diff_find_block(char **fl, int nfl, const char **oldb, int nold,
+                           int pos) {
+    for (int start = pos; start >= 0; start = (start == pos ? 0 : -1)) {
+        for (int s = start; s + nold <= nfl; s++) {
+            int ok = 1;
+            for (int k = 0; k < nold && ok; k++)
+                if (!diff_line_eq(fl[s + k], oldb[k])) ok = 0;
+            if (ok) return s;
+        }
+        if (start == 0) break;
+    }
+    return -1;
+}
+
+/* Tolerant unified-diff applier: ignores git cruft (diff/index headers, wrong
+   @@ line numbers), matches each hunk by context, and applies hunks by content
+   rather than shelling to a strict `git apply`. Single target file; multiple
+   hunks. The known limit is a value containing no resolvable context. */
 static char *run_apply_diff(const ToolArg *args, int n_args) {
     const char *diff = find_arg(args, n_args, "diff");
     if (!diff) return strdup("error: missing 'diff' argument");
-    const char *tmpfile = ".agent_apply.diff";
-    FILE *f = fopen(tmpfile, "w");
-    if (!f) return strdup("error: cannot write temp diff file");
-    fputs(diff, f);
-    fclose(f);
-    char *cmd = malloc(strlen(tmpfile) + 32);
-    if (!cmd) { remove(tmpfile); return NULL; }
-    snprintf(cmd, strlen(tmpfile) + 32, "git apply %s 2>&1", tmpfile);
-    char *out = run_capture(cmd);
-    free(cmd);
-    remove(tmpfile);
-    if (!out || !*out) {
-        free(out);
-        return strdup("applied");
+    int ndl = 0;
+    char **dl = split_lines(diff, &ndl);
+    if (!dl) return NULL;
+    char path[1024];
+    if (!diff_target_path(dl, ndl, path, sizeof path)) {
+        free_lines(dl, ndl);
+        return strdup("error: diff has no '+++'/'---' target path");
     }
-    return rtrim(out);
+    int nfl = 0;
+    char **fl = read_lines(path, &nfl);   /* NULL+0 when creating a new file */
+    int out_cap = nfl + ndl + 16;
+    char **out = malloc((size_t)out_cap * sizeof(char *));
+    if (!out) { free_lines(fl, nfl); free_lines(dl, ndl); return NULL; }
+    int noi = 0, pos = 0, applied = 0, failed = 0;
+    int i = 0;
+    while (i < ndl) {
+        if (!dl[i] || strncmp(dl[i], "@@", 2) != 0) { i++; continue; }
+        i++;
+        const char *oldb[2048], *newb[2048];
+        int nold = 0, nnew = 0;
+        while (i < ndl && dl[i] && strncmp(dl[i], "@@", 2) != 0 &&
+               strncmp(dl[i], "--- ", 4) != 0 &&
+               strncmp(dl[i], "+++ ", 4) != 0 &&
+               strncmp(dl[i], "diff ", 5) != 0) {
+            char c = dl[i][0];
+            const char *body = (c == '+' || c == '-' || c == ' ') ? dl[i] + 1 : dl[i];
+            if (c == '\\') { i++; continue; }   /* "\ No newline at end of file" */
+            if ((c == '-' || c == ' ') && nold < 2048) oldb[nold++] = body;
+            if ((c == '+' || c == ' ') && nnew < 2048) newb[nnew++] = body;
+            i++;
+        }
+        int m = diff_find_block(fl, nfl, oldb, nold, pos);
+        if (m < 0) {
+            if (nold == 0) { m = nfl; }       /* pure addition -> append at end */
+            else { failed++; continue; }      /* unmatchable -> skip this hunk */
+        }
+        for (int k = pos; k < m && noi < out_cap; k++) out[noi++] = strdup(fl[k]);
+        for (int k = 0; k < nnew && noi < out_cap; k++) {
+            size_t bl = strlen(newb[k]);
+            char *ln = malloc(bl + 2);
+            if (ln) { memcpy(ln, newb[k], bl); ln[bl] = '\n'; ln[bl + 1] = '\0'; }
+            out[noi++] = ln;
+        }
+        pos = m + nold;
+        applied++;
+    }
+    for (int k = pos; k < nfl && noi < out_cap; k++) out[noi++] = strdup(fl[k]);
+    int rc = (applied > 0) ? write_lines(path, out, noi) : 0;
+    free_lines(out, noi);
+    free_lines(fl, nfl);
+    free_lines(dl, ndl);
+    if (applied == 0) return strdup("error: no diff hunk matched the file");
+    if (rc != 0) {
+        size_t cap = 64 + strlen(path);
+        char *err = malloc(cap);
+        if (err) snprintf(err, cap, "error: cannot write '%s'", path);
+        return err;
+    }
+    char *res = malloc(160);
+    if (res)
+        snprintf(res, 160, "applied %d hunk%s to %s%s", applied,
+                 applied == 1 ? "" : "s", path,
+                 failed ? " (some hunks skipped)" : "");
+    return res;
 }
 
 /* ---------- dispatch --------------------------------------------- */
